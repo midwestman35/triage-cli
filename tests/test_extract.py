@@ -179,7 +179,7 @@ def test_lookup_site_cnc_override_case_insensitive(sites: list[SiteEntry]) -> No
         cnc_override="921D7C53-E815-4566-9692-6CBCE589E1D3",
     )
     assert strategy == "cnc_flag"
-    assert entry is not None and entry.cnc.lower().startswith("921d7c53")
+    assert entry is not None and entry.site_name == "us-co-aurora-apex"
 
 
 def test_lookup_site_cnc_override_no_match_raises(sites: list[SiteEntry]) -> None:
@@ -218,6 +218,69 @@ def test_lookup_site_org_match_case_insensitive(sites: list[SiteEntry]) -> None:
     )
     entry, strategy = lookup_site(ticket, sites)
     assert strategy == "org_match"
+    assert entry is not None and entry.site_name == "us-nv-nvdps-apex"
+
+
+def test_lookup_site_site_substring_longest_wins() -> None:
+    sites = [
+        SiteEntry(
+            friendly_name="Foo Apex",
+            site_name="us-co-foo-apex",
+            cnc="00000000-0000-0000-0000-00000000000a",
+        ),
+        SiteEntry(
+            friendly_name="Foo Apex Two",
+            site_name="us-co-foo-apex-2",
+            cnc="00000000-0000-0000-0000-00000000000b",
+        ),
+    ]
+    ticket = _ticket(subject="alert from us-co-foo-apex-2 host")
+    entry, strategy = lookup_site(ticket, sites)
+    assert strategy == "site_substring"
+    assert entry is not None and entry.site_name == "us-co-foo-apex-2"
+
+
+def test_lookup_site_friendly_substring_longest_wins() -> None:
+    sites = [
+        SiteEntry(
+            friendly_name="Foo Apex",
+            site_name="us-xx-foo-apex",
+            cnc="00000000-0000-0000-0000-00000000000a",
+        ),
+        SiteEntry(
+            friendly_name="Foo Apex Two",
+            site_name="us-xx-foo-apex-2",
+            cnc="00000000-0000-0000-0000-00000000000b",
+        ),
+    ]
+    ticket = _ticket(subject="ticket about Foo Apex Two reporting issue")
+    entry, strategy = lookup_site(ticket, sites)
+    assert strategy == "friendly_substring"
+    assert entry is not None and entry.friendly_name == "Foo Apex Two"
+
+
+def test_lookup_site_empty_site_override_raises(sites: list[SiteEntry]) -> None:
+    ticket = _ticket()
+    with pytest.raises(ValueError, match="--site cannot be empty"):
+        lookup_site(ticket, sites, site_override="")
+    with pytest.raises(ValueError, match="--site cannot be empty"):
+        lookup_site(ticket, sites, site_override="   ")
+
+
+def test_lookup_site_empty_cnc_override_raises(sites: list[SiteEntry]) -> None:
+    ticket = _ticket()
+    with pytest.raises(ValueError, match="--cnc cannot be empty"):
+        lookup_site(ticket, sites, cnc_override="")
+    with pytest.raises(ValueError, match="--cnc cannot be empty"):
+        lookup_site(ticket, sites, cnc_override="   ")
+
+
+def test_lookup_site_empty_org_falls_through_to_substring(
+    sites: list[SiteEntry],
+) -> None:
+    ticket = _ticket(subject="us-nv-nvdps-apex error", requester_org="")
+    entry, strategy = lookup_site(ticket, sites)
+    assert strategy == "site_substring"
     assert entry is not None and entry.site_name == "us-nv-nvdps-apex"
 
 

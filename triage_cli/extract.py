@@ -74,6 +74,9 @@ def lookup_site(
     4. Substring match of any site_name in ticket.subject + ticket.description.
     5. Substring match of any friendly_name in ticket.subject + ticket.description.
 
+    Among substring matches, the longest matching name wins; ties broken by list order.
+    Comment thread is intentionally not searched; only subject and description form the substring haystack.
+
     Returns (entry, strategy) where strategy is one of:
         "site_flag", "cnc_flag", "org_match", "site_substring",
         "friendly_substring", "no_match".
@@ -81,6 +84,8 @@ def lookup_site(
     prompt vs. abort.
     """
     if site_override is not None:
+        if not site_override.strip():
+            raise ValueError("--site cannot be empty")
         target = site_override.lower()
         for entry in sites:
             if entry.site_name.lower() == target:
@@ -91,11 +96,16 @@ def lookup_site(
         return synthetic, "site_flag"
 
     if cnc_override is not None:
+        if not cnc_override.strip():
+            raise ValueError("--cnc cannot be empty")
         target = cnc_override.lower()
         for entry in sites:
             if entry.cnc.lower() == target:
                 return entry, "cnc_flag"
-        raise ValueError(f"CNC override {cnc_override} not found in site map")
+        raise ValueError(
+            f"CNC override {cnc_override} not found in site map; "
+            f"run 'triage-cli build-map' to refresh"
+        )
 
     org = (ticket.requester_org or "").strip().lower()
     if org:
@@ -105,17 +115,34 @@ def lookup_site(
 
     haystack = f"{ticket.subject}\n{ticket.description}".lower()
 
+    best_site: SiteEntry | None = None
     for entry in sites:
         sn = entry.site_name.lower()
         if sn and sn in haystack:
-            return entry, "site_substring"
+            if best_site is None or len(entry.site_name) > len(best_site.site_name):
+                best_site = entry
+    if best_site is not None:
+        return best_site, "site_substring"
 
+    best_friendly: SiteEntry | None = None
     for entry in sites:
         fn = entry.friendly_name.lower()
         if fn and fn in haystack:
-            return entry, "friendly_substring"
+            if best_friendly is None or len(entry.friendly_name) > len(
+                best_friendly.friendly_name
+            ):
+                best_friendly = entry
+    if best_friendly is not None:
+        return best_friendly, "friendly_substring"
 
     return None, "no_match"
+
+
+def _to_utc(dt: datetime) -> datetime:
+    """Normalize a datetime to timezone-aware UTC. Naive inputs are assumed UTC."""
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
 def build_window(anchor: datetime, minutes: int) -> tuple[datetime, datetime]:
@@ -127,19 +154,9 @@ def build_window(anchor: datetime, minutes: int) -> tuple[datetime, datetime]:
     """
     if minutes <= 0:
         raise ValueError(f"window minutes must be positive, got {minutes}")
-    if anchor.tzinfo is None:
-        anchor_utc = anchor.replace(tzinfo=timezone.utc)
-    else:
-        anchor_utc = anchor.astimezone(timezone.utc)
+    anchor_utc = _to_utc(anchor)
     delta = timedelta(minutes=minutes)
     return anchor_utc - delta, anchor_utc + delta
-
-
-def _to_utc(dt: datetime) -> datetime:
-    """Normalize a datetime to timezone-aware UTC. Naive inputs are assumed UTC."""
-    if dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
 
 
 def resolve_anchor(
