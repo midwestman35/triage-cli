@@ -94,6 +94,7 @@ class ZendeskClient:
             requester_org=requester_org,
             tags=list(ticket_obj.get("tags") or []),
             created_at=_parse_iso(ticket_obj["created_at"]),
+            updated_at=_parse_iso(ticket_obj["updated_at"]),
             comments=self._fetch_comments(ticket_id),
         )
 

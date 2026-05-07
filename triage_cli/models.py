@@ -48,6 +48,7 @@ class Ticket(BaseModel):
     requester_org: str | None = None
     tags: list[str] = Field(default_factory=list)
     created_at: datetime
+    updated_at: datetime
     comments: list[Comment] = Field(default_factory=list)
 
 
