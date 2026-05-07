@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from datetime import datetime, timezone
 from types import TracebackType
 from typing import Any
@@ -17,6 +18,7 @@ from triage_cli.models import LogLine
 logger = logging.getLogger(__name__)
 
 _VALID_LEVELS = {"error", "warn", "info", "debug"}
+_SAFE_SITE_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
 
 
 class DatadogClient:
@@ -83,6 +85,11 @@ class DatadogClient:
         clean_site = (site_name or "").strip()
         if not clean_site:
             raise ValueError("site_name cannot be empty")
+        if not _SAFE_SITE_RE.match(clean_site):
+            raise ValueError(
+                f"site_name {clean_site!r} contains characters that are unsafe for "
+                "Datadog query interpolation; expected only [a-zA-Z0-9._-]"
+            )
         if start >= end:
             raise ValueError("start must be strictly before end")
         norm_levels = [lvl.strip().lower() for lvl in levels]
@@ -102,8 +109,12 @@ class DatadogClient:
                 page_limit=self._max_lines,
             )
         except ApiException as e:
+            if e.status in (401, 403):
+                raise RuntimeError(
+                    "Datadog auth failed — check DD_API_KEY and DD_APP_KEY"
+                ) from e
             body = getattr(e, "body", None) or ""
-            body_str = body.decode() if isinstance(body, bytes) else str(body)
+            body_str = body.decode(errors="replace") if isinstance(body, bytes) else str(body)
             raise RuntimeError(f"Datadog API error {e.status}: {body_str[:200]}") from e
         except Exception as e:  # pragma: no cover - urllib3/transport fallback
             raise RuntimeError(f"Datadog request failed: {e}") from e
