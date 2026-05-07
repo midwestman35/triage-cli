@@ -3,14 +3,16 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
-from triage_cli.models import Ticket
+from triage_cli.models import SiteEntry, Ticket
 from triage_cli.watcher import (
     WatcherOptions,
     load_state,
     prune_state,
+    run_iteration,
     save_state,
     should_triage,
 )
@@ -121,3 +123,129 @@ def test_should_triage_handles_naive_stored_timestamp() -> None:
     assert should_triage(_ticket(42, when), state, cutoff) is False
     # 5 minutes later → newer → SHOULD triage.
     assert should_triage(_ticket(42, when + timedelta(minutes=5)), state, cutoff) is True
+
+
+@pytest.fixture
+def stub_sites() -> list[SiteEntry]:
+    return [
+        SiteEntry(
+            friendly_name="Aurora 911, CO",
+            site_name="us-co-aurora-apex",
+            cnc="921d7c53-e815-4566-9692-6cbce589e1d3",
+        ),
+    ]
+
+
+def _zd_with_tickets(tickets: dict[int, Ticket], view_ids: list[int]) -> MagicMock:
+    zd = MagicMock()
+    zd.list_view_ticket_ids.return_value = view_ids
+    zd.get_ticket.side_effect = lambda tid: tickets[tid]
+    return zd
+
+
+def test_run_iteration_marks_only_successfully_triaged(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stub_sites: list[SiteEntry],
+) -> None:
+    now = datetime(2026, 5, 7, 12, 0, 0, tzinfo=timezone.utc)
+    cutoff = now - timedelta(hours=24)
+    t_ok = Ticket(
+        id=1, subject="s", description="us-co-aurora-apex", requester_org=None,
+        tags=[], created_at=now, updated_at=now, comments=[],
+    )
+    t_fail = Ticket(
+        id=2, subject="s", description="us-co-aurora-apex", requester_org=None,
+        tags=[], created_at=now, updated_at=now, comments=[],
+    )
+    t_no_site = Ticket(
+        id=3, subject="s", description="no match here", requester_org=None,
+        tags=[], created_at=now, updated_at=now, comments=[],
+    )
+    zd = _zd_with_tickets({1: t_ok, 2: t_fail, 3: t_no_site}, [1, 2, 3])
+
+    def fake_triage_one(ticket, site_entry, **kwargs):  # noqa: ARG001
+        if ticket.id == 2:
+            raise RuntimeError("simulated Datadog timeout")
+        return f"## Summary\nnote for {ticket.id}\n"
+
+    monkeypatch.setattr("triage_cli.pipeline.triage_one", fake_triage_one)
+    monkeypatch.setattr("triage_cli.render.save_note", lambda md, tid: tmp_path / f"{tid}.md")
+
+    state = {"version": 1, "triaged": {}}
+    opts = _opts(tmp_path / "state.json")
+    new_state = run_iteration(zd, stub_sites, state, opts, cutoff, dd_client=None)
+
+    assert new_state["triaged"] == {"1": now.isoformat()}
+
+
+def test_run_iteration_status_lines(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture,
+    stub_sites: list[SiteEntry],
+) -> None:
+    now = datetime(2026, 5, 7, 12, 0, 0, tzinfo=timezone.utc)
+    cutoff = now - timedelta(hours=24)
+    tickets = {
+        1: Ticket(id=1, subject="s", description="us-co-aurora-apex", requester_org=None,
+                  tags=[], created_at=now, updated_at=now, comments=[]),
+        2: Ticket(id=2, subject="s", description="us-co-aurora-apex", requester_org=None,
+                  tags=[], created_at=now, updated_at=now, comments=[]),
+        3: Ticket(id=3, subject="s", description="no match", requester_org=None,
+                  tags=[], created_at=now, updated_at=now, comments=[]),
+        4: Ticket(id=4, subject="s", description="us-co-aurora-apex", requester_org=None,
+                  tags=[], created_at=now, updated_at=now, comments=[]),
+    }
+    zd = _zd_with_tickets(tickets, [1, 2, 3, 4])
+
+    def fake_triage_one(ticket, site_entry, **kwargs):  # noqa: ARG001
+        if ticket.id == 2:
+            raise RuntimeError("Datadog timeout")
+        return f"note {ticket.id}"
+
+    monkeypatch.setattr("triage_cli.pipeline.triage_one", fake_triage_one)
+    monkeypatch.setattr("triage_cli.render.save_note", lambda md, tid: tmp_path / f"{tid}.md")
+
+    state = {"version": 1, "triaged": {"4": now.isoformat()}}
+    opts = _opts(tmp_path / "state.json")
+    run_iteration(zd, stub_sites, state, opts, cutoff, dd_client=None)
+    err = capsys.readouterr().err
+
+    assert "#1 triaged" in err
+    assert "#2 failed" in err and "Datadog timeout" in err and "will retry" in err
+    assert "#3 skipped: site unresolvable" in err
+    assert "#4 unchanged" in err
+
+
+def test_run_iteration_silent_backfill_marks_old_tickets_no_status(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture,
+    stub_sites: list[SiteEntry],
+) -> None:
+    """A ticket older than the cutoff with no prior state entry is silently marked."""
+    now = datetime(2026, 5, 7, 12, 0, 0, tzinfo=timezone.utc)
+    cutoff = now - timedelta(hours=1)
+    older = now - timedelta(hours=2)
+
+    t_old = Ticket(
+        id=99, subject="s", description="us-co-aurora-apex", requester_org=None,
+        tags=[], created_at=older, updated_at=older, comments=[],
+    )
+    zd = _zd_with_tickets({99: t_old}, [99])
+
+    # pipeline.triage_one should NOT be called for a backfill-skipped ticket.
+    def boom(*_args, **_kwargs):
+        raise AssertionError("triage_one should not be called for silent-backfill ticket")
+
+    monkeypatch.setattr("triage_cli.pipeline.triage_one", boom)
+
+    state = {"version": 1, "triaged": {}}
+    opts = _opts(tmp_path / "state.json")
+    new_state = run_iteration(zd, stub_sites, state, opts, cutoff, dd_client=None)
+
+    assert new_state["triaged"] == {"99": older.isoformat()}
+    err = capsys.readouterr().err
+    # No status line for ticket 99 — silent backfill.
+    assert "#99" not in err

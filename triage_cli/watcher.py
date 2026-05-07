@@ -13,13 +13,19 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
+import sys
+import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from triage_cli.models import Ticket
+from triage_cli import extract, pipeline, render
+from triage_cli.datadog import DatadogClient
+from triage_cli.models import SiteEntry, Ticket
+from triage_cli.zendesk import ZendeskClient
 
 logger = logging.getLogger(__name__)
 
@@ -115,3 +121,114 @@ def prune_state(state: State, max_entries: int = DEFAULT_PRUNE_CAP) -> State:
     items = sorted(triaged.items(), key=lambda kv: kv[1], reverse=True)
     kept = dict(items[:max_entries])
     return {"version": STATE_VERSION, "triaged": kept}
+
+
+def _now_local_hms() -> str:
+    return datetime.now().strftime("%H:%M:%S")
+
+
+def _emit(msg: str) -> None:
+    print(msg, file=sys.stderr, flush=True)
+
+
+def run_iteration(
+    zd: ZendeskClient,
+    sites: list[SiteEntry],
+    state: State,
+    opts: WatcherOptions,
+    backfill_cutoff: datetime,
+    dd_client: DatadogClient | None,
+) -> State:
+    """Run one poll-and-triage pass over the view. Returns the updated state."""
+    triaged_map: dict[str, str] = dict(state.get("triaged") or {})
+    new_state: State = {"version": STATE_VERSION, "triaged": triaged_map}
+
+    try:
+        view_ids = zd.list_view_ticket_ids(opts.view_id)
+    except RuntimeError as e:
+        _emit(f"[{_now_local_hms()}] iteration aborted: {e}")
+        return new_state
+
+    for tid in view_ids:
+        key = str(tid)
+        try:
+            ticket = zd.get_ticket(tid)
+        except (RuntimeError, ValueError) as e:
+            _emit(f"[{_now_local_hms()}] #{tid} failed: {e} (will retry)")
+            continue
+
+        stored = triaged_map.get(key)
+        if not should_triage(ticket, new_state, backfill_cutoff):
+            if stored is None:
+                # First-run silent backfill: mark as seen, no note.
+                triaged_map[key] = ticket.updated_at.isoformat()
+            else:
+                _emit(f"[{_now_local_hms()}] #{tid} unchanged")
+            continue
+
+        site_entry, _strategy = extract.lookup_site(ticket, sites)
+        if site_entry is None:
+            _emit(f"[{_now_local_hms()}] #{tid} skipped: site unresolvable")
+            continue
+
+        try:
+            markdown = pipeline.triage_one(
+                ticket,
+                site_entry,
+                dd_client=dd_client,
+                window_minutes=opts.window_minutes,
+                levels=opts.levels,
+                at=None,
+                verbose=opts.verbose,
+                show_spinner=False,
+            )
+        except (RuntimeError, ValueError) as e:
+            _emit(f"[{_now_local_hms()}] #{tid} failed: {e} (will retry)")
+            continue
+
+        try:
+            path = render.save_note(markdown, ticket.id)
+        except OSError as e:
+            _emit(f"[{_now_local_hms()}] #{tid} failed: could not write note: {e} (will retry)")
+            continue
+        _emit(f"[{_now_local_hms()}] #{tid} triaged → {path}")
+        if opts.print_notes:
+            print(markdown, flush=True)
+            print("---", flush=True)
+        triaged_map[key] = ticket.updated_at.isoformat()
+
+    return new_state
+
+
+def run_watch(opts: WatcherOptions) -> None:
+    """Main loop. Polls a view, triages new/updated tickets, sleeps, repeats.
+
+    Exits cleanly on KeyboardInterrupt. On unrecoverable startup errors
+    (cannot load site map, missing Zendesk env), raises RuntimeError so
+    the CLI can print and exit.
+    """
+    sites = extract.load_site_map(Path("data/cnc-map.json"))
+    state = load_state(opts.state_file)
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(hours=opts.backfill_hours)
+        if math.isfinite(opts.backfill_hours)
+        else datetime.min.replace(tzinfo=timezone.utc)
+    )
+
+    iteration = 0
+    try:
+        while True:
+            iteration += 1
+            _emit(f"[{_now_local_hms()}] iteration {iteration} start (view={opts.view_id})")
+            with ZendeskClient.from_env() as zd:
+                if opts.no_logs:
+                    state = run_iteration(zd, sites, state, opts, cutoff, dd_client=None)
+                else:
+                    with DatadogClient.from_env() as dd:
+                        state = run_iteration(zd, sites, state, opts, cutoff, dd_client=dd)
+            save_state(opts.state_file, prune_state(state))
+            _emit(f"[{_now_local_hms()}] iteration {iteration} done; sleeping {opts.interval}s")
+            time.sleep(opts.interval)
+    except KeyboardInterrupt:
+        _emit(f"[{_now_local_hms()}] watcher stopped (Ctrl-C)")
+        save_state(opts.state_file, prune_state(state))
