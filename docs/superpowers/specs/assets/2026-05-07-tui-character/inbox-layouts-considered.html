@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>triage-cli inbox — layouts considered (2026-05-07)</title>
+<style>
+  body { font-family: ui-sans-serif, system-ui, sans-serif; max-width: 980px; margin: 2rem auto; padding: 0 1rem; color: #1a1a1a; line-height: 1.5; }
+  h1 { font-size: 1.6rem; margin-bottom: 0.25rem; }
+  .subtitle { color: #555; margin-top: 0; }
+  h2 { margin-top: 2.5rem; font-size: 1.2rem; }
+  .chosen { display: inline-block; padding: 1px 8px; background: #d1fae5; color: #065f46; border-radius: 4px; font-size: 0.75rem; font-weight: 600; vertical-align: middle; margin-left: 0.5rem; }
+  pre { background: #0e1116; color: #c0c5ce; padding: 14px; border-radius: 6px; font-size: 11px; line-height: 1.4; overflow-x: auto; font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+  p { margin: 0.5rem 0 1rem; }
+  hr { border: 0; border-top: 1px solid #e5e7eb; margin: 2rem 0; }
+  .meta { color: #6b7280; font-size: 0.85rem; }
+</style>
+</head>
+<body>
+
+<h1>triage-cli inbox — layouts considered</h1>
+<p class="subtitle">Snapshotted during the 2026-05-07 brainstorming session. Layout A was chosen for the first iteration; B and C are kept here in case A doesn't land in practice.</p>
+
+<hr>
+
+<h2>Layout A · Vertical split, list always visible <span class="chosen">CHOSEN</span></h2>
+<p>Left ~40% list, right ~60% detail. Selecting a row updates the right pane live. Status icons (◉ &gt;&gt; selected · ✓ done · → triaging · ○ pending · ✗ failed). You see the queue and the report at the same time — switching context is one keystroke.</p>
+<pre>┌─ triage-cli inbox · view 360123 · last poll 14:08 ───────────────────────────────┐
+│ STATUS  TICKET    SITE         WHEN     CONF  SUMMARY                            │
+│ ◉ &gt;&gt;   #11241   chicago-pd   14:03    M     SIP auth failure on CH-22         │ ┃ Finding
+│ ✓      #11240   nyc-fire     13:51    L     Inconclusive — no DD events found │ ┃ Station CH-22 appears to be
+│ →      #11238   houston-pd   13:33    -     triaging...                       │ ┃ failing SIP authentication
+│ ○      #11239   la-ems       -        -     pending                           │ ┃ against the SBC.
+│ ✗      #11237   dfw-ems      13:22    -     failed: rate limit (retrying)     │ ┃
+│        #11236   bos-fire     13:10    H     SBC restart correlated w/ outage  │ ┃ Confidence: Medium · 8 events
+│        ...                                                                    │ ┃ Window: 14:00–14:15 CST
+│                                                                                │ ┃
+│                                                                                │ ┃ Evidence
+│                                                                                │ ┃  14:03:12 auth  401 Unauthorized
+│                                                                                │ ┃  14:03:15 sip   INVITE retry
+│                                                                                │ ┃  14:03:19 sip   INVITE retry
+│                                                                                │ ┃  14:03:24 sip   call abandoned
+│                                                                                │ ┃
+│                                                                                │ ┃ Next Checks
+│                                                                                │ ┃  - Verify station credentials
+│                                                                                │ ┃  - Check recent config push
+│                                                                                │ ┃
+│                                                                                │ ┃ Suggested Internal Note
+│                                                                                │ ┃  Reviewed Datadog logs for...
+├────────────────────────────────────────────────────────────────────────────────┤
+│ ↑↓ navigate · ⏎ focus · r refresh · n re-triage · y copy note · / search · q  │
+└────────────────────────────────────────────────────────────────────────────────┘</pre>
+
+<hr>
+
+<h2>Layout B · List → drill-in detail screen</h2>
+<p>Two full-screen views. List dominates; Enter swaps to a detail view, ⌫/q returns. Lots of room for both views. Trade-off: queue awareness disappears while reading the report.</p>
+<pre>┌─ triage-cli inbox · view 360123 · 6 tickets · last poll 14:08 ────────────────────┐
+│                                                                                  │
+│  STATUS  TICKET   SITE          WHEN     CONF   SUMMARY                          │
+│  ◉ &gt;&gt;   #11241   chicago-pd    14:03    M      SIP auth failure on CH-22        │
+│  ✓      #11240   nyc-fire      13:51    L      Inconclusive — no DD events found │
+│  →      #11238   houston-pd    13:33    -      triaging...                       │
+│  ○      #11239   la-ems        -        -      pending                           │
+│  ✗      #11237   dfw-ems       13:22    -      failed: rate limit (retrying)     │
+│         #11236   bos-fire      13:10    H      SBC restart correlated w/ outage  │
+│         ...                                                                       │
+├──────────────────────────────────────────────────────────────────────────────────┤
+│ ↑↓ navigate · ⏎ open · r refresh · / search · q quit                             │
+└──────────────────────────────────────────────────────────────────────────────────┘
+                              ⏎ Enter switches to detail screen
+┌─ #11241 · chicago-pd · 14:03 ─── ⌫ back ────────────────────────────────────────┐
+│  Finding                                                                         │
+│  Station CH-22 appears to be failing SIP authentication against the SBC.         │
+│                                                                                  │
+│  Confidence: Medium · Sources: Zendesk, Datadog (8 events) · 14:00–14:15 CST     │
+│                                                                                  │
+│  Evidence                                                                        │
+│   14:03:12  auth-service   401 Unauthorized — station=CH-22                      │
+│   14:03:15  sip-edge       INVITE retry                                          │
+│   14:03:19  sip-edge       INVITE retry                                          │
+│   14:03:24  sip-edge       call attempt abandoned                                │
+│                                                                                  │
+│  Next Checks · Unknowns · Suggested Internal Note (full draft)                   │
+├──────────────────────────────────────────────────────────────────────────────────┤
+│ ⌫/q back · n re-triage · y copy note · o open in zendesk                         │
+└──────────────────────────────────────────────────────────────────────────────────┘</pre>
+
+<hr>
+
+<h2>Layout C · List + tabbed detail</h2>
+<p>What the original mockup proposed (<code>[1] Summary [2] Evidence [3] Timeline …</code>). List on top, tab strip in the middle, one section at a time below. Trade-off: navigation cost for what's effectively six short scrollable sections.</p>
+<pre>┌─ triage-cli inbox · view 360123 · last poll 14:08 ───────────────────────────────┐
+│ ◉ &gt;&gt;   #11241   chicago-pd   14:03   M  SIP auth failure on CH-22              │
+│ ✓      #11240   nyc-fire     13:51   L  Inconclusive — no DD events found      │
+│ →      #11238   houston-pd   13:33   -  triaging...                            │
+│ ○      #11239   la-ems       -       -  pending                                │
+├──────────────────────────────────────────────────────────────────────────────────┤
+│ [ Summary ]  Evidence   Next Checks   Note   Raw Logs                            │
+├──────────────────────────────────────────────────────────────────────────────────┤
+│  Finding                                                                         │
+│  Station CH-22 appears to be failing SIP authentication against the SBC.         │
+│                                                                                  │
+│  Confidence: Medium · Sources: Zendesk, Datadog (8 events) · 14:00–14:15 CST     │
+│                                                                                  │
+│  Press 2 for Evidence, 3 for Next Checks, 4 for Note, 5 for Raw Logs.            │
+├──────────────────────────────────────────────────────────────────────────────────┤
+│ ↑↓ navigate list · 1-5 tabs · r refresh · n re-triage · y copy note · q quit     │
+└──────────────────────────────────────────────────────────────────────────────────┘</pre>
+
+<hr>
+
+<p class="meta">Notes for re-evaluation: revisit layouts B and C after living with A for a few weeks. B becomes interesting if the report grows long enough to need full-screen reading. C becomes interesting if Raw Logs / additional tabs land later.</p>
+
+</body>
+</html>
