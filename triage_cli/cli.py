@@ -58,6 +58,20 @@ def _parse_levels(levels: str) -> list[str]:
     return parts
 
 
+def _parse_backfill(value: str) -> float:
+    """Parse the --backfill flag into hours. Accepts: inf, 0, Nh, Nd."""
+    s = value.strip().lower()
+    if s == "inf":
+        return float("inf")
+    if s == "0":
+        return 0.0
+    if s.endswith("h") and s[:-1].isdigit():
+        return float(int(s[:-1]))
+    if s.endswith("d") and s[:-1].isdigit():
+        return float(int(s[:-1]) * 24)
+    _die(f"--backfill must be 'inf', '0', 'Nh', or 'Nd' (got {value!r})")
+
+
 @app.command()
 def triage(
     ticket: str = typer.Argument(..., help="Zendesk ticket ID or full URL"),
@@ -155,6 +169,68 @@ def triage(
     if save:
         path = render.save_note(markdown, ticket_obj.id)
         typer.echo(f"\nSaved to: {path}", err=True)
+
+
+@app.command()
+def watch(
+    view: int = typer.Option(..., "--view", help="Zendesk view ID to watch"),
+    interval: int = typer.Option(
+        300, "--interval", min=10, help="Seconds to sleep after each iteration"
+    ),
+    state_file: Path | None = typer.Option(  # noqa: B008
+        None,
+        "--state-file",
+        help="State file path (default: data/watcher-state-<view>.json)",
+    ),
+    backfill: str = typer.Option(
+        "24h", "--backfill", help="Initial backfill horizon: inf, 0, Nh, Nd"
+    ),
+    window_minutes: int = typer.Option(
+        30, "--window-minutes", min=1, help="Window radius around the anchor in minutes"
+    ),
+    levels: str = typer.Option(
+        "error,warn", "--levels", help="Datadog log levels: comma-separated"
+    ),
+    no_logs: bool = typer.Option(
+        False, "--no-logs", help="Skip Datadog; ticket-content-only triage"
+    ),
+    print_notes: bool = typer.Option(
+        False, "--print-notes", help="Also print full markdown to stdout"
+    ),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Poll a Zendesk view and triage new or updated tickets in a loop."""
+    from triage_cli.watcher import WatcherOptions, run_watch
+
+    logging.basicConfig(
+        level=logging.INFO if verbose else logging.WARNING,
+        format="%(levelname)s %(name)s: %(message)s",
+    )
+
+    level_list = _parse_levels(levels)
+    backfill_hours = _parse_backfill(backfill)
+    resolved_state = (
+        state_file
+        if state_file is not None
+        else Path(f"data/watcher-state-{view}.json")
+    )
+
+    opts = WatcherOptions(
+        view_id=view,
+        interval=interval,
+        state_file=resolved_state,
+        backfill_hours=backfill_hours,
+        window_minutes=window_minutes,
+        levels=level_list,
+        no_logs=no_logs,
+        print_notes=print_notes,
+        verbose=verbose,
+    )
+    try:
+        run_watch(opts)
+    # FileNotFoundError: missing site map; ValueError: corrupt state file.
+    except (RuntimeError, FileNotFoundError, ValueError) as e:
+        _die(str(e))
 
 
 @app.command("build-map")
