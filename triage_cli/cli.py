@@ -135,21 +135,30 @@ def triage(
         f"Site resolved via {strategy}: {site_entry.site_name} ({site_entry.friendly_name})",
     )
 
-    # [6] Resolve anchor.
+    # [6] Resolve anchor. Extraction is best-effort; fall back to created_at on failure.
     extracted_dt: datetime | None = None
     if not no_logs and at_dt is None:
-        # Let SDK errors surface; user can pass --at or --no-logs to skip extraction.
-        extracted_dt = asyncio.run(llm_extract_anchor(ticket_obj))
+        try:
+            extracted_dt = asyncio.run(llm_extract_anchor(ticket_obj))
+        except Exception as e:
+            _vecho(verbose, f"Anchor extraction via Claude failed: {e}; falling back to created_at")
     anchor_dt, anchor_source = extract.resolve_anchor(
         ticket_obj, at_flag=at_dt, extracted=extracted_dt,
     )
-    _vecho(verbose, f"Anchor: {anchor_dt.isoformat()} from {anchor_source.value}")
 
     # [7] Fetch logs (skip if --no-logs). Build the window either way for the bundle.
     start, end = extract.build_window(anchor_dt, window_minutes)
     log_lines: list = []
     log_truncated = False
-    if not no_logs:
+    if no_logs:
+        _vecho(verbose, "Skipping anchor extraction and Datadog (--no-logs)")
+    else:
+        _vecho(verbose, f"Anchor: {anchor_dt.isoformat()} from {anchor_source.value}")
+        _vecho(
+            verbose,
+            f"Querying Datadog for {site_entry.site_name} "
+            f"levels={level_list} window={window_minutes}min",
+        )
         try:
             with DatadogClient.from_env() as dd:
                 log_lines, log_truncated = dd.get_logs(
@@ -157,10 +166,7 @@ def triage(
                 )
         except (RuntimeError, ValueError) as e:
             _die(str(e))
-        _vecho(
-            verbose,
-            f"Pulled {len(log_lines)} log lines (truncated={log_truncated})",
-        )
+        _vecho(verbose, f"Pulled {len(log_lines)} log lines (truncated={log_truncated})")
 
     # [8] Build bundle.
     bundle = TriageBundle(
@@ -175,7 +181,13 @@ def triage(
     )
 
     # [9] Call LLM and render.
-    markdown = asyncio.run(llm_triage(bundle))
+    try:
+        markdown = asyncio.run(llm_triage(bundle))
+    except Exception as e:
+        _die(
+            f"Claude Agent SDK call failed: {e}\n"
+            "Hint: confirm Claude Code is installed and authenticated by running `claude` once interactively."
+        )
     render.print_note(markdown)
     if save:
         path = render.save_note(markdown, ticket_obj.id)
