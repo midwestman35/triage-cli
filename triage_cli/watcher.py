@@ -146,6 +146,10 @@ def run_iteration(
     try:
         view_ids = zd.list_view_ticket_ids(opts.view_id)
     except RuntimeError as e:
+        # View-not-found is a permanent config error; let it propagate so
+        # the CLI exits with a clear message instead of spinning forever.
+        if str(e).startswith(f"View {opts.view_id} not found"):
+            raise
         _emit(f"[{_now_local_hms()}] iteration aborted: {e}")
         return new_state
 
@@ -193,8 +197,7 @@ def run_iteration(
             continue
         _emit(f"[{_now_local_hms()}] #{tid} triaged → {path}")
         if opts.print_notes:
-            print(markdown, flush=True)
-            print("---", flush=True)
+            print(markdown.rstrip() + "\n---", flush=True)
         triaged_map[key] = ticket.updated_at.isoformat()
 
     return new_state

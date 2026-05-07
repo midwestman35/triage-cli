@@ -200,10 +200,9 @@ These are the v1 boundary; do not assume any of them have been addressed:
 
 - Site map is manually curated; refreshing the underlying Confluence inventory is an out-of-band step.
 - No station-level log filtering. Only call-center level via `@log.machineData.callCenterName`. The `DD_STATION_TAG` env var is reserved for v2.
-- No handling of ticket updates after the first run; single-shot only. There is no `agent-triaged` tag and no idempotency.
 - Internal Zendesk comments are sent to Claude. Output is terminal-only for v1, but be aware before adding any "post back to Zendesk" feature — internal comments would leak into anything posted publicly.
 - No retries on transient API failures; if Datadog or Zendesk hiccups, re-run the command.
-- Single-user, local execution. No scheduling, no watcher, no shared state.
+- Single-user, local execution. No scheduling, no shared state. (`watch` mode provides local single-user polling without external scheduling.)
 
 ## Project layout
 

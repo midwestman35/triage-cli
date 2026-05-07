@@ -39,6 +39,11 @@ Want no notes at all on first run, only future updates? `--backfill 0`.
 [14:33:09] iteration 1 done; sleeping 300s
 ```
 
+The `[HH:MM:SS]` prefix is the operator's **local wall clock**. The state
+file at `data/watcher-state-<view-id>.json` records ticket timestamps in
+UTC (`+00:00`), so when comparing the two, account for your local UTC
+offset.
+
 Status verbs:
 - `triaged` — note generated and saved.
 - `unchanged` — ticket's `updated_at` matches what we triaged before.

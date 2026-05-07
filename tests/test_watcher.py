@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -249,3 +250,106 @@ def test_run_iteration_silent_backfill_marks_old_tickets_no_status(
     err = capsys.readouterr().err
     # No status line for ticket 99 — silent backfill.
     assert "#99" not in err
+
+
+def test_run_watch_saves_state_on_keyboard_interrupt(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """run_watch saves state and exits cleanly on Ctrl-C."""
+    saved: list[Any] = []
+
+    def fake_run_iteration(zd, sites, state, opts, cutoff, dd_client):  # noqa: ARG001
+        # Mutate state to simulate work done; then signal stop on next loop.
+        state["triaged"]["111"] = "2026-05-07T12:00:00+00:00"
+        # Raise on the second call by tracking iteration count via closure.
+        raise KeyboardInterrupt
+
+    def fake_save_state(path: Path, state: Any) -> None:
+        saved.append((path, state))
+
+    # Monkeypatch the site map load so we don't need a real cnc-map.json.
+    monkeypatch.setattr("triage_cli.extract.load_site_map", lambda _path: [])
+    monkeypatch.setattr("triage_cli.watcher.run_iteration", fake_run_iteration)
+    monkeypatch.setattr("triage_cli.watcher.save_state", fake_save_state)
+    # Avoid actually opening Zendesk/Datadog clients.
+    monkeypatch.setattr(
+        "triage_cli.watcher.ZendeskClient.from_env",
+        classmethod(lambda cls: _DummyCM()),
+    )
+    monkeypatch.setattr(
+        "triage_cli.watcher.DatadogClient.from_env",
+        classmethod(lambda cls: _DummyCM()),
+    )
+
+    from triage_cli.watcher import run_watch
+
+    state_path = tmp_path / "state.json"
+    opts = WatcherOptions(
+        view_id=1,
+        interval=300,
+        state_file=state_path,
+        backfill_hours=24.0,
+        window_minutes=30,
+        levels=["error"],
+        no_logs=True,  # Skip the DatadogClient context.
+        print_notes=False,
+        verbose=False,
+    )
+
+    # run_watch catches KeyboardInterrupt internally and returns cleanly.
+    run_watch(opts)
+
+    # save_state was called at least once and the saved state has the
+    # mutation from fake_run_iteration.
+    assert any("111" in s["triaged"] for _, s in saved)
+
+
+def test_run_iteration_silent_backfill_does_not_double_triage(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture,
+    stub_sites: list[SiteEntry],
+) -> None:
+    """A silent-backfilled ticket is not re-triaged on the next iteration."""
+    now = datetime(2026, 5, 7, 12, 0, 0, tzinfo=timezone.utc)
+    cutoff = now - timedelta(hours=1)
+    older = now - timedelta(hours=2)
+
+    t_old = Ticket(
+        id=99, subject="s", description="us-co-aurora-apex", requester_org=None,
+        tags=[], created_at=older, updated_at=older, comments=[],
+    )
+    zd = _zd_with_tickets({99: t_old}, [99])
+
+    triage_calls: list[int] = []
+
+    def fake_triage_one(ticket, site_entry, **kwargs):  # noqa: ARG001
+        triage_calls.append(ticket.id)
+        return f"note {ticket.id}"
+
+    monkeypatch.setattr("triage_cli.pipeline.triage_one", fake_triage_one)
+    monkeypatch.setattr("triage_cli.render.save_note", lambda md, tid: tmp_path / f"{tid}.md")
+
+    state = {"version": 1, "triaged": {}}
+    opts = _opts(tmp_path / "state.json")
+
+    # First iteration: backfill-silent, no triage call.
+    state = run_iteration(zd, stub_sites, state, opts, cutoff, dd_client=None)
+    assert triage_calls == []
+    assert state["triaged"] == {"99": older.isoformat()}
+
+    # Second iteration: same ticket, same updated_at — should be unchanged, no triage.
+    state = run_iteration(zd, stub_sites, state, opts, cutoff, dd_client=None)
+    assert triage_calls == []
+    err = capsys.readouterr().err
+    # Second iteration should now emit "unchanged" since prior entry exists.
+    assert "#99 unchanged" in err
+
+
+class _DummyCM:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
