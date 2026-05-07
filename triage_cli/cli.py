@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import subprocess
 import sys
+from collections.abc import Iterator
 from datetime import datetime
 from pathlib import Path
 from typing import NoReturn
@@ -19,8 +21,23 @@ from triage_cli.llm import triage as llm_triage
 from triage_cli.models import SiteEntry, TriageBundle
 from triage_cli.zendesk import ZendeskClient
 
+try:
+    from unicode_animations import live_spinner as _live_spinner
+except ImportError:  # pragma: no cover
+    _live_spinner = None  # type: ignore[assignment]
+
 # Load .env at module import so every subcommand sees the same environment.
 load_dotenv()
+
+
+@contextlib.contextmanager
+def _spinner(text: str) -> Iterator[None]:
+    """Show an 'orbit' loading spinner during a slow op; no-op when stderr isn't a TTY."""
+    if _live_spinner is not None and sys.stderr.isatty():
+        with _live_spinner("orbit", text=text, stream=sys.stderr):
+            yield
+    else:
+        yield
 
 _VALID_LEVELS = {"error", "warn", "info", "debug"}
 _SITE_MAP_PATH = Path("data/cnc-map.json")
@@ -96,7 +113,7 @@ def triage(
 
     # [3] Fetch ticket.
     try:
-        with ZendeskClient.from_env() as zd:
+        with ZendeskClient.from_env() as zd, _spinner(f"Fetching ticket #{ticket_id}"):
             ticket_obj = zd.get_ticket(ticket_id)
     except RuntimeError as e:
         _die(str(e))
@@ -139,7 +156,8 @@ def triage(
     extracted_dt: datetime | None = None
     if not no_logs and at_dt is None:
         try:
-            extracted_dt = asyncio.run(llm_extract_anchor(ticket_obj))
+            with _spinner("Asking Claude to extract incident timestamp"):
+                extracted_dt = asyncio.run(llm_extract_anchor(ticket_obj))
         except Exception as e:
             _vecho(verbose, f"Anchor extraction via Claude failed: {e}; falling back to created_at")
     anchor_dt, anchor_source = extract.resolve_anchor(
@@ -160,7 +178,9 @@ def triage(
             f"levels={level_list} window={window_minutes}min",
         )
         try:
-            with DatadogClient.from_env() as dd:
+            with DatadogClient.from_env() as dd, _spinner(
+                f"Querying Datadog for {site_entry.site_name}"
+            ):
                 log_lines, log_truncated = dd.get_logs(
                     site_entry.site_name, level_list, start, end,
                 )
@@ -182,7 +202,8 @@ def triage(
 
     # [9] Call LLM and render.
     try:
-        markdown = asyncio.run(llm_triage(bundle))
+        with _spinner("Generating triage note"):
+            markdown = asyncio.run(llm_triage(bundle))
     except RuntimeError as e:
         _die(
             f"Claude Agent SDK call failed: {e}\n"
