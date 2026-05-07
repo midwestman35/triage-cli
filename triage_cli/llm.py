@@ -12,7 +12,7 @@ import os
 import re
 from datetime import datetime, timezone
 
-from triage_cli.models import Ticket, TriageBundle, _fmt_ts, _indent_continuations
+from triage_cli.models import Ticket, TriageBundle, fmt_ts, indent_continuations
 
 try:
     from claude_agent_sdk import (
@@ -86,7 +86,9 @@ async def _collect_text(prompt: str, system_prompt: str, model: str) -> str:
                 for block in message.content:
                     if isinstance(block, TextBlock):
                         chunks.append(block.text)
-    except Exception as e:
+    # Catch transport-level failures only; let programming errors (AttributeError,
+    # TypeError) propagate during development so they're not masked.
+    except (RuntimeError, OSError) as e:
         raise RuntimeError(f"Claude Agent SDK call failed: {e}") from e
     return "".join(chunks)
 
@@ -94,26 +96,31 @@ async def _collect_text(prompt: str, system_prompt: str, model: str) -> str:
 async def triage(bundle: TriageBundle, model: str | None = None) -> str:
     """Run the main triage call. Returns the raw markdown response, stripped."""
     resolved = _resolve_model(model)
-    text = await _collect_text(
+    text = (await _collect_text(
         prompt=bundle.as_user_message(),
         system_prompt=TRIAGE_SYSTEM_PROMPT,
         model=resolved,
-    )
-    return text.strip()
+    )).strip()
+    if not text:
+        raise RuntimeError(
+            "Claude Agent SDK returned no text content. Verify Claude Code "
+            "is installed and authenticated (run `claude` once interactively)."
+        )
+    return text
 
 
 def _ticket_for_anchor(ticket: Ticket) -> str:
     """Render subject + description + chronological comments for anchor extraction."""
     lines = [
         f"Subject: {ticket.subject}",
-        f"Description: {_indent_continuations(ticket.description)}",
+        f"Description: {indent_continuations(ticket.description)}",
         "Comments:",
     ]
     if ticket.comments:
         for c in ticket.comments:
             prefix = "" if c.is_public else "[internal] "
-            body = _indent_continuations(c.body)
-            lines.append(f"- {prefix}{_fmt_ts(c.created_at)} — {c.author}: {body}")
+            body = indent_continuations(c.body)
+            lines.append(f"- {prefix}{fmt_ts(c.created_at)} — {c.author}: {body}")
     else:
         lines.append("(no comments)")
     return "\n".join(lines)
@@ -129,11 +136,13 @@ def _strip_code_fence(s: str) -> str:
 
 
 async def extract_anchor(ticket: Ticket, model: str | None = None) -> datetime | None:
-    """Best-effort timestamp extraction. Returns UTC-aware datetime or None.
+    """Best-effort timestamp extraction from the ticket body.
 
-    Never raises on parse errors — only on Agent SDK transport errors. The
-    caller is expected to fall back to ``ticket.created_at`` when this returns
-    None.
+    Returns a timezone-aware UTC datetime when the model returns a clear
+    timestamp; returns None if the model returns null, the response is not
+    valid JSON, the 'timestamp' key is missing, or the value cannot be
+    parsed as ISO 8601. Raises RuntimeError only on Agent SDK transport
+    failures (caller should not retry automatically).
     """
     resolved = _resolve_model(model)
     raw = await _collect_text(
@@ -145,22 +154,22 @@ async def extract_anchor(ticket: Ticket, model: str | None = None) -> datetime |
     try:
         data = json.loads(payload)
     except json.JSONDecodeError:
-        logger.debug("anchor extraction: response was not valid JSON: %r", raw)
+        logger.debug("extract_anchor: invalid JSON from %s: %r", resolved, raw)
         return None
     if not isinstance(data, dict) or "timestamp" not in data:
-        logger.debug("anchor extraction: missing 'timestamp' key in %r", data)
+        logger.debug("extract_anchor: missing 'timestamp' key from %s in %r", resolved, data)
         return None
     ts = data["timestamp"]
     if ts is None:
         return None
     if not isinstance(ts, str):
-        logger.debug("anchor extraction: 'timestamp' was not a string: %r", ts)
+        logger.debug("extract_anchor: 'timestamp' was not a string from %s: %r", resolved, ts)
         return None
     try:
         # fromisoformat handles offset suffixes; swap trailing Z for +00:00 for 3.10 compat.
         dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
     except ValueError:
-        logger.debug("anchor extraction: could not parse timestamp %r", ts)
+        logger.debug("extract_anchor: could not parse timestamp from %s: %r", resolved, ts)
         return None
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)

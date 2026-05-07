@@ -8,7 +8,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 
-def _fmt_ts(dt: datetime) -> str:
+def fmt_ts(dt: datetime) -> str:
     """Render a datetime as ISO 8601 in UTC with Z suffix, no microseconds."""
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
@@ -17,7 +17,7 @@ def _fmt_ts(dt: datetime) -> str:
     return dt.replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-def _indent_continuations(s: str) -> str:
+def indent_continuations(s: str) -> str:
     """Indent every line after the first by two spaces so multi-line content stays visually attached to its bullet/section."""
     return s.replace("\n", "\n  ")
 
@@ -95,19 +95,19 @@ class TriageBundle(BaseModel):
         lines.append("")
         lines.append(f"# Ticket #{t.id}")
         lines.append(f"Subject: {t.subject}")
-        lines.append(f"Created: {_fmt_ts(t.created_at)}")
+        lines.append(f"Created: {fmt_ts(t.created_at)}")
         lines.append(f"Requester org: {org_str}")
         lines.append(f"Tags: {tags_str}")
         lines.append("")
         lines.append("## Description")
-        lines.append(_indent_continuations(t.description))
+        lines.append(indent_continuations(t.description))
         lines.append("")
         lines.append('## Comments (chronological; "[internal]" prefix for non-public)')
         if t.comments:
             for c in t.comments:
                 prefix = "" if c.is_public else "[internal] "
-                body = _indent_continuations(c.body)
-                lines.append(f"- {prefix}{_fmt_ts(c.created_at)} — {c.author}: {body}")
+                body = indent_continuations(c.body)
+                lines.append(f"- {prefix}{fmt_ts(c.created_at)} — {c.author}: {body}")
         else:
             lines.append("(no comments)")
         lines.append("")
@@ -115,15 +115,15 @@ class TriageBundle(BaseModel):
         n = len(self.log_lines)
         truncated_str = ", truncated" if self.log_truncated else ""
         header = (
-            f"# Logs (anchor: {_fmt_ts(self.anchor)} from {self.anchor_source.value}; "
-            f"window: {_fmt_ts(self.window_start)} to {_fmt_ts(self.window_end)}; "
+            f"# Logs (anchor: {fmt_ts(self.anchor)} from {self.anchor_source.value}; "
+            f"window: {fmt_ts(self.window_start)} to {fmt_ts(self.window_end)}; "
             f"{n} lines{truncated_str})"
         )
         lines.append(header)
         if self.log_lines:
             for log in self.log_lines:
-                msg = _indent_continuations(log.message)
-                lines.append(f"- {_fmt_ts(log.timestamp)} [{log.level}] {msg}")
+                msg = indent_continuations(log.message)
+                lines.append(f"- {fmt_ts(log.timestamp)} [{log.level}] {msg}")
         else:
             lines.append("(no logs in window)")
 
