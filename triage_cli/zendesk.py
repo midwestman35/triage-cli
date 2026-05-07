@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 
 _USER_AGENT = "triage-cli/0.1"
 _PAGE_SIZE = 100
+_MAX_PAGES = 1000  # 100k comments at page[size]=100 - far past any real ticket
 
 
 class ZendeskClient:
@@ -107,7 +108,9 @@ class ZendeskClient:
         users_by_id: dict[int, dict[str, Any]] = {}
         raw: list[dict[str, Any]] = []
 
-        while path is not None:
+        for _ in range(_MAX_PAGES):
+            if path is None:
+                break
             payload = self._get(path, params=params, ticket_id=ticket_id)
             for u in payload.get("users") or []:
                 if "id" in u:
@@ -122,6 +125,10 @@ class ZendeskClient:
             else:
                 path = payload.get("next_page")
             params = None  # the follow-up URL already carries query params
+        else:
+            raise RuntimeError(
+                f"Zendesk comments pagination exceeded {_MAX_PAGES} pages - possible loop"
+            )
 
         comments = [_to_comment(rc, users_by_id) for rc in raw]
         comments.sort(key=lambda c: c.created_at)
@@ -142,7 +149,12 @@ class ZendeskClient:
             raise RuntimeError(f"Zendesk request failed: {e}") from e
 
         if resp.is_success:
-            return resp.json()
+            try:
+                return resp.json()
+            except ValueError as e:
+                raise RuntimeError(
+                    f"Zendesk returned non-JSON response: {e}"
+                ) from e
 
         status = resp.status_code
         if status == 404:
@@ -165,7 +177,7 @@ def _to_comment(rc: dict[str, Any], users_by_id: dict[int, dict[str, Any]]) -> C
         author=author,
         body=body,
         created_at=_parse_iso(rc["created_at"]),
-        is_public=bool(rc.get("public", True)),
+        is_public=bool(rc.get("public", False)),
     )
 
 
