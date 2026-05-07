@@ -98,6 +98,43 @@ class ZendeskClient:
             comments=self._fetch_comments(ticket_id),
         )
 
+    def list_view_ticket_ids(self, view_id: int) -> list[int]:
+        """Return ticket IDs in the given Zendesk view, in the order returned.
+
+        Paginates via cursor (meta.has_more + links.next) with legacy next_page
+        fallback. Raises RuntimeError on transport failure or non-2xx status;
+        a 404 surfaces a view-flavored message.
+        """
+        path: str | None = f"/views/{view_id}/tickets.json"
+        params: dict[str, Any] | None = {"page[size]": _PAGE_SIZE}
+        ids: list[int] = []
+
+        for _ in range(_MAX_PAGES):
+            if path is None:
+                break
+            try:
+                payload = self._get(path, params=params, ticket_id=view_id)
+            except RuntimeError as e:
+                if str(e).startswith(f"Ticket {view_id} not found"):
+                    raise RuntimeError(f"View {view_id} not found") from e
+                raise
+            for t in payload.get("tickets") or []:
+                if "id" in t:
+                    ids.append(int(t["id"]))
+
+            meta = payload.get("meta") or {}
+            links = payload.get("links") or {}
+            if meta.get("has_more") and links.get("next"):
+                path = links["next"]
+            else:
+                path = payload.get("next_page")
+            params = None
+        else:
+            raise RuntimeError(
+                f"Zendesk view pagination exceeded {_MAX_PAGES} pages - possible loop"
+            )
+        return ids
+
     def _fetch_comments(self, ticket_id: int) -> list[Comment]:
         """Page through /comments.json (with sideloaded users) and return Comment models."""
         path: str | None = f"/tickets/{ticket_id}/comments.json"
