@@ -1,12 +1,10 @@
-"""Typer CLI for triage-cli: wires zendesk, extract, datadog, llm, and render together."""
+"""Typer CLI for triage-cli: wires zendesk, extract, pipeline, and render together."""
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import logging
 import subprocess
 import sys
-from collections.abc import Iterator
 from datetime import datetime
 from pathlib import Path
 from typing import NoReturn
@@ -14,30 +12,14 @@ from typing import NoReturn
 import typer
 from dotenv import load_dotenv
 
-from triage_cli import extract, render
+from triage_cli import extract, pipeline, render
 from triage_cli.datadog import DatadogClient
-from triage_cli.llm import extract_anchor as llm_extract_anchor
-from triage_cli.llm import triage as llm_triage
-from triage_cli.models import SiteEntry, TriageBundle
+from triage_cli.models import SiteEntry
+from triage_cli.pipeline import spinner as _spinner
 from triage_cli.zendesk import ZendeskClient
-
-try:
-    from unicode_animations import live_spinner as _live_spinner
-except ImportError:  # pragma: no cover
-    _live_spinner = None  # type: ignore[assignment]
 
 # Load .env at module import so every subcommand sees the same environment.
 load_dotenv()
-
-
-@contextlib.contextmanager
-def _spinner(text: str) -> Iterator[None]:
-    """Show an 'orbit' loading spinner during a slow op; no-op when stderr isn't a TTY."""
-    if _live_spinner is not None and sys.stderr.isatty():
-        with _live_spinner("orbit", text=text, stream=sys.stderr):
-            yield
-    else:
-        yield
 
 _VALID_LEVELS = {"error", "warn", "info", "debug"}
 _SITE_MAP_PATH = Path("data/cnc-map.json")
@@ -72,10 +54,22 @@ def _parse_levels(levels: str) -> list[str]:
         _die("--levels must be a non-empty comma-separated list")
     invalid = [p for p in parts if p not in _VALID_LEVELS]
     if invalid:
-        _die(
-            f"Invalid log levels: {invalid}. Valid: {sorted(_VALID_LEVELS)}"
-        )
+        _die(f"Invalid log levels: {invalid}. Valid: {sorted(_VALID_LEVELS)}")
     return parts
+
+
+def _parse_backfill(value: str) -> float:
+    """Parse the --backfill flag into hours. Accepts: inf, 0, Nh, Nd."""
+    s = value.strip().lower()
+    if s == "inf":
+        return float("inf")
+    if s == "0":
+        return 0.0
+    if s.endswith("h") and s[:-1].isdigit():
+        return float(int(s[:-1]))
+    if s.endswith("d") and s[:-1].isdigit():
+        return float(int(s[:-1]) * 24)
+    _die(f"--backfill must be 'inf', '0', 'Nh', or 'Nd' (got {value!r})")
 
 
 @app.command()
@@ -113,14 +107,13 @@ def triage(
 
     # [3] Fetch ticket.
     try:
-        with ZendeskClient.from_env() as zd, _spinner(f"Fetching ticket #{ticket_id}"):
+        with ZendeskClient.from_env() as zd, _spinner(
+            f"Fetching ticket #{ticket_id}", show=True
+        ):
             ticket_obj = zd.get_ticket(ticket_id)
     except RuntimeError as e:
         _die(str(e))
-    _vecho(
-        verbose,
-        f"Fetched ticket #{ticket_obj.id} — subject: {ticket_obj.subject}",
-    )
+    _vecho(verbose, f"Fetched ticket #{ticket_obj.id} — subject: {ticket_obj.subject}")
 
     # [4] Load site map.
     try:
@@ -152,67 +145,92 @@ def triage(
         f"Site resolved via {strategy}: {site_entry.site_name} ({site_entry.friendly_name})",
     )
 
-    # [6] Resolve anchor. Extraction is best-effort; fall back to created_at on failure.
-    extracted_dt: datetime | None = None
-    if not no_logs and at_dt is None:
-        try:
-            with _spinner("Asking Claude to extract incident timestamp"):
-                extracted_dt = asyncio.run(llm_extract_anchor(ticket_obj))
-        except Exception as e:
-            _vecho(verbose, f"Anchor extraction via Claude failed: {e}; falling back to created_at")
-    anchor_dt, anchor_source = extract.resolve_anchor(
-        ticket_obj, at_flag=at_dt, extracted=extracted_dt,
-    )
-    _vecho(verbose, f"Anchor: {anchor_dt.isoformat()} from {anchor_source.value}")
-
-    # [7] Fetch logs (skip if --no-logs). Build the window either way for the bundle.
-    start, end = extract.build_window(anchor_dt, window_minutes)
-    log_lines: list = []
-    log_truncated = False
-    if no_logs:
-        _vecho(verbose, "Skipping Datadog (--no-logs)")
-    else:
-        _vecho(
-            verbose,
-            f"Querying Datadog for {site_entry.site_name} "
-            f"levels={level_list} window={window_minutes}min",
-        )
-        try:
-            with DatadogClient.from_env() as dd, _spinner(
-                f"Querying Datadog for {site_entry.site_name}"
-            ):
-                log_lines, log_truncated = dd.get_logs(
-                    site_entry.site_name, level_list, start, end,
-                )
-        except (RuntimeError, ValueError) as e:
-            _die(str(e))
-        _vecho(verbose, f"Pulled {len(log_lines)} log lines (truncated={log_truncated})")
-
-    # [8] Build bundle.
-    bundle = TriageBundle(
-        ticket=ticket_obj,
-        site_entry=site_entry,
-        log_lines=log_lines,
-        log_truncated=log_truncated,
-        anchor=anchor_dt,
-        anchor_source=anchor_source,
-        window_start=start,
-        window_end=end,
-    )
-
-    # [9] Call LLM and render.
+    # [6] Run pipeline (anchor + Datadog + LLM). DatadogClient lifetime spans the call.
     try:
-        with _spinner("Generating triage note"):
-            markdown = asyncio.run(llm_triage(bundle))
-    except RuntimeError as e:
-        _die(
-            f"Claude Agent SDK call failed: {e}\n"
-            "Hint: confirm Claude Code is installed and authenticated by running `claude` once interactively."
-        )
+        with contextlib.ExitStack() as stack:
+            dd_client: DatadogClient | None = None
+            if not no_logs:
+                dd_client = stack.enter_context(DatadogClient.from_env())
+            markdown = pipeline.triage_one(
+                ticket_obj,
+                site_entry,
+                dd_client=dd_client,
+                window_minutes=window_minutes,
+                levels=level_list,
+                at=at_dt,
+                verbose=verbose,
+                show_spinner=True,
+            )
+    except (RuntimeError, ValueError) as e:
+        _die(str(e))
+
+    # [7] Render.
     render.print_note(markdown)
     if save:
         path = render.save_note(markdown, ticket_obj.id)
         typer.echo(f"\nSaved to: {path}", err=True)
+
+
+@app.command()
+def watch(
+    view: int = typer.Option(..., "--view", help="Zendesk view ID to watch"),
+    interval: int = typer.Option(
+        300, "--interval", min=10, help="Seconds to sleep after each iteration"
+    ),
+    state_file: Path | None = typer.Option(  # noqa: B008
+        None,
+        "--state-file",
+        help="State file path (default: data/watcher-state-<view>.json)",
+    ),
+    backfill: str = typer.Option(
+        "24h", "--backfill", help="Initial backfill horizon: inf, 0, Nh, Nd"
+    ),
+    window_minutes: int = typer.Option(
+        30, "--window-minutes", min=1, help="Window radius around the anchor in minutes"
+    ),
+    levels: str = typer.Option(
+        "error,warn", "--levels", help="Datadog log levels: comma-separated"
+    ),
+    no_logs: bool = typer.Option(
+        False, "--no-logs", help="Skip Datadog; ticket-content-only triage"
+    ),
+    print_notes: bool = typer.Option(
+        False, "--print-notes", help="Also print full markdown to stdout"
+    ),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Poll a Zendesk view and triage new or updated tickets in a loop."""
+    from triage_cli.watcher import WatcherOptions, run_watch
+
+    logging.basicConfig(
+        level=logging.INFO if verbose else logging.WARNING,
+        format="%(levelname)s %(name)s: %(message)s",
+    )
+
+    level_list = _parse_levels(levels)
+    backfill_hours = _parse_backfill(backfill)
+    resolved_state = (
+        state_file
+        if state_file is not None
+        else Path(f"data/watcher-state-{view}.json")
+    )
+
+    opts = WatcherOptions(
+        view_id=view,
+        interval=interval,
+        state_file=resolved_state,
+        backfill_hours=backfill_hours,
+        window_minutes=window_minutes,
+        levels=level_list,
+        no_logs=no_logs,
+        print_notes=print_notes,
+        verbose=verbose,
+    )
+    try:
+        run_watch(opts)
+    # FileNotFoundError: missing site map; ValueError: corrupt state file.
+    except (RuntimeError, FileNotFoundError, ValueError) as e:
+        _die(str(e))
 
 
 @app.command("build-map")

@@ -147,6 +147,31 @@ triage-cli build-map
 
 Runs `scripts/build_cnc_map.py` and prints a summary of entries written and gap entries logged.
 
+## Watching a Zendesk view
+
+Run a polling loop that triages every new or updated ticket in a Zendesk view:
+
+```bash
+triage-cli watch --view 12345
+```
+
+This will:
+- Poll the view every 5 minutes (`--interval 300`).
+- On first run, triage every ticket whose `updated_at` is within the last 24
+  hours (`--backfill 24h`) and silently mark older tickets as "seen".
+- Save each note to `./triage-notes/<ticket-id>-<timestamp>.md`.
+- Emit one structured status line per ticket to stderr.
+- Persist state to `data/watcher-state-<view-id>.json` so restarts pick up
+  where they left off.
+
+Common flags:
+- `--backfill 0` — watermark mode; only future updates trigger notes.
+- `--backfill inf` — triage every ticket in the view on first run.
+- `--print-notes` — also stream the full markdown to stdout.
+- `--no-logs` — skip Datadog (ticket-content-only triage).
+
+See `docs/runbooks/06-watching-a-view.md` for a full operator runbook.
+
 ## Output format
 
 The triage note is plain markdown with four fixed sections, in this order:
@@ -175,10 +200,9 @@ These are the v1 boundary; do not assume any of them have been addressed:
 
 - Site map is manually curated; refreshing the underlying Confluence inventory is an out-of-band step.
 - No station-level log filtering. Only call-center level via `@log.machineData.callCenterName`. The `DD_STATION_TAG` env var is reserved for v2.
-- No handling of ticket updates after the first run; single-shot only. There is no `agent-triaged` tag and no idempotency.
 - Internal Zendesk comments are sent to Claude. Output is terminal-only for v1, but be aware before adding any "post back to Zendesk" feature — internal comments would leak into anything posted publicly.
 - No retries on transient API failures; if Datadog or Zendesk hiccups, re-run the command.
-- Single-user, local execution. No scheduling, no watcher, no shared state.
+- Single-user, local execution. No scheduling, no shared state. (`watch` mode provides local single-user polling without external scheduling.)
 
 ## Project layout
 
@@ -191,13 +215,15 @@ triage-cli/
 ├── apex-cnc-inventory.md       # source of truth for the CNC map
 ├── .env.example
 ├── triage_cli/
-│   ├── cli.py                  # typer app: triage and build-map subcommands
+│   ├── cli.py                  # typer app: triage, watch, and build-map subcommands
 │   ├── zendesk.py              # ticket + comment fetch (httpx)
 │   ├── datadog.py              # log query (datadog-api-client)
 │   ├── extract.py              # ticket ID parsing, site lookup, window/anchor
 │   ├── llm.py                  # Claude Agent SDK calls + system prompts
+│   ├── models.py               # pydantic models
+│   ├── pipeline.py             # triage_one single-ticket orchestration
 │   ├── render.py               # markdown print + --save handling
-│   └── models.py               # pydantic models
+│   └── watcher.py              # watch command: poll loop, state, backfill
 ├── data/
 │   ├── cnc-map.json            # generated; do not hand-edit
 │   └── cnc-map-gaps.md         # generated; rows without CNC/site_name

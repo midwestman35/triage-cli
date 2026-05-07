@@ -23,15 +23,17 @@ def _ticket(
     description: str = "",
     requester_org: str | None = None,
     created_at: datetime | None = None,
+    updated_at: datetime | None = None,
 ) -> Ticket:
+    created = created_at or datetime(2026, 5, 1, 12, 0, 0, tzinfo=timezone.utc)
     return Ticket(
         id=1,
         subject=subject,
         description=description,
         requester_org=requester_org,
         tags=[],
-        created_at=created_at
-        or datetime(2026, 5, 1, 12, 0, 0, tzinfo=timezone.utc),
+        created_at=created,
+        updated_at=updated_at or created,
         comments=[],
     )
 
