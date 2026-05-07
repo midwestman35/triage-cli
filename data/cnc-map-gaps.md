@@ -4,10 +4,10 @@ Rows from `apex-cnc-inventory.md` that were skipped during conversion. Fill in
 the missing data and re-run `triage-cli build-map` (or
 `python scripts/build_cnc_map.py`) to regenerate `data/cnc-map.json`.
 
-Generated: 2026-05-07T16:01:39Z
+Generated: 2026-05-07T16:06:57Z
 Source: `apex-cnc-inventory.md`
 
-## Blank CNC UUID in source
+## Missing or unparseable CNC UUID in source
 
 | Site Name | Friendly Name | Notes |
 |---|---|---|

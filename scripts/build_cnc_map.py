@@ -76,12 +76,14 @@ def _normalize_label_to_site_name(label: str) -> str | None:
     return candidate if SITE_NAME_RE.match(candidate) else None
 
 
-def build_entries(inventory_text: str) -> tuple[list[dict], dict[str, list[dict]]]:
+def build_entries(
+    per_site_rows: list[list[str]], master_rows: list[list[str]]
+) -> tuple[list[dict], dict[str, list[dict]]]:
     """Return (entries sorted by site_name, gaps_by_reason)."""
     entries: dict[str, dict] = {}  # cnc -> entry
     gaps: dict[str, list[dict]] = {"blank": [], "unparseable_label": []}
 
-    for row in parse_table(inventory_text, PER_SITE_HEADING):
+    for row in per_site_rows:
         if len(row) < 3:
             continue
         site_name, friendly, cnc = row[0], row[1], row[2]
@@ -96,7 +98,7 @@ def build_entries(inventory_text: str) -> tuple[list[dict], dict[str, list[dict]
             "cnc": cnc.lower(),
         }
 
-    for row in parse_table(inventory_text, MASTER_HEADING):
+    for row in master_rows:
         if len(row) < 3:
             continue
         label, cnc, region = row[0], row[1], row[2]
@@ -153,7 +155,7 @@ def render_gaps_markdown(gaps: dict[str, list[dict]]) -> str:
         for r in gaps.get("blank", [])
     ]
     lines += _render_section(
-        "Blank CNC UUID in source",
+        "Missing or unparseable CNC UUID in source",
         "| Site Name | Friendly Name | Notes |",
         blank_rows,
     )
@@ -170,8 +172,16 @@ def render_gaps_markdown(gaps: dict[str, list[dict]]) -> str:
 
 
 def main() -> None:
-    inventory_text = INVENTORY.read_text(encoding="utf-8")
-    entries, gaps = build_entries(inventory_text)
+    inventory_text = INVENTORY.read_text(encoding="utf-8-sig")
+    per_site_rows = parse_table(inventory_text, PER_SITE_HEADING)
+    master_rows = parse_table(inventory_text, MASTER_HEADING)
+    if not per_site_rows and not master_rows:
+        raise SystemExit(
+            f"No table rows found under either '{PER_SITE_HEADING}' or "
+            f"'{MASTER_HEADING}' in {INVENTORY}. Headings may have changed; "
+            f"refusing to overwrite {MAP_OUT.relative_to(REPO_ROOT)}."
+        )
+    entries, gaps = build_entries(per_site_rows, master_rows)
     MAP_OUT.parent.mkdir(parents=True, exist_ok=True)
     MAP_OUT.write_text(json.dumps(entries, indent=2) + "\n", encoding="utf-8")
     GAPS_OUT.write_text(render_gaps_markdown(gaps), encoding="utf-8")
