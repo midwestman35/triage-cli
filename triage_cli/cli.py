@@ -145,15 +145,15 @@ def triage(
     anchor_dt, anchor_source = extract.resolve_anchor(
         ticket_obj, at_flag=at_dt, extracted=extracted_dt,
     )
+    _vecho(verbose, f"Anchor: {anchor_dt.isoformat()} from {anchor_source.value}")
 
     # [7] Fetch logs (skip if --no-logs). Build the window either way for the bundle.
     start, end = extract.build_window(anchor_dt, window_minutes)
     log_lines: list = []
     log_truncated = False
     if no_logs:
-        _vecho(verbose, "Skipping anchor extraction and Datadog (--no-logs)")
+        _vecho(verbose, "Skipping Datadog (--no-logs)")
     else:
-        _vecho(verbose, f"Anchor: {anchor_dt.isoformat()} from {anchor_source.value}")
         _vecho(
             verbose,
             f"Querying Datadog for {site_entry.site_name} "
@@ -183,7 +183,7 @@ def triage(
     # [9] Call LLM and render.
     try:
         markdown = asyncio.run(llm_triage(bundle))
-    except Exception as e:
+    except RuntimeError as e:
         _die(
             f"Claude Agent SDK call failed: {e}\n"
             "Hint: confirm Claude Code is installed and authenticated by running `claude` once interactively."
