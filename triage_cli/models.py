@@ -1,28 +1,25 @@
 """Pydantic data models for the triage-cli pipeline."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from enum import Enum
-from typing import Any
+from datetime import UTC, datetime
+from enum import StrEnum
+from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 def fmt_ts(dt: datetime) -> str:
     """Render a datetime as ISO 8601 in UTC with Z suffix, no microseconds."""
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    else:
-        dt = dt.astimezone(timezone.utc)
+    dt = dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt.astimezone(UTC)
     return dt.replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def indent_continuations(s: str) -> str:
-    """Indent every line after the first by two spaces so multi-line content stays visually attached to its bullet/section."""
+    """Indent continuation lines so wrapped bullets remain visually attached."""
     return s.replace("\n", "\n  ")
 
 
-class AnchorSource(str, Enum):
+class AnchorSource(StrEnum):
     """Where the anchor timestamp on a TriageBundle came from."""
 
     FLAG = "flag"
@@ -135,3 +132,57 @@ class TriageNote(BaseModel):
     """Raw markdown response from the triage LLM call; no schema enforcement."""
 
     markdown: str
+
+
+Confidence = Literal["low", "medium", "high"]
+
+
+class TimeWindow(BaseModel):
+    """A timezone-aware UTC window. Both endpoints inclusive."""
+
+    start: datetime
+    end: datetime
+
+    @field_validator("start", "end")
+    @classmethod
+    def _as_utc(cls, value: datetime) -> datetime:
+        return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+
+
+class EvidenceItem(BaseModel):
+    """A single piece of evidence cited by the LLM in support of its finding.
+
+    `timestamp` and `service` are None when the evidence comes from the ticket
+    text rather than a Datadog log line.
+    """
+
+    timestamp: datetime | None = None
+    service: str | None = None
+    message: str
+
+
+class LLMTriageOutput(BaseModel):
+    """The fields the LLM emits as JSON. Subset of `TriageReport`."""
+
+    finding: str
+    confidence: Confidence
+    evidence: list[EvidenceItem]
+    suggested_note: str
+    next_checks: list[str] = Field(default_factory=list)
+    unknowns: list[str] = Field(default_factory=list)
+
+
+class TriageReport(LLMTriageOutput):
+    """Full triage report: LLM output + pipeline-derived metadata."""
+
+    ticket_id: int
+    site_name: str
+    window: TimeWindow
+    sources: list[str]
+    log_event_count: int
+    generated_at: datetime
+
+    @field_validator("generated_at")
+    @classmethod
+    def _generated_at_as_utc(cls, value: datetime) -> datetime:
+        return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)

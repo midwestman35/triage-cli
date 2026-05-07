@@ -18,7 +18,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -109,7 +109,7 @@ def should_triage(ticket: Ticket, state: State, backfill_cutoff: datetime) -> bo
         logger.warning("watcher: corrupt timestamp for ticket %s in state: %r", key, stored)
         return True
     if stored_dt.tzinfo is None:
-        stored_dt = stored_dt.replace(tzinfo=timezone.utc)
+        stored_dt = stored_dt.replace(tzinfo=UTC)
     return ticket.updated_at > stored_dt
 
 
@@ -176,7 +176,7 @@ def run_iteration(
             continue
 
         try:
-            markdown = pipeline.triage_one(
+            report = pipeline.triage_one(
                 ticket,
                 site_entry,
                 dd_client=dd_client,
@@ -191,13 +191,19 @@ def run_iteration(
             continue
 
         try:
-            path = render.save_note(markdown, ticket.id)
+            md_path, _json_path = render.save_note(report, ticket.id)
         except OSError as e:
             _emit(f"[{_now_local_hms()}] #{tid} failed: could not write note: {e} (will retry)")
             continue
-        _emit(f"[{_now_local_hms()}] #{tid} triaged → {path}")
+        _emit(f"[{_now_local_hms()}] #{tid} triaged → {md_path}")
+        if opts.verbose:
+            sources_str = ", ".join(report.sources)
+            _emit(
+                f"[{_now_local_hms()}] #{tid} confidence: {report.confidence}; "
+                f"events: {report.log_event_count}; sources: {sources_str}"
+            )
         if opts.print_notes:
-            print(markdown.rstrip() + "\n---", flush=True)
+            print(render.to_markdown(report).rstrip() + "\n---", flush=True)
         triaged_map[key] = ticket.updated_at.isoformat()
 
     return new_state
@@ -213,9 +219,9 @@ def run_watch(opts: WatcherOptions) -> None:
     sites = extract.load_site_map(Path("data/cnc-map.json"))
     state = load_state(opts.state_file)
     cutoff = (
-        datetime.now(timezone.utc) - timedelta(hours=opts.backfill_hours)
+        datetime.now(UTC) - timedelta(hours=opts.backfill_hours)
         if math.isfinite(opts.backfill_hours)
-        else datetime.min.replace(tzinfo=timezone.utc)
+        else datetime.min.replace(tzinfo=UTC)
     )
 
     iteration = 0

@@ -12,7 +12,7 @@ import contextlib
 import logging
 import sys
 from collections.abc import Iterator
-from datetime import datetime
+from datetime import UTC, datetime
 
 from unicode_animations import live_spinner as _live_spinner
 
@@ -20,7 +20,7 @@ from triage_cli import extract
 from triage_cli.datadog import DatadogClient
 from triage_cli.llm import extract_anchor as _llm_extract_anchor
 from triage_cli.llm import triage as _llm_triage
-from triage_cli.models import SiteEntry, Ticket, TriageBundle
+from triage_cli.models import SiteEntry, Ticket, TimeWindow, TriageBundle, TriageReport
 
 logger = logging.getLogger(__name__)
 
@@ -51,10 +51,10 @@ def triage_one(
     at: datetime | None,
     verbose: bool,
     show_spinner: bool,
-) -> str:
+) -> TriageReport:
     """Run the triage pipeline for a fetched ticket and resolved site.
 
-    Returns the rendered markdown.
+    Returns a `TriageReport` (LLM output + pipeline-derived metadata).
     Raises RuntimeError on Datadog or Claude failure.
     Raises ValueError on validation failure (e.g. invalid window).
     """
@@ -96,5 +96,16 @@ def triage_one(
     )
 
     with spinner("Generating triage note", show=show_spinner):
-        markdown = asyncio.run(_llm_triage(bundle))
-    return markdown
+        llm_out = asyncio.run(_llm_triage(bundle, verbose=verbose))
+
+    sources = ["zendesk"] + (["datadog"] if dd_client is not None else [])
+
+    return TriageReport(
+        **llm_out.model_dump(),
+        ticket_id=ticket.id,
+        site_name=site_entry.site_name,
+        window=TimeWindow(start=start, end=end),
+        sources=sources,
+        log_event_count=len(log_lines),
+        generated_at=datetime.now(UTC),
+    )
