@@ -82,7 +82,9 @@ def triage(
     at: str | None = typer.Option(None, "--at", help="Anchor timestamp override (ISO 8601)"),
     cnc: str | None = typer.Option(None, "--cnc", help="CNC UUID override"),
     site: str | None = typer.Option(None, "--site", help="site_name override (bypasses lookup)"),
-    levels: str = typer.Option("error,warn", "--levels", help="Datadog log levels: comma-separated"),
+    levels: str = typer.Option(
+        "error,warn", "--levels", help="Datadog log levels: comma-separated"
+    ),
     no_interactive: bool = typer.Option(
         False,
         "--no-interactive",
@@ -151,7 +153,7 @@ def triage(
             dd_client: DatadogClient | None = None
             if not no_logs:
                 dd_client = stack.enter_context(DatadogClient.from_env())
-            markdown = pipeline.triage_one(
+            report = pipeline.triage_one(
                 ticket_obj,
                 site_entry,
                 dd_client=dd_client,
@@ -165,10 +167,19 @@ def triage(
         _die(str(e))
 
     # [7] Render.
-    render.print_note(markdown)
+    render.print_note(report)
     if save:
-        path = render.save_note(markdown, ticket_obj.id)
-        typer.echo(f"\nSaved to: {path}", err=True)
+        md_path, json_path = render.save_note(report, ticket_obj.id)
+        typer.echo(f"Saved: {md_path} and {json_path}", err=True)
+
+    if verbose:
+        sources_str = ", ".join(report.sources)
+        typer.echo(
+            f"Confidence: {report.confidence} · "
+            f"events: {report.log_event_count} · "
+            f"sources: {sources_str}",
+            err=True,
+        )
 
 
 @app.command()

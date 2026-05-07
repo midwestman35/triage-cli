@@ -1,4 +1,4 @@
-"""Pure-function helpers for the triage pipeline: ID parsing, site lookup, time-window construction, and anchor resolution.
+"""Pure-function helpers for triage ID parsing, site lookup, windows, and anchors.
 
 All datetimes returned are timezone-aware UTC. Naive inputs are assumed UTC.
 The only function that performs I/O is `load_site_map`, which reads the
@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from pydantic import ValidationError
@@ -20,7 +20,7 @@ _RAW_ID_RE = re.compile(r"^\d+$")
 
 
 def parse_ticket_id(value: str) -> int:
-    """Parse a Zendesk ticket ID from a raw number, a /agent/tickets/<id> URL, or a /tickets/<id> URL.
+    """Parse a Zendesk ticket ID from a raw number or ticket URL.
 
     Raises ValueError on unrecognized input (empty string, non-numeric junk, or
     a URL with no numeric tail).
@@ -75,7 +75,8 @@ def lookup_site(
     5. Substring match of any friendly_name in ticket.subject + ticket.description.
 
     Among substring matches, the longest matching name wins; ties broken by list order.
-    Comment thread is intentionally not searched; only subject and description form the substring haystack.
+    Comment thread is intentionally not searched; only subject and description
+    form the substring haystack.
 
     Returns (entry, strategy) where strategy is one of:
         "site_flag", "cnc_flag", "org_match", "site_substring",
@@ -118,20 +119,21 @@ def lookup_site(
     best_site: SiteEntry | None = None
     for entry in sites:
         sn = entry.site_name.lower()
-        if sn and sn in haystack:
-            if best_site is None or len(entry.site_name) > len(best_site.site_name):
-                best_site = entry
+        if sn and sn in haystack and (
+            best_site is None or len(entry.site_name) > len(best_site.site_name)
+        ):
+            best_site = entry
     if best_site is not None:
         return best_site, "site_substring"
 
     best_friendly: SiteEntry | None = None
     for entry in sites:
         fn = entry.friendly_name.lower()
-        if fn and fn in haystack:
-            if best_friendly is None or len(entry.friendly_name) > len(
-                best_friendly.friendly_name
-            ):
-                best_friendly = entry
+        if fn and fn in haystack and (
+            best_friendly is None
+            or len(entry.friendly_name) > len(best_friendly.friendly_name)
+        ):
+            best_friendly = entry
     if best_friendly is not None:
         return best_friendly, "friendly_substring"
 
@@ -141,8 +143,8 @@ def lookup_site(
 def _to_utc(dt: datetime) -> datetime:
     """Normalize a datetime to timezone-aware UTC. Naive inputs are assumed UTC."""
     if dt.tzinfo is None:
-        return dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
+        return dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
 
 
 def build_window(anchor: datetime, minutes: int) -> tuple[datetime, datetime]:

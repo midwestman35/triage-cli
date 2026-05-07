@@ -10,9 +10,17 @@ import json
 import logging
 import os
 import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
-from triage_cli.models import Ticket, TriageBundle, fmt_ts, indent_continuations
+from pydantic import ValidationError
+
+from triage_cli.models import (
+    LLMTriageOutput,
+    Ticket,
+    TriageBundle,
+    fmt_ts,
+    indent_continuations,
+)
 
 try:
     from claude_agent_sdk import (
@@ -32,37 +40,37 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL = "claude-sonnet-4-6"
 
-TRIAGE_SYSTEM_PROMPT = """You are a triage assistant for a Network Engineer working on the Carbyne APEX
-NG911/E911 platform at Axon. You receive a Zendesk ticket and a window of
-Datadog logs from the affected customer. Produce a structured triage note in
-markdown with exactly these four sections, in this order:
+TRIAGE_SYSTEM_PROMPT = """You are a triage assistant for a Network Engineer
+working on the Carbyne APEX NG911/E911 platform at Axon. You receive a Zendesk
+ticket and a window of Datadog logs from the affected customer. Return a single
+JSON object — no prose, no commentary, no fences required but a ```json fence is
+acceptable — matching this schema:
 
-## Summary
-Two sentences. What the ticket reports. No speculation.
+{
+  "finding":         "<one or two sentences. What's likely wrong. No padding.>",
+  "confidence":      "low" | "medium" | "high",
+  "evidence":        [{"timestamp": "<ISO 8601 UTC or null>",
+                       "service": "<service name or null>",
+                       "message": "<terse, factual; quote sparingly>"}],
+  "suggested_note":  "<paste-ready Zendesk internal note. Markdown allowed.
+                       Hedge on uncertain claims. Cite log lines you saw.>",
+  "next_checks":     ["<concrete verification step>", ...],
+  "unknowns":        ["<what you couldn't determine>", ...]
+}
 
-## Log signals
-What the logs actually show in the window. Quote sparingly. Note error
-counts, recurring messages, and timing relative to the anchor timestamp. If
-logs are empty or all routine, say so plainly. Do not infer causes here.
-
-## Likely cause (inference)
-Your best guess at the cause, given the ticket and logs. Mark this section as
-inference. If the logs do not support a cause, say "Insufficient log evidence
-to infer cause" rather than guessing.
-
-## Suggested first action
-One concrete step the engineer should take first. Prefer "check X" or
-"verify Y" over open-ended advice. If you cannot suggest a useful action,
-say so.
+Confidence calibration:
+- "high":   logs and ticket agree on a specific failure mode.
+- "medium": logs are consistent with one cause but don't prove it.
+- "low":    logs absent, ambiguous, or contradict the ticket.
 
 Rules:
 - Do not invent log lines, error codes, ticket IDs, or past incidents.
-- Do not assign priority or confidence scores.
-- Do not pad. Empty findings are valid findings.
-- If sections 2 and 3 disagree, that is signal; do not paper over it."""
+- Empty arrays for next_checks/unknowns are preferred over filler.
+- If you would hedge three times in finding, the right field is confidence:"low"."""
 
-ANCHOR_EXTRACTION_PROMPT = """You extract the most likely incident timestamp from a Zendesk ticket. Read
-the subject, description, and comments. Return JSON with a single field:
+ANCHOR_EXTRACTION_PROMPT = """You extract the most likely incident timestamp
+from a Zendesk ticket. Read the subject, description, and comments. Return JSON
+with a single field:
 
 {"timestamp": "<ISO 8601 in UTC>" or null}
 
@@ -93,20 +101,50 @@ async def _collect_text(prompt: str, system_prompt: str, model: str) -> str:
     return "".join(chunks)
 
 
-async def triage(bundle: TriageBundle, model: str | None = None) -> str:
-    """Run the main triage call. Returns the raw markdown response, stripped."""
+async def triage(
+    bundle: TriageBundle,
+    model: str | None = None,
+    *,
+    verbose: bool = False,
+) -> LLMTriageOutput:
+    """Run the main triage call. Returns a parsed `LLMTriageOutput`.
+
+    On malformed JSON, retries once with a stricter nudge appended to the
+    user prompt. Verbose mode logs the first-attempt failure. Second failure
+    raises RuntimeError into the caller's failure path.
+    """
     resolved = _resolve_model(model)
-    text = (await _collect_text(
-        prompt=bundle.as_user_message(),
+    base_prompt = bundle.as_user_message()
+
+    raw = (await _collect_text(
+        prompt=base_prompt,
         system_prompt=TRIAGE_SYSTEM_PROMPT,
         model=resolved,
     )).strip()
-    if not text:
-        raise RuntimeError(
-            "Claude Agent SDK returned no text content. Verify Claude Code "
-            "is installed and authenticated (run `claude` once interactively)."
+    try:
+        return LLMTriageOutput.model_validate_json(_strip_code_fence(raw))
+    except (json.JSONDecodeError, ValidationError) as e:
+        if verbose:
+            logger.warning(
+                "triage: first attempt returned invalid JSON from %s; retrying. %s",
+                resolved, e,
+            )
+        retry_prompt = (
+            base_prompt
+            + "\n\nReturn ONLY a single valid JSON object matching the schema. "
+            + "No prose, no commentary."
         )
-    return text
+        raw2 = (await _collect_text(
+            prompt=retry_prompt,
+            system_prompt=TRIAGE_SYSTEM_PROMPT,
+            model=resolved,
+        )).strip()
+        try:
+            return LLMTriageOutput.model_validate_json(_strip_code_fence(raw2))
+        except (json.JSONDecodeError, ValidationError) as e2:
+            raise RuntimeError(
+                f"LLM returned invalid TriageReport JSON after retry: {e2}"
+            ) from e2
 
 
 def _ticket_for_anchor(ticket: Ticket) -> str:
@@ -171,8 +209,5 @@ async def extract_anchor(ticket: Ticket, model: str | None = None) -> datetime |
     except ValueError:
         logger.debug("extract_anchor: could not parse timestamp from %s: %r", resolved, ts)
         return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    else:
-        dt = dt.astimezone(timezone.utc)
+    dt = dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt.astimezone(UTC)
     return dt

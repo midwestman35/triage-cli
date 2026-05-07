@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-from datetime import datetime, timezone
 import json
 import re
+from datetime import UTC, datetime
+from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 INVENTORY = REPO_ROOT / "apex-cnc-inventory.md"
@@ -138,7 +138,7 @@ def _render_section(heading: str, header: str, rows: list[str]) -> list[str]:
 
 
 def render_gaps_markdown(gaps: dict[str, list[dict]]) -> str:
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    now = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     lines = [
         "# CNC map gaps",
         "",

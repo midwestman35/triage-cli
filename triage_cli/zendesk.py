@@ -38,7 +38,7 @@ class ZendeskClient:
         )
 
     @classmethod
-    def from_env(cls) -> "ZendeskClient":
+    def from_env(cls) -> ZendeskClient:
         """Construct from ZENDESK_SUBDOMAIN, ZENDESK_EMAIL, ZENDESK_API_TOKEN env vars."""
         required = ("ZENDESK_SUBDOMAIN", "ZENDESK_EMAIL", "ZENDESK_API_TOKEN")
         values = {name: os.environ.get(name) for name in required}
@@ -57,7 +57,7 @@ class ZendeskClient:
         """Close the underlying HTTP client."""
         self._client.close()
 
-    def __enter__(self) -> "ZendeskClient":
+    def __enter__(self) -> ZendeskClient:
         return self
 
     def __exit__(

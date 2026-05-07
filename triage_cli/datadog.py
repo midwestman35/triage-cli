@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 import os
 import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from types import TracebackType
 from typing import Any
 
@@ -43,7 +43,7 @@ class DatadogClient:
         self._max_lines = max_lines
 
     @classmethod
-    def from_env(cls) -> "DatadogClient":
+    def from_env(cls) -> DatadogClient:
         """Construct from DD_API_KEY, DD_APP_KEY, DD_SITE, DD_CALL_CENTER_TAG env vars."""
         api_key = os.environ.get("DD_API_KEY")
         app_key = os.environ.get("DD_APP_KEY")
@@ -54,14 +54,16 @@ class DatadogClient:
             api_key=api_key,  # type: ignore[arg-type]
             app_key=app_key,  # type: ignore[arg-type]
             site=os.environ.get("DD_SITE") or "datadoghq.com",
-            call_center_tag=os.environ.get("DD_CALL_CENTER_TAG") or "@log.machineData.callCenterName",
+            call_center_tag=(
+                os.environ.get("DD_CALL_CENTER_TAG") or "@log.machineData.callCenterName"
+            ),
         )
 
     def close(self) -> None:
         """Close the underlying SDK ApiClient."""
         self._api_client.close()
 
-    def __enter__(self) -> "DatadogClient":
+    def __enter__(self) -> DatadogClient:
         return self
 
     def __exit__(
@@ -127,7 +129,7 @@ class DatadogClient:
 
 def _ensure_aware(dt: datetime) -> datetime:
     """Return a timezone-aware datetime; treat naive inputs as UTC."""
-    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
 
 
 def _get(obj: Any, key: str) -> Any:
@@ -164,9 +166,9 @@ def _to_log_line(item: Any) -> LogLine:
     if isinstance(ts, str):
         ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
     if ts is None:
-        ts = datetime.now(timezone.utc)
+        ts = datetime.now(UTC)
     elif isinstance(ts, datetime) and ts.tzinfo is None:
-        ts = ts.replace(tzinfo=timezone.utc)
+        ts = ts.replace(tzinfo=UTC)
 
     level = _get(inner, "status") or getattr(outer, "status", None) or "info"
     message = getattr(outer, "message", None)

@@ -1,7 +1,7 @@
 """Tests for triage_cli.extract -- pure-function helpers."""
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 
@@ -12,7 +12,6 @@ from triage_cli.extract import (
     resolve_anchor,
 )
 from triage_cli.models import AnchorSource, SiteEntry, Ticket
-
 
 # ---------- shared fixtures ----------
 
@@ -25,7 +24,7 @@ def _ticket(
     created_at: datetime | None = None,
     updated_at: datetime | None = None,
 ) -> Ticket:
-    created = created_at or datetime(2026, 5, 1, 12, 0, 0, tzinfo=timezone.utc)
+    created = created_at or datetime(2026, 5, 1, 12, 0, 0, tzinfo=UTC)
     return Ticket(
         id=1,
         subject=subject,
@@ -290,10 +289,10 @@ def test_lookup_site_empty_org_falls_through_to_substring(
 
 
 def test_build_window_basic_aware_utc() -> None:
-    anchor = datetime(2026, 5, 1, 12, 0, 0, tzinfo=timezone.utc)
+    anchor = datetime(2026, 5, 1, 12, 0, 0, tzinfo=UTC)
     start, end = build_window(anchor, 30)
-    assert start == datetime(2026, 5, 1, 11, 30, 0, tzinfo=timezone.utc)
-    assert end == datetime(2026, 5, 1, 12, 30, 0, tzinfo=timezone.utc)
+    assert start == datetime(2026, 5, 1, 11, 30, 0, tzinfo=UTC)
+    assert end == datetime(2026, 5, 1, 12, 30, 0, tzinfo=UTC)
     assert start.tzinfo is not None
     assert end.tzinfo is not None
 
@@ -301,26 +300,26 @@ def test_build_window_basic_aware_utc() -> None:
 def test_build_window_naive_treated_as_utc() -> None:
     anchor = datetime(2026, 5, 1, 12, 0, 0)  # naive
     start, end = build_window(anchor, 30)
-    assert start == datetime(2026, 5, 1, 11, 30, 0, tzinfo=timezone.utc)
-    assert end == datetime(2026, 5, 1, 12, 30, 0, tzinfo=timezone.utc)
+    assert start == datetime(2026, 5, 1, 11, 30, 0, tzinfo=UTC)
+    assert end == datetime(2026, 5, 1, 12, 30, 0, tzinfo=UTC)
 
 
 def test_build_window_non_utc_aware_converted() -> None:
     pacific = timezone(timedelta(hours=-7))
     anchor = datetime(2026, 5, 1, 5, 0, 0, tzinfo=pacific)  # 12:00 UTC
     start, end = build_window(anchor, 15)
-    assert start == datetime(2026, 5, 1, 11, 45, 0, tzinfo=timezone.utc)
-    assert end == datetime(2026, 5, 1, 12, 15, 0, tzinfo=timezone.utc)
+    assert start == datetime(2026, 5, 1, 11, 45, 0, tzinfo=UTC)
+    assert end == datetime(2026, 5, 1, 12, 15, 0, tzinfo=UTC)
 
 
 def test_build_window_zero_minutes_raises() -> None:
-    anchor = datetime(2026, 5, 1, 12, 0, 0, tzinfo=timezone.utc)
+    anchor = datetime(2026, 5, 1, 12, 0, 0, tzinfo=UTC)
     with pytest.raises(ValueError):
         build_window(anchor, 0)
 
 
 def test_build_window_negative_minutes_raises() -> None:
-    anchor = datetime(2026, 5, 1, 12, 0, 0, tzinfo=timezone.utc)
+    anchor = datetime(2026, 5, 1, 12, 0, 0, tzinfo=UTC)
     with pytest.raises(ValueError):
         build_window(anchor, -5)
 
@@ -329,9 +328,9 @@ def test_build_window_negative_minutes_raises() -> None:
 
 
 def test_resolve_anchor_flag_wins() -> None:
-    flag = datetime(2026, 5, 1, 10, 0, 0, tzinfo=timezone.utc)
-    extracted = datetime(2026, 5, 1, 11, 0, 0, tzinfo=timezone.utc)
-    created = datetime(2026, 5, 1, 12, 0, 0, tzinfo=timezone.utc)
+    flag = datetime(2026, 5, 1, 10, 0, 0, tzinfo=UTC)
+    extracted = datetime(2026, 5, 1, 11, 0, 0, tzinfo=UTC)
+    created = datetime(2026, 5, 1, 12, 0, 0, tzinfo=UTC)
     ticket = _ticket(created_at=created)
     dt, src = resolve_anchor(ticket, at_flag=flag, extracted=extracted)
     assert dt == flag
@@ -339,8 +338,8 @@ def test_resolve_anchor_flag_wins() -> None:
 
 
 def test_resolve_anchor_extracted_wins_over_created() -> None:
-    extracted = datetime(2026, 5, 1, 11, 0, 0, tzinfo=timezone.utc)
-    created = datetime(2026, 5, 1, 12, 0, 0, tzinfo=timezone.utc)
+    extracted = datetime(2026, 5, 1, 11, 0, 0, tzinfo=UTC)
+    created = datetime(2026, 5, 1, 12, 0, 0, tzinfo=UTC)
     ticket = _ticket(created_at=created)
     dt, src = resolve_anchor(ticket, at_flag=None, extracted=extracted)
     assert dt == extracted
@@ -348,7 +347,7 @@ def test_resolve_anchor_extracted_wins_over_created() -> None:
 
 
 def test_resolve_anchor_falls_back_to_created_at() -> None:
-    created = datetime(2026, 5, 1, 12, 0, 0, tzinfo=timezone.utc)
+    created = datetime(2026, 5, 1, 12, 0, 0, tzinfo=UTC)
     ticket = _ticket(created_at=created)
     dt, src = resolve_anchor(ticket, at_flag=None, extracted=None)
     assert dt == created
@@ -360,5 +359,5 @@ def test_resolve_anchor_normalizes_naive_to_utc() -> None:
     ticket = _ticket()
     dt, src = resolve_anchor(ticket, at_flag=naive_flag, extracted=None)
     assert dt.tzinfo is not None
-    assert dt == datetime(2026, 5, 1, 10, 0, 0, tzinfo=timezone.utc)
+    assert dt == datetime(2026, 5, 1, 10, 0, 0, tzinfo=UTC)
     assert src == AnchorSource.FLAG
