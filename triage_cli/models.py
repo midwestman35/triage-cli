@@ -1,11 +1,25 @@
 """Pydantic data models for the triage-cli pipeline."""
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
 from pydantic import BaseModel, Field
+
+
+def _fmt_ts(dt: datetime) -> str:
+    """Render a datetime as ISO 8601 in UTC with Z suffix, no microseconds."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return dt.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _indent_continuations(s: str) -> str:
+    """Indent every line after the first by two spaces so multi-line content stays visually attached to its bullet/section."""
+    return s.replace("\n", "\n  ")
 
 
 class AnchorSource(str, Enum):
@@ -63,6 +77,8 @@ class TriageBundle(BaseModel):
     log_truncated: bool = False
     anchor: datetime
     anchor_source: AnchorSource
+    window_start: datetime
+    window_end: datetime
 
     def as_user_message(self) -> str:
         t = self.ticket
@@ -79,18 +95,19 @@ class TriageBundle(BaseModel):
         lines.append("")
         lines.append(f"# Ticket #{t.id}")
         lines.append(f"Subject: {t.subject}")
-        lines.append(f"Created: {t.created_at.isoformat()}")
+        lines.append(f"Created: {_fmt_ts(t.created_at)}")
         lines.append(f"Requester org: {org_str}")
         lines.append(f"Tags: {tags_str}")
         lines.append("")
         lines.append("## Description")
-        lines.append(t.description)
+        lines.append(_indent_continuations(t.description))
         lines.append("")
         lines.append('## Comments (chronological; "[internal]" prefix for non-public)')
         if t.comments:
             for c in t.comments:
                 prefix = "" if c.is_public else "[internal] "
-                lines.append(f"- {prefix}{c.created_at.isoformat()} — {c.author}: {c.body}")
+                body = _indent_continuations(c.body)
+                lines.append(f"- {prefix}{_fmt_ts(c.created_at)} — {c.author}: {body}")
         else:
             lines.append("(no comments)")
         lines.append("")
@@ -98,13 +115,15 @@ class TriageBundle(BaseModel):
         n = len(self.log_lines)
         truncated_str = ", truncated" if self.log_truncated else ""
         header = (
-            f"# Logs (anchor: {self.anchor.isoformat()} from {self.anchor_source.value}; "
+            f"# Logs (anchor: {_fmt_ts(self.anchor)} from {self.anchor_source.value}; "
+            f"window: {_fmt_ts(self.window_start)} to {_fmt_ts(self.window_end)}; "
             f"{n} lines{truncated_str})"
         )
         lines.append(header)
         if self.log_lines:
             for log in self.log_lines:
-                lines.append(f"- {log.timestamp.isoformat()} [{log.level}] {log.message}")
+                msg = _indent_continuations(log.message)
+                lines.append(f"- {_fmt_ts(log.timestamp)} [{log.level}] {msg}")
         else:
             lines.append("(no logs in window)")
 
