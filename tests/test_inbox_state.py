@@ -46,7 +46,7 @@ def test_sort_pending_below_triaged_above_failed():
     rows = [
         RowEntry(ticket_id=1, status="failed", report=None, failure_reason="x"),
         RowEntry(ticket_id=2, status="triaged", report=_report(2)),
-        RowEntry(ticket_id=3, status="pending", report=None),
+        RowEntry(ticket_id=3, status="queued", report=None),
     ]
     out = sort_rows(rows)
-    assert [r.status for r in out] == ["triaged", "pending", "failed"]
+    assert [r.status for r in out] == ["triaged", "queued", "failed"]

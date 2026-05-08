@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import subprocess
 import sys
@@ -13,8 +14,8 @@ import typer
 from dotenv import load_dotenv
 
 from triage_cli import extract, pipeline, render
-from triage_cli.datadog import DatadogClient
-from triage_cli.models import SiteEntry
+from triage_cli.datadog import DatadogClient, DatadogError
+from triage_cli.models import SiteEntry, TriageReport
 from triage_cli.pipeline import spinner as _spinner
 from triage_cli.zendesk import ZendeskClient
 
@@ -23,6 +24,7 @@ load_dotenv()
 
 _VALID_LEVELS = {"error", "warn", "info", "debug"}
 _SITE_MAP_PATH = Path("data/cnc-map.json")
+_VIEWS_PATH = Path("data/views.json")
 
 app = typer.Typer(no_args_is_help=True, add_completion=False)
 
@@ -72,9 +74,32 @@ def _parse_backfill(value: str) -> float:
     _die(f"--backfill must be 'inf', '0', 'Nh', or 'Nd' (got {value!r})")
 
 
-def _configure_inbox_logging(view: int, verbose: bool) -> Path:
+def _resolve_view(view: str | None) -> tuple[int | None, str]:
+    """Resolve --view to (view_id, state_key).
+
+    None view means "my assigned tickets". A numeric string is used as-is.
+    A non-numeric string is looked up in data/views.json.
+    Returns (None, "me") for the personal queue.
+    """
+    if view is None:
+        return None, "me"
+    try:
+        return int(view), view
+    except ValueError:
+        pass
+    if _VIEWS_PATH.exists():
+        try:
+            named: dict = json.loads(_VIEWS_PATH.read_text())
+            if view in named:
+                return int(named[view]), view
+        except (json.JSONDecodeError, ValueError):
+            pass
+    _die(f"Unknown view {view!r}. Use a numeric ID or a name from {_VIEWS_PATH}.")
+
+
+def _configure_inbox_logging(view_key: str, verbose: bool) -> Path:
     """Route triage_cli logs to the inbox log file before Textual starts."""
-    log_path = Path("data") / f"inbox-{view}.log"
+    log_path = Path("data") / f"inbox-{view_key}.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
     log_logger = logging.getLogger("triage_cli")
@@ -146,10 +171,12 @@ def triage(
     except (FileNotFoundError, ValueError) as e:
         _die(f"{e}\nHint: run 'triage-cli build-map' to (re)generate {_SITE_MAP_PATH}.")
 
-    # [5] Resolve site.
+    # [5] Resolve site (substring match → LLM fallback → interactive prompt).
     try:
-        site_entry, strategy = extract.lookup_site(
-            ticket_obj, sites, cnc_override=cnc, site_override=site,
+        site_entry, strategy = pipeline.resolve_site(
+            ticket_obj, sites,
+            cnc_override=cnc, site_override=site,
+            verbose=verbose, show_spinner=True,
         )
     except ValueError as e:
         _die(str(e))
@@ -171,12 +198,12 @@ def triage(
     )
 
     # [6] Run pipeline (anchor + Datadog + LLM). DatadogClient lifetime spans the call.
-    try:
+    def _run_pipeline(use_dd: bool) -> TriageReport:
         with contextlib.ExitStack() as stack:
             dd_client: DatadogClient | None = None
-            if not no_logs:
+            if use_dd:
                 dd_client = stack.enter_context(DatadogClient.from_env())
-            report = pipeline.triage_one(
+            return pipeline.triage_one(
                 ticket_obj,
                 site_entry,
                 dd_client=dd_client,
@@ -186,6 +213,19 @@ def triage(
                 verbose=verbose,
                 show_spinner=True,
             )
+
+    try:
+        report = _run_pipeline(use_dd=not no_logs)
+    except DatadogError as e:
+        typer.echo(f"Datadog error: {e}", err=True)
+        if no_interactive or not sys.stderr.isatty():
+            _die("Aborting — use --no-logs to skip Datadog")
+        if not typer.confirm("Continue without Datadog logs?", default=False):
+            _die("Aborted")
+        try:
+            report = _run_pipeline(use_dd=False)
+        except (RuntimeError, ValueError) as e2:
+            _die(str(e2))
     except (RuntimeError, ValueError) as e:
         _die(str(e))
 
@@ -207,7 +247,11 @@ def triage(
 
 @app.command()
 def inbox(
-    view: int = typer.Option(..., "--view", help="Zendesk view ID to monitor"),
+    view: str | None = typer.Option(
+        None,
+        "--view",
+        help="View ID or named queue (e.g. 'unassigned'). Defaults to your assigned tickets.",
+    ),
     poll: int = typer.Option(60, "--poll", min=10, help="Seconds between polls"),
     backfill: str = typer.Option(
         "0", "--backfill", help="Initial backfill horizon: inf, 0, Nh, Nd"
@@ -220,22 +264,23 @@ def inbox(
     ),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
-    """Launch the interactive inbox TUI for a Zendesk view."""
+    """Launch the interactive inbox TUI. Defaults to your assigned tickets."""
     if not sys.stdout.isatty() or not sys.stdin.isatty():
         _die("inbox requires an interactive terminal. Use `watch` for headless runs.")
 
     from triage_cli.inbox import InboxApp
     from triage_cli.watcher import WatcherOptions
 
+    view_id, view_key = _resolve_view(view)
     backfill_hours = _parse_backfill(backfill)
     level_list = _parse_levels(levels)
-    state_file = Path("data") / f"watcher-state-{view}.json"
+    state_file = Path("data") / f"watcher-state-{view_key}.json"
     state_file.parent.mkdir(parents=True, exist_ok=True)
 
-    log_path = _configure_inbox_logging(view, verbose)
+    log_path = _configure_inbox_logging(view_key, verbose)
 
     opts = WatcherOptions(
-        view_id=view,
+        view_id=view_id,
         interval=poll,
         state_file=state_file,
         backfill_hours=backfill_hours,

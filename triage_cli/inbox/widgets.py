@@ -10,20 +10,27 @@ from textual.widgets import DataTable, Static
 from triage_cli.models import TriageReport
 from triage_cli.render import rich_layout
 
-Status = Literal["triaged", "triaging", "pending", "failed"]
+Status = Literal["triaged", "triaging", "queued", "failed"]
 
 _STATUS_PRIORITY: dict[Status, int] = {
     "triaging": 0,
     "triaged": 1,
-    "pending": 2,
+    "queued": 2,
     "failed": 3,
 }
 
 _STATUS_ICONS: dict[Status, str] = {
     "triaged": "✓",
     "triaging": "→",
-    "pending": "○",
+    "queued": "○",
     "failed": "✗",
+}
+
+_STATUS_LABELS: dict[Status, str] = {
+    "triaged": "triaged",
+    "triaging": "triaging…",
+    "queued": "in queue",
+    "failed": "failed",
 }
 
 _SELECTED_ICON = "◉"
@@ -101,7 +108,7 @@ class TicketListWidget(DataTable):
             summary = (
                 report.finding[:60]
                 if report is not None
-                else row.failure_reason or row.status
+                else row.failure_reason or _STATUS_LABELS[row.status]
             )
             self.add_row(
                 icon,
@@ -130,10 +137,10 @@ class ReportPaneWidget(Static):
 
     current_report: TriageReport | None = None
 
-    def show(self, report: TriageReport | None) -> None:
+    def show(self, report: TriageReport | None, *, placeholder: str | None = None) -> None:
         self.current_report = report
         if report is None:
-            self.update("[dim]Select a ticket to view its report.[/]")
+            self.update(placeholder or "[dim]Select a ticket to view its report.[/]")
             return
 
         self.update(rich_layout(report))

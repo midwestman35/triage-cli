@@ -16,6 +16,7 @@ from pydantic import ValidationError
 
 from triage_cli.models import (
     LLMTriageOutput,
+    SiteEntry,
     Ticket,
     TriageBundle,
     fmt_ts,
@@ -67,6 +68,18 @@ Rules:
 - Do not invent log lines, error codes, ticket IDs, or past incidents.
 - Empty arrays for next_checks/unknowns are preferred over filler.
 - If you would hedge three times in finding, the right field is confidence:"low"."""
+
+SITE_EXTRACTION_PROMPT = """You identify which Carbyne APEX customer site a
+Zendesk support ticket is about. A list of known sites is provided. Return JSON
+with a single field:
+
+{"site_name": "<site_name from the list>" or null}
+
+Rules:
+- You MUST only return a site_name that appears verbatim in the provided list.
+- Return null if no site clearly matches — do not guess.
+- Geographic, agency name, and abbreviation cues in the subject/description
+  matter more than exact wording. "Roswell PD GA" → look for a Georgia/Roswell site."""
 
 ANCHOR_EXTRACTION_PROMPT = """You extract the most likely incident timestamp
 from a Zendesk ticket. Read the subject, description, and comments. Return JSON
@@ -171,6 +184,61 @@ def _strip_code_fence(s: str) -> str:
     """If the model wrapped JSON in a ```json fence, peel it off; otherwise return as-is."""
     m = _FENCE_RE.match(s)
     return m.group(1) if m else s
+
+
+async def extract_site(
+    ticket: Ticket,
+    sites: list[SiteEntry],
+    model: str | None = None,
+) -> str | None:
+    """Best-effort site identification from the ticket against the known site list.
+
+    Returns a site_name string that exists in the provided list, or None on no
+    confident match, missing/invalid JSON, hallucinated name, or any failure mode.
+    Only Agent SDK transport errors raise RuntimeError.
+    """
+    resolved = _resolve_model(model)
+    known_names = {e.site_name.lower(): e.site_name for e in sites if e.site_name}
+    if not known_names:
+        return None
+
+    site_list = "\n".join(
+        f"  site_name: {e.site_name}  |  friendly_name: {e.friendly_name}"
+        for e in sites
+        if e.site_name
+    )
+    prompt = (
+        f"Known sites:\n{site_list}\n\n"
+        f"Ticket subject: {ticket.subject}\n"
+        f"Org: {ticket.requester_org or '(none)'}\n"
+        f"Description (first 500 chars): {ticket.description[:500]}"
+    )
+
+    raw = await _collect_text(
+        prompt=prompt,
+        system_prompt=SITE_EXTRACTION_PROMPT,
+        model=resolved,
+    )
+    payload = _strip_code_fence(raw.strip())
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError:
+        logger.debug("extract_site: invalid JSON from %s: %r", resolved, raw)
+        return None
+    if not isinstance(data, dict) or "site_name" not in data:
+        logger.debug("extract_site: missing 'site_name' key in %r", data)
+        return None
+    sn = data["site_name"]
+    if sn is None:
+        return None
+    if not isinstance(sn, str):
+        logger.debug("extract_site: 'site_name' was not a string: %r", sn)
+        return None
+    canonical = known_names.get(sn.lower())
+    if canonical is None:
+        logger.debug("extract_site: LLM returned unknown site_name %r", sn)
+        return None
+    return canonical
 
 
 async def extract_anchor(ticket: Ticket, model: str | None = None) -> datetime | None:

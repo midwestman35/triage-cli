@@ -36,7 +36,7 @@ DEFAULT_PRUNE_CAP = 1000
 
 @dataclass(frozen=True)
 class WatcherOptions:
-    view_id: int
+    view_id: int | None  # None = tickets assigned to the authenticated user
     interval: int
     state_file: Path
     backfill_hours: float
@@ -150,11 +150,14 @@ def run_iteration(
     new_state: State = {"version": STATE_VERSION, "triaged": triaged_map}
 
     try:
-        view_ids = zd.list_view_ticket_ids(opts.view_id)
+        if opts.view_id is None:
+            view_ids = zd.list_my_ticket_ids()
+        else:
+            view_ids = zd.list_view_ticket_ids(opts.view_id)
     except RuntimeError as e:
         # View-not-found is a permanent config error; let it propagate so
         # the CLI exits with a clear message instead of spinning forever.
-        if str(e).startswith(f"View {opts.view_id} not found"):
+        if opts.view_id is not None and str(e).startswith(f"View {opts.view_id} not found"):
             raise
         _emit(f"[{_now_local_hms()}] iteration aborted: {e}")
         return new_state
@@ -181,7 +184,9 @@ def run_iteration(
                 _emit(f"[{_now_local_hms()}] #{tid} unchanged")
             continue
 
-        site_entry, _strategy = extract.lookup_site(ticket, sites)
+        site_entry, _strategy = pipeline.resolve_site(
+            ticket, sites, verbose=opts.verbose,
+        )
         if site_entry is None:
             _emit(f"[{_now_local_hms()}] #{tid} skipped: site unresolvable")
             if on_failure is not None:

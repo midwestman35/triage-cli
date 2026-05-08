@@ -18,6 +18,10 @@ from triage_cli.models import LogLine
 logger = logging.getLogger(__name__)
 
 _VALID_LEVELS = {"error", "warn", "info", "debug"}
+
+
+class DatadogError(RuntimeError):
+    """Raised when the Datadog API call fails (auth, network, or API error)."""
 _SAFE_SITE_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
 
 
@@ -112,14 +116,14 @@ class DatadogClient:
             )
         except ApiException as e:
             if e.status in (401, 403):
-                raise RuntimeError(
+                raise DatadogError(
                     "Datadog auth failed — check DD_API_KEY and DD_APP_KEY"
                 ) from e
             body = getattr(e, "body", None) or ""
             body_str = body.decode(errors="replace") if isinstance(body, bytes) else str(body)
-            raise RuntimeError(f"Datadog API error {e.status}: {body_str[:200]}") from e
+            raise DatadogError(f"Datadog API error {e.status}: {body_str[:200]}") from e
         except Exception as e:  # pragma: no cover - urllib3/transport fallback
-            raise RuntimeError(f"Datadog request failed: {e}") from e
+            raise DatadogError(f"Datadog request failed: {e}") from e
 
         raw = list(getattr(resp, "data", None) or [])
         logs = [_to_log_line(item) for item in raw]

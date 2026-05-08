@@ -17,6 +17,7 @@ from .models import AnchorSource, SiteEntry, Ticket
 
 _TICKET_URL_RE = re.compile(r"/(?:agent/)?tickets/(\d+)(?:[/?#].*)?$")
 _RAW_ID_RE = re.compile(r"^\d+$")
+_SUBJECT_BRACKET_RE = re.compile(r"\[([a-z0-9_]+)\]", re.IGNORECASE)
 
 
 def parse_ticket_id(value: str) -> int:
@@ -71,16 +72,18 @@ def lookup_site(
     2. cnc_override -- exact CNC UUID match (case-insensitive). Raises
        ValueError if not found in the map.
     3. Exact friendly_name match (case-insensitive) against ticket.requester_org.
-    4. Substring match of any site_name in ticket.subject + ticket.description.
-    5. Substring match of any friendly_name in ticket.subject + ticket.description.
+    4. Bracket tag in ticket subject: "[us__site__name]" → normalize "__"/"_" to
+       "-" → exact site_name lookup. Zendesk automations embed this tag.
+    5. Substring match of any site_name in ticket.subject + ticket.description.
+    6. Substring match of any friendly_name in ticket.subject + ticket.description.
 
     Among substring matches, the longest matching name wins; ties broken by list order.
     Comment thread is intentionally not searched; only subject and description
     form the substring haystack.
 
     Returns (entry, strategy) where strategy is one of:
-        "site_flag", "cnc_flag", "org_match", "site_substring",
-        "friendly_substring", "no_match".
+        "site_flag", "cnc_flag", "org_match", "subject_bracket",
+        "site_substring", "friendly_substring", "no_match".
     Returns (None, "no_match") when no match -- caller decides interactive
     prompt vs. abort.
     """
@@ -113,6 +116,13 @@ def lookup_site(
         for entry in sites:
             if entry.friendly_name.lower() == org:
                 return entry, "org_match"
+
+    site_name_index = {e.site_name.lower(): e for e in sites if e.site_name}
+    for m in _SUBJECT_BRACKET_RE.finditer(ticket.subject):
+        normalized = re.sub(r"_+", "-", m.group(1)).lower()
+        entry = site_name_index.get(normalized)
+        if entry is not None:
+            return entry, "subject_bracket"
 
     haystack = f"{ticket.subject}\n{ticket.description}".lower()
 

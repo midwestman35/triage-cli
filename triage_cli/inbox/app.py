@@ -13,19 +13,74 @@ from pathlib import Path
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal
-from textual.widgets import DataTable, Footer, Header
+from textual.containers import Horizontal, Vertical
+from textual.screen import ModalScreen
+from textual.widgets import Button, DataTable, Footer, Header, Input, Label
 
-from triage_cli import extract, watcher
+from triage_cli import extract, pipeline, render, watcher
 from triage_cli.datadog import DatadogClient
 from triage_cli.inbox import clipboard, hydrate
 from triage_cli.inbox.widgets import ReportPaneWidget, RowEntry, Status, TicketListWidget
-from triage_cli.models import TriageReport
+from triage_cli.models import SiteEntry, Ticket, TriageReport
 from triage_cli.render import DEFAULT_OUTPUT_DIR
 from triage_cli.watcher import State, WatcherOptions
 from triage_cli.zendesk import ZendeskClient
 
 logger = logging.getLogger(__name__)
+
+
+class SiteInputModal(ModalScreen):
+    """Modal that prompts the user for a site_name when auto-resolution fails."""
+
+    DEFAULT_CSS = """
+    SiteInputModal {
+        align: center middle;
+    }
+    SiteInputModal Vertical {
+        background: $surface;
+        border: thick $primary;
+        padding: 1 2;
+        width: 70;
+        height: auto;
+    }
+    SiteInputModal Label { margin-bottom: 1; }
+    SiteInputModal Input { margin-bottom: 1; }
+    SiteInputModal #buttons { layout: horizontal; height: auto; }
+    SiteInputModal Button { margin-right: 1; }
+    """
+
+    def __init__(self, ticket_id: int, subject: str, org: str | None) -> None:
+        super().__init__()
+        self._ticket_id = ticket_id
+        self._subject = subject
+        self._org = org
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Label(f"[bold]#{self._ticket_id}[/] {self._subject[:70]}")
+            if self._org:
+                yield Label(f"Org: [dim]{self._org}[/]")
+            yield Label("[yellow]Could not auto-resolve site.[/] Enter site_name to query:")
+            yield Input(placeholder="e.g. us-ga-roswell", id="site-input")
+            with Horizontal(id="buttons"):
+                yield Button("Triage", variant="primary", id="ok")
+                yield Button("Cancel", id="cancel")
+
+    def on_mount(self) -> None:
+        self.query_one("#site-input", Input).focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "ok":
+            self._submit()
+        else:
+            self.dismiss(None)
+
+    def on_input_submitted(self, _event: Input.Submitted) -> None:
+        self._submit()
+
+    def _submit(self) -> None:
+        value = self.query_one("#site-input", Input).value.strip()
+        self.dismiss(value if value else None)
 
 
 class InboxApp(App):
@@ -107,13 +162,13 @@ class InboxApp(App):
         list_widget.refresh_rows(list(self._rows.values()), selected_ticket_id=selected_ticket_id)
         last_poll = self._last_poll.strftime("%H:%M") if self._last_poll else "-"
         ticket_count = len(self._rows)
+        view_label = str(self.opts.view_id) if self.opts.view_id is not None else "my tickets"
         if ticket_count == 0:
-            self.sub_title = f"view {self.opts.view_id} - no tickets - last poll: {last_poll}"
+            self.sub_title = f"{view_label} - no tickets - last poll: {last_poll}"
         else:
             ticket_word = "ticket" if ticket_count == 1 else "tickets"
             self.sub_title = (
-                f"view {self.opts.view_id} - {ticket_count} {ticket_word} - "
-                f"last poll: {last_poll}"
+                f"{view_label} - {ticket_count} {ticket_word} - last poll: {last_poll}"
             )
 
     async def _poll_tick(self) -> None:
@@ -127,17 +182,21 @@ class InboxApp(App):
             return
 
         self._polling = True
+        new_state = None
         try:
             new_state = await asyncio.to_thread(
                 self._run_iteration_blocking, self._state,
             )
+        except RuntimeError as e:
+            msg = str(e)
+            self.notify(msg, severity="error", timeout=10)
+            # "not found" errors are permanent config mistakes — exit instead of looping.
+            if "not found" in msg.lower():
+                self.exit(1)
         finally:
             self._polling = False
             self._last_poll = datetime.now(UTC)
-            # The state assignment lives on the event-loop thread so the
-            # worker is the only producer and the main thread is the only
-            # consumer — no concurrent access to ``self._state``.
-            if "new_state" in locals():
+            if new_state is not None:
                 self._state = new_state
             if self.is_running:
                 self._refresh_list()
@@ -205,12 +264,12 @@ class InboxApp(App):
             if ticket_id not in self._rows:
                 self._rows[ticket_id] = RowEntry(
                     ticket_id=ticket_id,
-                    status="pending",
+                    status="queued",
                     report=None,
                 )
 
         for ticket_id in list(self._rows):
-            if self._rows[ticket_id].status == "pending" and ticket_id not in self._view_ids:
+            if self._rows[ticket_id].status == "queued" and ticket_id not in self._view_ids:
                 del self._rows[ticket_id]
 
         self._refresh_list()
@@ -281,11 +340,93 @@ class InboxApp(App):
     def action_cursor_down(self) -> None:
         self.query_one("#list", TicketListWidget).action_cursor_down()
 
-    def action_focus_detail(self) -> None:
+    async def action_focus_detail(self) -> None:
+        entry = self._currently_selected()
+        if entry is not None and entry.status == "queued":
+            self.run_worker(self._triage_ticket_async(entry.ticket_id), exclusive=False)
+            self.notify("Starting triage…", timeout=2)
+            return
         self.query_one("#detail", ReportPaneWidget).focus()
 
     def action_focus_list(self) -> None:
         self.query_one("#list", TicketListWidget).focus()
+
+    async def _triage_ticket_async(self, ticket_id: int) -> None:
+        try:
+            await asyncio.to_thread(self._triage_ticket_blocking, ticket_id)
+        except Exception as e:
+            self._on_failure(ticket_id, str(e))
+
+    def _triage_ticket_blocking(self, ticket_id: int) -> None:
+        """Fetch ticket, resolve site, run pipeline (worker thread).
+
+        On site no_match, fires the SiteInputModal via call_from_thread and returns.
+        The modal's dismiss handler restarts triage with the user-provided site override.
+        """
+        self.call_from_thread(self._set_status, ticket_id, "triaging")
+
+        try:
+            sites = extract.load_site_map(Path("data/cnc-map.json"))
+        except (FileNotFoundError, ValueError) as e:
+            self._on_failure(ticket_id, f"Site map error: {e}")
+            return
+
+        with ZendeskClient.from_env() as zd:
+            try:
+                ticket = zd.get_ticket(ticket_id)
+            except RuntimeError as e:
+                self._on_failure(ticket_id, str(e))
+                return
+
+        site_entry, _ = pipeline.resolve_site(ticket, sites, verbose=self.opts.verbose)
+        if site_entry is None:
+            # LLM also failed — hand off to the event loop to show the manual modal.
+            self.call_from_thread(self._prompt_site_for_ticket, ticket, sites)
+            return
+
+        self._run_pipeline_blocking(ticket_id, ticket, site_entry)
+
+    def _run_pipeline_blocking(
+        self, ticket_id: int, ticket: Ticket, site_entry: SiteEntry
+    ) -> None:
+        """Run the triage pipeline for a resolved ticket+site (worker thread)."""
+        try:
+            if self.opts.no_logs:
+                report = pipeline.triage_one(
+                    ticket, site_entry, dd_client=None,
+                    window_minutes=self.opts.window_minutes,
+                    levels=self.opts.levels, at=None,
+                    verbose=self.opts.verbose, show_spinner=False,
+                )
+            else:
+                with DatadogClient.from_env() as dd:
+                    report = pipeline.triage_one(
+                        ticket, site_entry, dd_client=dd,
+                        window_minutes=self.opts.window_minutes,
+                        levels=self.opts.levels, at=None,
+                        verbose=self.opts.verbose, show_spinner=False,
+                    )
+            render.save_note(report, ticket_id)
+            self._on_complete(report)
+        except (RuntimeError, ValueError) as e:
+            self._on_failure(ticket_id, str(e))
+
+    def _prompt_site_for_ticket(self, ticket: Ticket, sites: list[SiteEntry]) -> None:
+        """Show the site-input modal (event loop). Called via call_from_thread."""
+        def on_dismiss(site_name: str | None) -> None:
+            if not site_name:
+                self._set_failure(ticket.id, "Triage cancelled — no site provided")
+                return
+            site_entry, _ = extract.lookup_site(ticket, sites, site_override=site_name)
+            self.run_worker(
+                asyncio.to_thread(self._run_pipeline_blocking, ticket.id, ticket, site_entry),
+                exclusive=False,
+            )
+
+        self.push_screen(
+            SiteInputModal(ticket.id, ticket.subject, ticket.requester_org),
+            on_dismiss,
+        )
 
     async def action_refresh(self) -> None:
         if self.poll_on_mount:
@@ -340,4 +481,14 @@ class InboxApp(App):
             return
         entry = self._rows.get(ticket_id)
         detail = self.query_one("#detail", ReportPaneWidget)
-        detail.show(entry.report if entry is not None else None)
+        if entry is None:
+            detail.show(None)
+        elif entry.status == "queued":
+            detail.show(None, placeholder="[dim]○ In queue — press [bold]Enter[/] to triage now[/]")
+        elif entry.status == "triaging":
+            detail.show(None, placeholder="[dim]→ Triaging in progress…[/]")
+        elif entry.status == "failed":
+            reason = entry.failure_reason or "Unknown error"
+            detail.show(None, placeholder=f"[red]✗ Triage failed:[/red]\n\n{reason}")
+        else:
+            detail.show(entry.report)
