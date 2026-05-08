@@ -39,24 +39,32 @@ def _panel(body: str, title: str, border_style: str | None = None) -> Panel:
     return Panel(body, title=title, title_align="left", **kwargs)
 
 
+def _meta_line(report: TriageReport) -> str:
+    parts = [
+        f"**Confidence:** {report.confidence}",
+        f"**Sources:** {_sources(report)}",
+    ]
+    if report.window is not None:
+        window_start = _utc(report.window.start)
+        window_end = _utc(report.window.end)
+        parts.append(f"**Window:** {window_start:%Y-%m-%d %H:%M}–{window_end:%H:%M} UTC")
+    if report.site_name:
+        parts.append(f"**Site:** {report.site_name}")
+    return " · ".join(parts)
+
+
 def to_markdown(report: TriageReport) -> str:
-    window_start = _utc(report.window.start)
-    window_end = _utc(report.window.end)
-    window = f"{window_start:%Y-%m-%d %H:%M}–{window_end:%H:%M} UTC"
-    meta = (
-        f"**Confidence:** {report.confidence} · **Sources:** {_sources(report)} · "
-        f"**Window:** {window} · **Site:** {report.site_name}"
-    )
     lines = [
         f"# Triage Report — ZD-{report.ticket_id}",
         "",
-        meta,
+        _meta_line(report),
         "",
-        "## Finding",
-        report.finding,
-        "",
-        "## Evidence",
     ]
+
+    if report.summary:
+        lines.extend(["## Summary", report.summary, ""])
+
+    lines.extend(["## Finding", report.finding, "", "## Evidence"])
 
     if report.evidence:
         for evidence in report.evidence:
@@ -65,6 +73,11 @@ def to_markdown(report: TriageReport) -> str:
     else:
         lines.append("_No evidence collected._")
     lines.append("")
+
+    if report.correlation:
+        lines.append("## Correlation")
+        lines.extend(f"- {c}" for c in report.correlation)
+        lines.append("")
 
     if report.next_checks:
         lines.append("## Next Checks")
@@ -82,16 +95,17 @@ def to_markdown(report: TriageReport) -> str:
 
 def rich_layout(report: TriageReport) -> ConsoleRenderable:
     styles = {"low": "yellow", "medium": "cyan", "high": "green"}
-    header = Text.assemble(
+    header_parts = [
         ("ZD-", "dim"),
         (str(report.ticket_id), "bold"),
         ("  ·  ", "dim"),
         (f"confidence: {report.confidence}", styles.get(report.confidence, "white")),
         ("  ·  ", "dim"),
         (f"sources: {_sources(report)}", "dim"),
-        ("  ·  ", "dim"),
-        (f"site: {report.site_name}", "dim"),
-    )
+    ]
+    if report.site_name:
+        header_parts.extend([("  ·  ", "dim"), (f"site: {report.site_name}", "dim")])
+    header = Text.assemble(*header_parts)
 
     if report.evidence:
         evidence_text = "\n".join(
@@ -101,11 +115,15 @@ def rich_layout(report: TriageReport) -> ConsoleRenderable:
     else:
         evidence_text = "[dim]No evidence collected.[/]"
 
-    panels: list[ConsoleRenderable] = [
-        header,
+    panels: list[ConsoleRenderable] = [header]
+    if report.summary:
+        panels.append(_panel(report.summary, "Summary"))
+    panels.extend([
         _panel(report.finding, "Finding"),
         _panel(evidence_text, "Evidence"),
-    ]
+    ])
+    if report.correlation:
+        panels.append(_panel("\n".join(f"• {c}" for c in report.correlation), "Correlation"))
     if report.next_checks:
         panels.append(_panel("\n".join(f"• {c}" for c in report.next_checks), "Next Checks"))
     if report.unknowns:

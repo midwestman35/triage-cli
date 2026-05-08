@@ -2,14 +2,22 @@
 
 ## What this is
 
-A local CLI for Axon network engineers working the Carbyne APEX NG911/E911 platform. Give it a Zendesk ticket (URL or numeric ID) and it pulls the ticket and its full comment thread, resolves which APEX site it belongs to via a local CNC inventory, queries Datadog for logs in a window around the incident anchor, hands the bundle to Claude, and prints a four-section markdown triage note to your terminal. Single-shot, terminal-only, no posting back, no daemons.
+A local CLI for Axon network engineers working the Carbyne APEX NG911/E911 platform. It is built around two first-class workflows:
+
+1. **Guided Investigation** (`triage-cli investigate <ticket>`) — the daily-use path. Fetches a Zendesk ticket, walks you through ingesting evidence (attachments, local log files or directories, pasted text), normalizes everything into a chronological timeline, and asks Claude for an assessment, likely root cause, unknowns, suggested next steps, and a Zendesk-ready internal note.
+
+2. **Automated Watcher** (`triage-cli watch --view <id>`) — a polling loop that watches a Zendesk view, runs the legacy fast-path triage on new or updated tickets, and saves markdown + JSON artifacts to `./triage-notes/`. The accompanying `triage-cli inbox` TUI is the live review surface for those artifacts.
+
+Datadog is **optional evidence enrichment**, not a required part of the core flow. The guided flow is fully usable without Datadog credentials. The legacy one-shot `triage-cli triage <ticket>` command is preserved for scripting and the watcher's reuse; it still queries Datadog by default unless `--no-logs` is passed.
+
+Terminal-only, no posting back to Zendesk, single-user.
 
 ## Prerequisites
 
 - **Claude Code CLI installed and authenticated.** The `claude` command must work in your shell. The Claude Agent SDK piggybacks on Claude Code's existing OAuth session, so there is no API key to provision. If you have not run `claude` interactively at least once, do that first.
 - **Python 3.11+** (the package is pinned to `>=3.11` in `pyproject.toml`).
 - **Zendesk credentials** with read scope on tickets: an agent email plus an API token.
-- **Datadog credentials**: an API key and an APP key with permission to read logs.
+- **Datadog credentials** (optional): an API key and an APP key with permission to read logs. Required only for the `triage` fast-path with Datadog enrichment, the `watch` loop with logs, or future Datadog evidence inside a guided investigation.
 
 ## Install
 
@@ -26,7 +34,7 @@ pip install -e .
 uv pip install -e .
 ```
 
-After install, `triage-cli --help` should list the `triage` and `build-map` subcommands.
+After install, `triage-cli --help` should list the `investigate`, `triage`, `watch`, `inbox`, and `build-map` subcommands.
 
 ## Configuration
 
@@ -36,17 +44,25 @@ Copy the example env file and fill in the credentials:
 cp .env.example .env
 ```
 
-| Variable | Purpose |
-| --- | --- |
-| `ZENDESK_SUBDOMAIN` | Your Zendesk subdomain (the `<sub>` in `<sub>.zendesk.com`). |
-| `ZENDESK_EMAIL` | Agent email used for Basic auth. |
-| `ZENDESK_API_TOKEN` | Zendesk API token. The client appends `/token` to the email automatically; do not append it yourself. |
-| `DD_API_KEY` | Datadog API key. |
-| `DD_APP_KEY` | Datadog application key. |
-| `DD_SITE` | Datadog site host. Leave at default `datadoghq.com` unless you are on a non-US tenant. |
-| `DD_CALL_CENTER_TAG` | Datadog tag key for the call-center filter. Leave at default `@log.machineData.callCenterName`. |
-| `DD_STATION_TAG` | Reserved for v2 station-level filtering. Leave at default; v1 does not use it. |
-| `ANTHROPIC_MODEL` | Model identifier passed to the Agent SDK. Default `claude-sonnet-4-6`. |
+| Variable | Required for | Purpose |
+| --- | --- | --- |
+| `ZENDESK_SUBDOMAIN` | always | Your Zendesk subdomain (the `<sub>` in `<sub>.zendesk.com`). |
+| `ZENDESK_EMAIL` | always | Agent email used for Basic auth. |
+| `ZENDESK_API_TOKEN` | always | Zendesk API token. The client appends `/token` to the email automatically; do not append it yourself. |
+| `DD_API_KEY` | Datadog enrichment | Datadog API key. |
+| `DD_APP_KEY` | Datadog enrichment | Datadog application key. |
+| `DD_SITE` | Datadog enrichment | Datadog site host. Leave at default `datadoghq.com` unless you are on a non-US tenant. |
+| `DD_CALL_CENTER_TAG` | Datadog enrichment | Datadog tag key for the call-center filter. Leave at default `@log.machineData.callCenterName`. |
+| `DD_STATION_TAG` | reserved | Reserved for v2 station-level filtering. Leave at default; v1 does not use it. |
+| `ANTHROPIC_MODEL` | optional | Model identifier passed to the Agent SDK. Default `claude-sonnet-4-6`. |
+
+The Datadog variables are only consulted when:
+
+- you run `triage-cli triage <id>` without `--no-logs`,
+- you run `triage-cli watch` without `--no-logs`, or
+- (future) you pick the Datadog evidence option from the guided investigation menu.
+
+Guided investigations work end-to-end with only the Zendesk variables set.
 
 `ANTHROPIC_API_KEY` is intentionally absent. The Claude Agent SDK inherits Claude Code's auth.
 
@@ -64,14 +80,47 @@ This rewrites `data/cnc-map.json` and `data/cnc-map-gaps.md` (the latter records
 
 ## Usage
 
-### Basic happy path
+### Guided Investigation (primary workflow)
+
+```bash
+triage-cli investigate 12345
+triage-cli investigate https://<sub>.zendesk.com/agent/tickets/12345
+```
+
+`investigate` is the daily-use path for engineers actively working a ticket. It:
+
+1. Fetches the ticket and its full comment thread.
+2. Lists any Zendesk attachments it found (metadata only — see "Attachments" below).
+3. Prints a short summary, then loops a menu prompting you for evidence:
+
+   ```
+   Add evidence:
+     [a] Ingest Zendesk attachment metadata
+     [f] Add local file
+     [d] Add local directory
+     [p] Paste log text
+     [s] Proceed to assessment
+   ```
+
+4. Parses each ingested source into chronological `TimelineEvent`s. ISO-8601 prefixed lines and JSON-line logs are recognized automatically; unrecognized lines are counted but not surfaced.
+5. Builds one merged timeline across all sources (ticket created, comments, parsed log lines).
+6. Sends the manifest + timeline to Claude and renders a `TriageReport` to your terminal.
+7. Saves markdown + JSON to `./triage-notes/<id>-<timestamp>.{md,json}` (use `--no-save` to skip).
+
+`investigate` does not require Datadog credentials, a resolved site, or any flags beyond the ticket id.
+
+#### Attachments
+
+Zendesk attachment ingestion is **metadata-only** in this release. Picking `[a]` records each attachment's filename, size, content type, and URL on the session, and surfaces that to the LLM as evidence-source manifest entries marked `[metadata only]`. Actual binary download and parsing (PDFs, screenshots, log archives) is a follow-up that needs an explicit per-attachment opt-in step — call recordings and CAD exports are a different privacy class than the comment text we already send.
+
+### Fast path (one-shot, non-interactive)
 
 ```bash
 triage-cli triage 12345
 triage-cli triage https://<sub>.zendesk.com/agent/tickets/12345
 ```
 
-The CLI accepts either a raw ticket ID or a full Zendesk URL. The output is a four-section markdown note printed to stdout.
+A non-interactive transformation: ticket → site lookup → Datadog query → Claude → markdown to stdout. Use this for scripting, CI, and the watcher's internal reuse — not for active investigation. Datadog is queried by default; pass `--no-logs` for ticket-content-only triage.
 
 ### Save the note to disk
 
@@ -79,7 +128,7 @@ The CLI accepts either a raw ticket ID or a full Zendesk URL. The output is a fo
 triage-cli triage 12345 --save
 ```
 
-Also writes the rendered note to `./triage-notes/<ticket-id>-<timestamp>.md`. Stdout still shows the note.
+Also writes the rendered note to `./triage-notes/<ticket-id>-<timestamp>.md` and `.json`. Stdout still shows the note. (`investigate` saves both by default; pass `--no-save` to skip.)
 
 ### Verbose pipeline trace
 
@@ -174,25 +223,39 @@ See `docs/runbooks/06-watching-a-view.md` for a full operator runbook.
 
 ## Output format
 
-The triage note is plain markdown with four fixed sections, in this order:
+Both commands produce a `TriageReport` rendered as markdown to stdout (Rich-formatted to a TTY). `investigate` adds a `Summary` and `Correlation` section that the fast-path `triage` omits.
 
 ```markdown
-## Summary
-Two sentences describing what the ticket reports. No speculation.
+# Triage Report — ZD-12345
 
-## Log signals
-What the logs in the window show — error counts, recurring messages, timing
-relative to the anchor. If logs are empty or routine, says so plainly.
+**Confidence:** medium · **Sources:** zendesk, local_file:syslog.log(312)
 
-## Likely cause (inference)
-Best guess at cause, marked as inference. If the logs do not support a cause,
-says "Insufficient log evidence to infer cause" rather than guessing.
+## Summary               (investigate only)
+2-4 sentences summarizing the ticket and the evidence.
 
-## Suggested first action
-One concrete next step ("check X" / "verify Y") for the engineer.
+## Finding
+One or two sentences. Likely cause.
+
+## Evidence
+- timestamps and one-line excerpts the LLM relied on.
+
+## Correlation           (investigate only)
+- Bullets describing where signals line up.
+
+## Next Checks
+- Concrete verification steps.
+
+## Unknowns
+- What the LLM couldn't determine.
+
+## Suggested Internal Note
+Paste-ready Zendesk internal note.
 ```
 
-The exact wording of the system prompt that produces this lives in `triage_cli/llm.py` (`TRIAGE_SYSTEM_PROMPT`).
+System prompts:
+
+- `triage_cli/llm.py` `TRIAGE_SYSTEM_PROMPT` — fast-path `triage` command.
+- `triage_cli/llm.py` `ASSESSMENT_SYSTEM_PROMPT` — guided `investigate` command.
 
 ## Known limitations
 
@@ -215,14 +278,18 @@ triage-cli/
 ├── apex-cnc-inventory.md       # source of truth for the CNC map
 ├── .env.example
 ├── triage_cli/
-│   ├── cli.py                  # typer app: triage, watch, and build-map subcommands
-│   ├── zendesk.py              # ticket + comment fetch (httpx)
+│   ├── cli.py                  # typer app: investigate, triage, watch, inbox, build-map
+│   ├── zendesk.py              # ticket + comment + attachment-metadata fetch (httpx)
 │   ├── datadog.py              # log query (datadog-api-client)
 │   ├── extract.py              # ticket ID parsing, site lookup, window/anchor
-│   ├── llm.py                  # Claude Agent SDK calls + system prompts
-│   ├── models.py               # pydantic models
-│   ├── pipeline.py             # triage_one single-ticket orchestration
+│   ├── llm.py                  # Claude Agent SDK calls + system prompts (triage + assess)
+│   ├── models.py               # pydantic models (Ticket, TriageReport, ...)
+│   ├── timeline.py             # TimelineEvent + ISO/JSON line parsing
+│   ├── evidence.py             # EvidenceSource + ingestion helpers
+│   ├── investigation.py        # InvestigationSession + assessment orchestration
+│   ├── pipeline.py             # triage_one single-ticket orchestration (fast path)
 │   ├── render.py               # markdown print + --save handling
+│   ├── inbox/                  # Textual TUI: live review queue for the watcher
 │   └── watcher.py              # watch command: poll loop, state, backfill
 ├── data/
 │   ├── cnc-map.json            # generated; do not hand-edit
@@ -238,9 +305,14 @@ triage-cli/
 
 | What | Where |
 | --- | --- |
-| Triage system prompt | `triage_cli/llm.py` (`TRIAGE_SYSTEM_PROMPT`) |
+| Guided investigation flow | `triage_cli/cli.py` `investigate()` |
+| Investigation orchestration | `triage_cli/investigation.py` (`InvestigationSession`, `run_assessment`) |
+| Evidence ingestion helpers | `triage_cli/evidence.py` |
+| Timeline normalization | `triage_cli/timeline.py` |
+| Assessment system prompt | `triage_cli/llm.py` (`ASSESSMENT_SYSTEM_PROMPT`) |
+| Triage system prompt (fast path) | `triage_cli/llm.py` (`TRIAGE_SYSTEM_PROMPT`) |
 | Anchor extraction prompt | `triage_cli/llm.py` (`ANCHOR_EXTRACTION_PROMPT`) |
-| Pipeline flow (numbered steps) | `triage_cli/cli.py` `triage()` |
+| Fast-path pipeline flow | `triage_cli/cli.py` `triage()` |
 | Site lookup logic | `triage_cli/extract.py` (`lookup_site`, `load_site_map`) |
 | Anchor resolution priority | `triage_cli/extract.py` (`resolve_anchor`) |
 | Site map source | `apex-cnc-inventory.md` -> `scripts/build_cnc_map.py` -> `data/cnc-map.json` |

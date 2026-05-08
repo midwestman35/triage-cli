@@ -56,6 +56,32 @@ def test_to_markdown_omits_empty_optional_sections() -> None:
     assert "## Suggested Internal Note" in md
 
 
+def test_to_markdown_renders_summary_and_correlation_when_present() -> None:
+    md = render.to_markdown(
+        _report(
+            summary="audio dropouts started after the 11:42 reboot",
+            correlation=["sip register failures align with first user report"],
+        )
+    )
+    assert "## Summary" in md
+    assert "audio dropouts started after the 11:42 reboot" in md
+    assert "## Correlation" in md
+    assert "sip register failures align with first user report" in md
+
+
+def test_to_markdown_omits_summary_and_correlation_when_absent() -> None:
+    md = render.to_markdown(_report())
+    assert "## Summary" not in md
+    assert "## Correlation" not in md
+
+
+def test_to_markdown_handles_optional_site_and_window() -> None:
+    md = render.to_markdown(_report(site_name=None, window=None))
+    assert "**Site:**" not in md
+    assert "**Window:**" not in md
+    assert "**Confidence:** medium" in md
+
+
 def test_to_markdown_is_deterministic() -> None:
     report = _report()
     assert render.to_markdown(report) == render.to_markdown(report)

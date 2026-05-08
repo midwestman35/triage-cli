@@ -13,8 +13,9 @@ from typing import NoReturn
 import typer
 from dotenv import load_dotenv
 
-from triage_cli import extract, pipeline, render
+from triage_cli import evidence, extract, investigation, pipeline, render
 from triage_cli.datadog import DatadogClient, DatadogError
+from triage_cli.investigation import InvestigationSession
 from triage_cli.models import SiteEntry, TriageReport
 from triage_cli.pipeline import spinner as _spinner
 from triage_cli.zendesk import ZendeskClient
@@ -354,6 +355,177 @@ def watch(
     # FileNotFoundError: missing site map; ValueError: corrupt state file.
     except (RuntimeError, FileNotFoundError, ValueError) as e:
         _die(str(e))
+
+
+def _summary_lines(ticket_obj, attachments: list[dict]) -> list[str]:
+    """Render a short stderr summary for the start of an investigation."""
+    public = sum(1 for c in ticket_obj.comments if c.is_public)
+    internal = len(ticket_obj.comments) - public
+    org = ticket_obj.requester_org or "(unset)"
+    created = ticket_obj.created_at.strftime("%Y-%m-%d %H:%M UTC")
+    lines = [
+        f"Ticket #{ticket_obj.id}",
+        f"  Subject:     {ticket_obj.subject}",
+        f"  Requester:   {org}",
+        f"  Created:     {created}",
+        f"  Comments:    {len(ticket_obj.comments)} ({public} public, {internal} internal)",
+    ]
+    if attachments:
+        names = ", ".join(
+            str(a.get("file_name") or "(unnamed)") for a in attachments[:5]
+        )
+        suffix = "" if len(attachments) <= 5 else f", +{len(attachments) - 5} more"
+        lines.append(f"  Attachments: {len(attachments)} ({names}{suffix})")
+    else:
+        lines.append("  Attachments: 0")
+    return lines
+
+
+def _read_paste_block() -> str:
+    """Read multi-line text from stdin until EOF or a single '.' on a line."""
+    typer.echo(
+        "  Paste your text. End with a single '.' on its own line, or Ctrl-D.",
+        err=True,
+    )
+    chunks: list[str] = []
+    while True:
+        line = sys.stdin.readline()
+        if not line:
+            break
+        if line.strip() == ".":
+            break
+        chunks.append(line)
+    return "".join(chunks)
+
+
+def _evidence_menu(session: InvestigationSession, *, attachments_pending: bool) -> str:
+    """Render the evidence-source menu and return the user's normalized choice."""
+    typer.echo("", err=True)
+    typer.echo(f"Sources so far: {len(session.sources)} · Timeline: {len(session.timeline)} events",
+               err=True)
+    typer.echo("Add evidence:", err=True)
+    if attachments_pending:
+        typer.echo("  [a] Ingest Zendesk attachment metadata", err=True)
+    typer.echo("  [f] Add local file", err=True)
+    typer.echo("  [d] Add local directory", err=True)
+    typer.echo("  [p] Paste log text", err=True)
+    typer.echo("  [s] Proceed to assessment", err=True)
+    raw = typer.prompt("Choice", default="s").strip().lower()
+    if not raw:
+        return "s"
+    return raw[0]
+
+
+@app.command()
+def investigate(
+    ticket: str = typer.Argument(..., help="Zendesk ticket ID or full URL"),
+    save: bool = typer.Option(
+        True, "--save/--no-save", help="Save markdown + JSON to ./triage-notes/"
+    ),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Guided investigation: fetch a ticket, ingest evidence, produce a triage note."""
+    logging.basicConfig(
+        level=logging.INFO if verbose else logging.WARNING,
+        format="%(levelname)s %(name)s: %(message)s",
+    )
+
+    if not sys.stdin.isatty():
+        _die("investigate requires an interactive terminal. Use `triage` for headless runs.")
+
+    try:
+        ticket_id = extract.parse_ticket_id(ticket)
+    except ValueError as e:
+        _die(str(e))
+
+    try:
+        with ZendeskClient.from_env() as zd:
+            with _spinner(f"Fetching ticket #{ticket_id}", show=True):
+                ticket_obj = zd.get_ticket(ticket_id)
+            with _spinner("Listing attachments", show=True):
+                attachments = zd.list_attachments(ticket_id)
+    except RuntimeError as e:
+        _die(str(e))
+
+    session = InvestigationSession(ticket=ticket_obj)
+    src, evs = evidence.from_ticket(ticket_obj)
+    investigation.add_source(session, src, evs)
+    src, evs = evidence.from_comments(ticket_obj)
+    investigation.add_source(session, src, evs)
+
+    typer.echo("", err=True)
+    for line in _summary_lines(ticket_obj, attachments):
+        typer.echo(line, err=True)
+
+    attachments_pending = bool(attachments)
+    while True:
+        choice = _evidence_menu(session, attachments_pending=attachments_pending)
+        if choice == "s":
+            break
+        if choice == "a" and attachments_pending:
+            sources = evidence.attachments_metadata(attachments, ticket_id=ticket_obj.id)
+            for att_src in sources:
+                investigation.add_source(session, att_src, [])
+            typer.echo(f"  recorded {len(sources)} attachment(s) as metadata-only", err=True)
+            attachments_pending = False
+            continue
+        if choice == "f":
+            path_str = typer.prompt("File path").strip()
+            try:
+                src, evs = evidence.from_local_file(Path(path_str).expanduser())
+            except (FileNotFoundError, OSError) as e:
+                typer.echo(f"  error: {e}", err=True)
+                continue
+            investigation.add_source(session, src, evs)
+            note = src.notes or "all parsed"
+            typer.echo(f"  added {src.label}: {src.event_count} events ({note})", err=True)
+            continue
+        if choice == "d":
+            path_str = typer.prompt("Directory path").strip()
+            pattern = typer.prompt("Glob pattern", default="*.log").strip()
+            try:
+                src, evs = evidence.from_local_directory(
+                    Path(path_str).expanduser(), pattern=pattern
+                )
+            except (FileNotFoundError, NotADirectoryError, OSError) as e:
+                typer.echo(f"  error: {e}", err=True)
+                continue
+            investigation.add_source(session, src, evs)
+            typer.echo(f"  added {src.label}: {src.event_count} events ({src.notes})", err=True)
+            continue
+        if choice == "p":
+            label = typer.prompt("Label for this paste", default="paste").strip() or "paste"
+            text = _read_paste_block()
+            if not text.strip():
+                typer.echo("  (empty paste skipped)", err=True)
+                continue
+            src, evs = evidence.from_pasted_text(text, label=label)
+            investigation.add_source(session, src, evs)
+            note = src.notes or "all parsed"
+            typer.echo(f"  added {src.label}: {src.event_count} events ({note})", err=True)
+            continue
+        typer.echo(f"  unknown choice: {choice!r}", err=True)
+
+    typer.echo("", err=True)
+    typer.echo(f"Running assessment over {len(session.sources)} source(s), "
+               f"{len(session.timeline)} event(s)…", err=True)
+    try:
+        with _spinner("Generating triage note", show=True):
+            report = investigation.run_assessment(session, verbose=verbose)
+    except (RuntimeError, ValueError) as e:
+        _die(str(e))
+
+    render.print_note(report)
+    if save:
+        md_path, json_path = render.save_note(report, ticket_obj.id)
+        typer.echo(f"Saved: {md_path} and {json_path}", err=True)
+
+    if verbose:
+        typer.echo(
+            f"Confidence: {report.confidence} · sources: {len(session.sources)} · "
+            f"events: {report.log_event_count}",
+            err=True,
+        )
 
 
 @app.command("build-map")

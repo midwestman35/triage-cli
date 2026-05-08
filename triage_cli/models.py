@@ -156,7 +156,11 @@ class EvidenceItem(BaseModel):
 
 
 class LLMTriageOutput(BaseModel):
-    """The fields the LLM emits as JSON. Subset of `TriageReport`."""
+    """The fields the LLM emits as JSON. Subset of `TriageReport`.
+
+    `summary` and `correlation` are optional so older saved reports still load.
+    The legacy triage prompt does not emit them; the investigation prompt does.
+    """
 
     finding: str
     confidence: Confidence
@@ -164,14 +168,21 @@ class LLMTriageOutput(BaseModel):
     suggested_note: str
     next_checks: list[str] = Field(default_factory=list)
     unknowns: list[str] = Field(default_factory=list)
+    summary: str | None = None
+    correlation: list[str] = Field(default_factory=list)
 
 
 class TriageReport(LLMTriageOutput):
-    """Full triage report: LLM output + pipeline-derived metadata."""
+    """Full triage report: LLM output + pipeline-derived metadata.
+
+    `site_name` and `window` are optional because the guided investigation
+    flow does not require site resolution or a Datadog window; the legacy
+    `pipeline.triage_one` path always populates both.
+    """
 
     ticket_id: int
-    site_name: str
-    window: TimeWindow
+    site_name: str | None = None
+    window: TimeWindow | None = None
     sources: list[str]
     log_event_count: int
     generated_at: datetime

@@ -11,8 +11,12 @@ import logging
 import os
 import re
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
 from pydantic import ValidationError
+
+if TYPE_CHECKING:
+    from triage_cli.investigation import InvestigationSession
 
 from triage_cli.models import (
     LLMTriageOutput,
@@ -90,6 +94,45 @@ with a single field:
 Return null if there is no clear timestamp in the content. Do not guess. A
 generic "this morning" with no date is null. An explicit "2026-05-06 14:32 PT"
 is a timestamp. When in doubt, return null."""
+
+
+ASSESSMENT_SYSTEM_PROMPT = """You are an investigation assistant for a Network
+Engineer working on the Carbyne APEX NG911/E911 platform. You receive a Zendesk
+ticket plus a manifest of evidence sources and a merged chronological timeline
+that includes ticket events, comments, and any logs the user ingested. Datadog
+may or may not be among the sources. Treat the timeline as your primary signal.
+
+Return a single JSON object — no prose, a ```json fence is acceptable —
+matching this schema:
+
+{
+  "summary":         "<2-4 sentences summarizing what the ticket reports
+                       and what the evidence shows>",
+  "finding":         "<one or two sentences. Likely cause. No padding.>",
+  "confidence":      "low" | "medium" | "high",
+  "evidence":        [{"timestamp": "<ISO 8601 UTC or null>",
+                       "service": "<source label or null>",
+                       "message": "<terse, factual; quote sparingly>"}],
+  "correlation":     ["<one bullet per signal that lines up across
+                        symptoms, timestamps, comments, or logs>", ...],
+  "suggested_note":  "<paste-ready Zendesk internal note. Markdown allowed.
+                       Hedge on uncertain claims. Cite specific events.>",
+  "next_checks":     ["<concrete verification step>", ...],
+  "unknowns":        ["<what you couldn't determine>", ...]
+}
+
+Confidence calibration:
+- "high":   timeline + comments agree on a specific failure mode.
+- "medium": evidence is consistent with one cause but does not prove it.
+- "low":    no evidence beyond the ticket text, or evidence is ambiguous
+            or contradicts the ticket.
+
+Rules:
+- Do not invent log lines, error codes, ticket IDs, or past incidents.
+- If only the ticket itself was provided as evidence, confidence is "low"
+  unless the ticket text alone establishes the cause.
+- Empty arrays are preferred over filler.
+- If you would hedge three times in finding, the right field is confidence:"low"."""
 
 
 def _resolve_model(model: str | None) -> str:
@@ -184,6 +227,53 @@ def _strip_code_fence(s: str) -> str:
     """If the model wrapped JSON in a ```json fence, peel it off; otherwise return as-is."""
     m = _FENCE_RE.match(s)
     return m.group(1) if m else s
+
+
+async def assess(
+    session: InvestigationSession,
+    model: str | None = None,
+    *,
+    verbose: bool = False,
+) -> LLMTriageOutput:
+    """Run the investigation assessment call. Returns a parsed `LLMTriageOutput`.
+
+    Mirrors the retry behavior of `triage()`: on malformed JSON, retries once
+    with a stricter nudge; second failure raises RuntimeError.
+    """
+    from triage_cli.investigation import to_assessment_prompt
+
+    resolved = _resolve_model(model)
+    base_prompt = to_assessment_prompt(session)
+
+    raw = (await _collect_text(
+        prompt=base_prompt,
+        system_prompt=ASSESSMENT_SYSTEM_PROMPT,
+        model=resolved,
+    )).strip()
+    try:
+        return LLMTriageOutput.model_validate_json(_strip_code_fence(raw))
+    except (json.JSONDecodeError, ValidationError) as e:
+        if verbose:
+            logger.warning(
+                "assess: first attempt returned invalid JSON from %s; retrying. %s",
+                resolved, e,
+            )
+        retry_prompt = (
+            base_prompt
+            + "\n\nReturn ONLY a single valid JSON object matching the schema. "
+            + "No prose, no commentary."
+        )
+        raw2 = (await _collect_text(
+            prompt=retry_prompt,
+            system_prompt=ASSESSMENT_SYSTEM_PROMPT,
+            model=resolved,
+        )).strip()
+        try:
+            return LLMTriageOutput.model_validate_json(_strip_code_fence(raw2))
+        except (json.JSONDecodeError, ValidationError) as e2:
+            raise RuntimeError(
+                f"LLM returned invalid assessment JSON after retry: {e2}"
+            ) from e2
 
 
 async def extract_site(

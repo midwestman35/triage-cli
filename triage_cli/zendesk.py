@@ -171,6 +171,45 @@ class ZendeskClient:
 
         return ids
 
+    def list_attachments(self, ticket_id: int) -> list[dict[str, Any]]:
+        """Return attachment metadata dicts from all comments on a ticket.
+
+        Each entry has 'comment_id', 'file_name', 'content_type', 'size',
+        and 'content_url'. No bytes are downloaded. Used by the guided
+        investigation flow to surface ingestible evidence to the operator.
+        """
+        path: str | None = f"/tickets/{ticket_id}/comments.json"
+        params: dict[str, Any] | None = {"page[size]": _PAGE_SIZE, "sort": "created_at"}
+        out: list[dict[str, Any]] = []
+
+        for _ in range(_MAX_PAGES):
+            if path is None:
+                break
+            payload = self._get(path, params=params, ticket_id=ticket_id)
+            for c in payload.get("comments") or []:
+                cid = c.get("id")
+                for att in c.get("attachments") or []:
+                    out.append({
+                        "comment_id": cid,
+                        "file_name": att.get("file_name"),
+                        "content_type": att.get("content_type"),
+                        "size": att.get("size"),
+                        "content_url": att.get("content_url"),
+                    })
+
+            meta = payload.get("meta") or {}
+            links = payload.get("links") or {}
+            if meta.get("has_more") and links.get("next"):
+                path = links["next"]
+            else:
+                path = payload.get("next_page")
+            params = None
+        else:
+            raise RuntimeError(
+                f"Zendesk attachments pagination exceeded {_MAX_PAGES} pages - possible loop"
+            )
+        return out
+
     def _fetch_comments(self, ticket_id: int) -> list[Comment]:
         """Page through /comments.json (with sideloaded users) and return Comment models."""
         path: str | None = f"/tickets/{ticket_id}/comments.json"
