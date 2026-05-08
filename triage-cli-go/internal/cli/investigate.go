@@ -2,14 +2,15 @@ package cli
 
 import (
 	"context"
-	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/midwestman35/triage-cli-go/internal/assessment"
+	"github.com/midwestman35/triage-cli-go/internal/config"
 	"github.com/midwestman35/triage-cli-go/internal/investigation"
 	"github.com/midwestman35/triage-cli-go/internal/render"
 	"github.com/midwestman35/triage-cli-go/internal/store"
@@ -20,6 +21,7 @@ type investigateFlags struct {
 	mock          bool
 	json          bool
 	evidencePaths []string
+	timeout       time.Duration
 }
 
 func newInvestigateCmd() *cobra.Command {
@@ -29,18 +31,19 @@ func newInvestigateCmd() *cobra.Command {
 		Short: "Guided investigation of a single Zendesk ticket",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runPipeline(cmd.Context(), args[0], f.mock, f.json, f.evidencePaths, true)
+			return runPipeline(cmd.Context(), args[0], f, true)
 		},
 	}
 	cmd.Flags().BoolVar(&f.mock, "mock", false, "use the mock Zendesk fetcher (no network, no env vars)")
 	cmd.Flags().BoolVar(&f.json, "json", false, "emit JSON to stdout instead of Markdown")
 	cmd.Flags().StringArrayVar(&f.evidencePaths, "evidence", nil, "path to a local evidence file (repeatable)")
+	cmd.Flags().DurationVar(&f.timeout, "timeout", 30*time.Second, "per-request HTTP timeout for the live Zendesk client")
 	return cmd
 }
 
 // runPipeline is shared by investigate and triage. guided=true emits
 // stderr phase headers and includes the timeline section in Markdown.
-func runPipeline(ctx context.Context, idArg string, mock, asJSON bool, evidencePaths []string, guided bool) error {
+func runPipeline(ctx context.Context, idArg string, f *investigateFlags, guided bool) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -49,23 +52,19 @@ func runPipeline(ctx context.Context, idArg string, mock, asJSON bool, evidenceP
 		return err
 	}
 
-	if !mock {
-		if !zendeskCredsConfigured() {
-			return errors.New("--mock required (real Zendesk client not implemented in spike); set ZENDESK_SUBDOMAIN/EMAIL/API_TOKEN to opt in once supported")
-		}
-		// Even with creds, the live fetcher returns an unimplemented
-		// error today. Surface that explicitly.
-		return errors.New("live Zendesk client not implemented in spike — use --mock")
+	fetcher, err := buildFetcher(f)
+	if err != nil {
+		return err
 	}
 
 	deps := investigation.Deps{
-		Fetcher:  zendesk.NewMockFetcher("testdata/tickets"),
+		Fetcher:  fetcher,
 		Assessor: assessment.StubAssessor{},
 		Now:      func() time.Time { return time.Now().UTC() },
 	}
 	report, err := investigation.Run(ctx, deps, investigation.RunOpts{
 		TicketID:      id,
-		EvidencePaths: evidencePaths,
+		EvidencePaths: f.evidencePaths,
 		Guided:        guided,
 		Quiet:         globals.quiet,
 	})
@@ -79,7 +78,7 @@ func runPipeline(ctx context.Context, idArg string, mock, asJSON bool, evidenceP
 		return fmt.Errorf("encode json: %w", err)
 	}
 
-	if asJSON {
+	if f.json {
 		fmt.Fprintln(os.Stdout, string(jsonOut))
 	} else {
 		fmt.Fprint(os.Stdout, mdOut)
@@ -96,11 +95,20 @@ func runPipeline(ctx context.Context, idArg string, mock, asJSON bool, evidenceP
 	return nil
 }
 
-func zendeskCredsConfigured() bool {
-	for _, k := range []string{"ZENDESK_SUBDOMAIN", "ZENDESK_EMAIL", "ZENDESK_API_TOKEN"} {
-		if os.Getenv(k) == "" {
-			return false
-		}
+// buildFetcher returns the appropriate Zendesk fetcher based on flags.
+// In --mock mode it never touches the environment. In live mode it
+// loads ZENDESK_* env vars and returns a clear error if any are missing.
+func buildFetcher(f *investigateFlags) (zendesk.Fetcher, error) {
+	if f.mock {
+		return zendesk.NewMockFetcher("testdata/tickets"), nil
 	}
-	return true
+	cfg, err := config.LoadZendesk()
+	if err != nil {
+		return nil, fmt.Errorf("zendesk config: %w", err)
+	}
+	hf := zendesk.NewHTTPFetcher(cfg)
+	if f.timeout > 0 {
+		hf.SetHTTPClient(&http.Client{Timeout: f.timeout})
+	}
+	return hf, nil
 }

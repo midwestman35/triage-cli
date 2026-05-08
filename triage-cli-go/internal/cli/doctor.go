@@ -1,12 +1,18 @@
 package cli
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/spf13/cobra"
+
+	"github.com/midwestman35/triage-cli-go/internal/config"
 )
 
 func newDoctorCmd() *cobra.Command {
@@ -20,15 +26,20 @@ func newDoctorCmd() *cobra.Command {
 
 			critical := 0
 
-			// Zendesk env vars (warn only)
+			zendeskAllSet := true
 			for _, key := range []string{"ZENDESK_SUBDOMAIN", "ZENDESK_EMAIL", "ZENDESK_API_TOKEN"} {
 				mark := "✓"
 				note := "set"
 				if os.Getenv(key) == "" {
 					mark = "−"
 					note = "not set (required for live mode; --mock works without it)"
+					zendeskAllSet = false
 				}
 				fmt.Fprintf(out, "  %s %s: %s\n", mark, key, note)
+			}
+
+			if zendeskAllSet {
+				probeZendesk(cmd.Context(), out)
 			}
 
 			// Datadog env vars (info only)
@@ -42,7 +53,6 @@ func newDoctorCmd() *cobra.Command {
 				fmt.Fprintf(out, "  %s %s: %s\n", mark, key, note)
 			}
 
-			// Output dir
 			outputDir := globals.outputDir
 			if outputDir == "" {
 				outputDir = "./triage-notes"
@@ -51,7 +61,6 @@ func newDoctorCmd() *cobra.Command {
 				critical++
 			}
 
-			// Watcher state dir
 			stateDir := filepath.Join(outputDir, ".watcher")
 			if err := ensureWritable(out, stateDir, "watcher state dir"); err != nil {
 				critical++
@@ -63,6 +72,58 @@ func newDoctorCmd() *cobra.Command {
 			fmt.Fprintln(out, "OK")
 			return nil
 		},
+	}
+}
+
+// probeZendesk does a 5s GET against /api/v2/users/me.json and emits a
+// single status line. Reachability failures are warnings, not critical.
+func probeZendesk(ctx context.Context, out io.Writer) {
+	cfg, err := config.LoadZendesk()
+	if err != nil {
+		fmt.Fprintf(out, "  ✗ zendesk: %v\n", err)
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	url := cfg.BaseURL + "/api/v2/users/me.json"
+	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, url, nil)
+	if err != nil {
+		fmt.Fprintf(out, "  ✗ zendesk: %v\n", err)
+		return
+	}
+	req.SetBasicAuth(cfg.Email+"/token", cfg.APIToken)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "triage-cli/0.1.0-spike (doctor)")
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		fmt.Fprintf(out, "  ✗ zendesk: %v\n", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	switch {
+	case resp.StatusCode == http.StatusOK:
+		var me struct {
+			User struct {
+				Name  string `json:"name"`
+				Email string `json:"email"`
+			} `json:"user"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&me); err != nil {
+			fmt.Fprintf(out, "  ✓ zendesk: reachable (decode warning: %v)\n", err)
+			return
+		}
+		fmt.Fprintf(out, "  ✓ zendesk: reachable as %s (%s)\n", me.User.Name, me.User.Email)
+	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
+		fmt.Fprintf(out, "  ✗ zendesk: authentication failed (check ZENDESK_API_TOKEN)\n")
+	default:
+		fmt.Fprintf(out, "  ✗ zendesk: HTTP %d\n", resp.StatusCode)
 	}
 }
 

@@ -59,8 +59,6 @@ Behavioral concepts, not implementation:
 
 Explicitly out of scope for this spike:
 
-- Live Zendesk HTTP client (mock-only for now; real client behind an
-  interface, with TODO).
 - Live Datadog client.
 - Live LLM call (deterministic stub assessment for now).
 - Bubble Tea three-pane TUI. The spike uses a clean linear terminal flow.
@@ -185,12 +183,47 @@ go run ./cmd/triage-cli doctor
 
 ## What the next agent should pick up
 
-1. Real Zendesk HTTP client behind the `Fetcher` interface.
-2. Real LLM-backed `Assessor` (Anthropic or local) behind the
+1. Real LLM-backed `Assessor` (Anthropic or local) behind the
    `Assessor` interface — keep the stub as a `--no-llm` option.
-3. Attachment download + text extraction.
-4. Watcher: actual polling loop against Zendesk views.
-5. Bubble Tea three-pane TUI for `investigate`, kept as a flag
+2. Attachment download + text extraction.
+3. Watcher: actual polling loop against Zendesk views.
+4. Bubble Tea three-pane TUI for `investigate`, kept as a flag
    (`--tui`); the linear flow remains the default for piping.
-6. Optional Datadog evidence source.
-7. `build-map` command parity (parse `apex-cnc-inventory.md`).
+5. Optional Datadog evidence source.
+6. `build-map` command parity (parse `apex-cnc-inventory.md`).
+
+## Iteration log
+
+### 2026-05-08 — Iteration 1: live Zendesk HTTP client
+
+Shipped:
+
+- `internal/config/zendesk.go` — `LoadZendesk()` reads
+  `ZENDESK_SUBDOMAIN/EMAIL/API_TOKEN`, normalizes pasted URLs, errors
+  list every missing variable in one message.
+- `internal/zendesk/types.go` — wire-format structs (`apiTicket`,
+  `apiComment`, `apiUser`, `apiOrgResponse`, …) kept package-private,
+  plus `mapTicket(...)` to project them onto `model.Ticket`.
+- `internal/zendesk/client.go` — `HTTPFetcher` with HTTP Basic
+  (`<email>/token:<token>`), 30 s default timeout, paginated
+  `comments.json` walk capped at 500, best-effort `users` →
+  `organizations` lookup that never fails the fetch, status-aware error
+  hints (401/403/404/429), context cancellation propagation.
+- `internal/zendesk/client_test.go` — `httptest.NewServer`-driven
+  coverage: happy path, pagination, 401/404/5xx, org lookup failure,
+  context cancellation, and a comment-cap test that would otherwise
+  loop forever.
+- `internal/cli/investigate.go` + `triage.go` — `--mock` still uses the
+  fixture fetcher; without `--mock`, `config.LoadZendesk()` builds an
+  `HTTPFetcher`. New `--timeout` duration flag overrides the client
+  timeout.
+- `internal/cli/doctor.go` — when all three env vars are set, doctor
+  performs a 5 s `GET /api/v2/users/me.json` probe and prints one of
+  reachable / authentication failed / HTTP <status> / network error.
+  Reachability failures stay warnings, not critical.
+
+Verified: `gofmt -l .` clean, `go vet ./...` clean,
+`go test -race ./... -count=1` green, smoke runs match the success
+target. The error printed when `investigate 12345` runs without env is:
+`zendesk config: missing required environment variable(s):
+ZENDESK_API_TOKEN, ZENDESK_EMAIL, ZENDESK_SUBDOMAIN`.
