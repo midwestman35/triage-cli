@@ -62,8 +62,9 @@ Behavioral concepts, not implementation:
 Explicitly out of scope for this spike:
 
 - Live Datadog client.
-- Live LLM call (deterministic stub assessment for now).
-- Bubble Tea three-pane TUI. The spike uses a clean linear terminal flow.
+- Streaming-style assessor integration (`claude --output-format
+  stream-json`); the TUI today renders phase-level events but the
+  assessment phase is still a single blocking call.
 - SQLite history.
 - Slack notifications.
 - Posting back to Zendesk.
@@ -282,3 +283,72 @@ Verified: `gofmt -l .` clean, `go vet ./...` clean, `go test -race
 available produces a content-aware assessment (Confidence: likely;
 ties SBC jitter windows to reported drop times); `--mock --no-llm`
 produces the deterministic stub.
+
+### 2026-05-08 — Iteration 3: Bubble Tea three-pane TUI
+
+Shipped:
+
+- `internal/investigation/flow.go` — pipeline now emits typed
+  `Event`s through a `Reporter` interface. `Phase` is an enum of the
+  six pipeline stages (`PhaseLoadTicket`…`PhaseAssess`); `TotalPhases`
+  is the (constant) denominator. Three reporter implementations live
+  here: `NopReporter` (default when `Deps.Reporter` is nil),
+  `StderrReporter{Quiet}` (the previous behavior, lifted into a
+  struct), and `ChanReporter{Ch}` (non-blocking forward to a channel
+  for the TUI). `RunOpts.Guided`/`Quiet` were removed — the choice of
+  reporter is the new lever.
+- `internal/tui/` — opt-in three-pane bubbletea program. `model.go`
+  defines the `tea.Model` state (phase, per-step status,
+  ticket/report data, two `bubbles/viewport`s, focus). `view.go`
+  composes the layout: header (ticket id · subject · status; sources
+  line below), upper row split into Workflow rail (left, ⅓ width) and
+  Active Step pane (right, ⅔ width), full-width Evidence/Timeline
+  pane below, footer with key hints. `update.go` handles
+  `WindowSizeMsg`, `KeyMsg` (`q`/`ctrl+c` quit, `tab`/`shift+tab`
+  cycle focus, arrows/pgup/pgdn forward to the focused viewport,
+  `enter` focuses the report viewer post-completion), and the custom
+  message types (`PhaseEventMsg`, `TicketLoadedMsg`,
+  `EvidenceAddedMsg`, `AssessmentDoneMsg`, `PipelineDoneMsg`,
+  `PipelineErrorMsg`). `program.go` exposes
+  `tui.Run(ctx, ticketID, noColor, runner)`: it spins up the alt-
+  screen bubbletea program, pumps runner events into it via
+  `prog.Send`, and returns the final `*model.TriageReport`,
+  `tui.ErrUserCancelled`, or a pipeline error. `styles.go` defines
+  the colour palette and respects `--no-color`.
+- `internal/cli/investigate.go` — adds `--tui` flag. Mutually
+  exclusive with `--json` and `--quiet` (typed errors). On `--tui`,
+  `runPipelineTUI` builds the same `Deps` + `RunOpts`, wraps the
+  fetcher in a `ticketTapFetcher` so the loaded ticket reaches the
+  TUI, and saves paired artifacts after the program exits cleanly.
+  User cancellation prints `→ cancelled` to stderr and exits 0; the
+  artifact write is skipped. Non-TTY environments get a friendly
+  hint instead of the raw bubbletea `/dev/tty` error.
+- Tests: `internal/investigation/flow_test.go` adds
+  `TestRun_ChanReporterEmitsAllPhasesInOrder` (asserts six phase
+  events in declared order plus the final `Done` event) and
+  `TestNopReporter_DoesNotPanicOnNilDeps`. `internal/tui/model_test.go`
+  drives the model directly: `View()` snapshot at 80×24 confirms
+  ZD-12345 / Workflow / each phase / Evidence-Timeline pane / footer
+  appear; phase events flip `stepStatus` from pending → active →
+  done; `q` returns `tea.Quit`; `WindowSizeMsg` updates dimensions;
+  `PipelineDoneMsg` swaps the right pane to the report viewer.
+- `go.mod` — added `github.com/charmbracelet/bubbletea v1.3.10`,
+  `github.com/charmbracelet/lipgloss v1.1.0`,
+  `github.com/charmbracelet/bubbles v1.0.0`. No other new direct
+  deps.
+
+Linear flow regression-checked: stderr output for
+`investigate 12345 --mock --no-llm` is identical to pre-iteration
+(`→ [N/6] …` plus the two `→ saved …` lines). The new `Done` event
+is suppressed in `StderrReporter` so the trailing line is unchanged.
+
+## TUI controls
+
+When `investigate --tui` is active:
+
+| Key | Action |
+| --- | --- |
+| `q`, `ctrl+c` | Quit (cancels pipeline if still running) |
+| `tab` / `shift+tab` | Cycle focus between Active and Timeline panes (and Report once complete) |
+| `↑` / `↓` / `pgup` / `pgdn` | Scroll the focused viewport |
+| `enter` | (post-completion) Focus the report viewer |

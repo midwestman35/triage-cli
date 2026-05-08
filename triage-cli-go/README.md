@@ -36,6 +36,49 @@ go run ./cmd/triage-cli watch --view 12345
 Stdout is reserved for the rendered report so output is pipe-friendly.
 Status, warnings, and progress headers go to stderr.
 
+### TUI
+
+```bash
+# Same pipeline, three-pane Bubble Tea TUI. Requires a real TTY;
+# incompatible with --json / --quiet because the TUI takes over the screen.
+go run ./cmd/triage-cli investigate 12345 --mock --tui
+```
+
+Layout (rendered at ~80×24):
+
+```
+triage-cli · ZD-12345 · SBC jitter on PSAP-01 · running
+sources: zendesk
+╭──────────────────────────╮╭──────────────────────────────────────────────╮
+│Workflow                  ││Review comments                               │
+│                          ││                                              │
+│✓ Load ticket             ││Reviewing comments (3 found)...               │
+│→ Review comments         ││                                              │
+│• Catalogue attachments   ││Ticket: SBC jitter on PSAP-01                 │
+│• Ingest evidence         ││Requester: Acme Co                            │
+│• Build timeline          ││                                              │
+│• Assess                  ││                                              │
+│• Export                  ││                                              │
+╰──────────────────────────╯╰──────────────────────────────────────────────╯
+╭──────────────────────────────────────────────────────────────────────────╮
+│Evidence / Timeline                                                       │
+│                                                                          │
+│[2/6] Reviewing comments (3 found)...                                     │
+│loaded ZD-12345: SBC jitter on PSAP-01                                    │
+╰──────────────────────────────────────────────────────────────────────────╯
+[q] quit · running pipeline…
+```
+
+| Key | Action |
+| --- | --- |
+| `q`, `ctrl+c` | Quit (cancels pipeline if still running) |
+| `tab` / `shift+tab` | Cycle focus between panes |
+| `↑` / `↓` / `pgup` / `pgdn` | Scroll the focused viewport |
+| `enter` | (after completion) Focus the report viewer |
+
+The same paired Markdown + JSON artifacts are saved on exit, exactly as
+in the linear flow.
+
 ## Layout
 
 - `cmd/triage-cli/` — CLI entry point.
@@ -47,6 +90,7 @@ Status, warnings, and progress headers go to stderr.
 - `internal/render/` — Markdown / JSON renderers + stderr helper.
 - `internal/store/` — paired artifact writer.
 - `internal/investigation/` — pipeline orchestration shared by both commands.
+- `internal/tui/` — Bubble Tea three-pane TUI (opt-in via `--tui`).
 - `internal/watcher/` — state file + skeleton tick.
 
 ## Further reading

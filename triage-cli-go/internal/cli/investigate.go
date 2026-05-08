@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -16,6 +17,7 @@ import (
 	"github.com/midwestman35/triage-cli-go/internal/model"
 	"github.com/midwestman35/triage-cli-go/internal/render"
 	"github.com/midwestman35/triage-cli-go/internal/store"
+	"github.com/midwestman35/triage-cli-go/internal/tui"
 	"github.com/midwestman35/triage-cli-go/internal/zendesk"
 )
 
@@ -27,6 +29,7 @@ type investigateFlags struct {
 	noLLM         bool
 	llmModel      string
 	llmVerbose    bool
+	tui           bool
 }
 
 func newInvestigateCmd() *cobra.Command {
@@ -36,10 +39,11 @@ func newInvestigateCmd() *cobra.Command {
 		Short: "Guided investigation of a single Zendesk ticket",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runPipeline(cmd.Context(), args[0], f, true)
+			return runInvestigate(cmd.Context(), args[0], f)
 		},
 	}
 	addCommonInvestigateFlags(cmd, f)
+	cmd.Flags().BoolVar(&f.tui, "tui", false, "render progress in a Bubble Tea three-pane TUI (incompatible with --json/--quiet)")
 	return cmd
 }
 
@@ -54,8 +58,25 @@ func addCommonInvestigateFlags(cmd *cobra.Command, f *investigateFlags) {
 	cmd.Flags().BoolVar(&f.llmVerbose, "llm-verbose", false, "mirror claude CLI stderr to our stderr")
 }
 
-// runPipeline is shared by investigate and triage. guided=true emits
-// stderr phase headers and includes the timeline section in Markdown.
+// runInvestigate dispatches between the linear flow and the TUI. The
+// TUI is opt-in (--tui) and conflicts with output-format flags
+// because the TUI takes over the terminal.
+func runInvestigate(ctx context.Context, idArg string, f *investigateFlags) error {
+	if f.tui {
+		if f.json {
+			return errors.New("--tui is incompatible with --json")
+		}
+		if globals.quiet {
+			return errors.New("--tui is incompatible with --quiet")
+		}
+		return runPipelineTUI(ctx, idArg, f)
+	}
+	return runPipeline(ctx, idArg, f, true)
+}
+
+// runPipeline is the linear (non-TUI) flow shared by investigate and
+// triage. guided=true emits stderr phase headers and includes the
+// timeline section in Markdown.
 func runPipeline(ctx context.Context, idArg string, f *investigateFlags, guided bool) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -70,16 +91,20 @@ func runPipeline(ctx context.Context, idArg string, f *investigateFlags, guided 
 		return err
 	}
 
+	var reporter investigation.Reporter = investigation.NopReporter{}
+	if guided {
+		reporter = investigation.StderrReporter{Quiet: globals.quiet}
+	}
+
 	deps := investigation.Deps{
 		Fetcher:  fetcher,
 		Assessor: selectAssessor(f),
 		Now:      func() time.Time { return time.Now().UTC() },
+		Reporter: reporter,
 	}
 	report, err := investigation.Run(ctx, deps, investigation.RunOpts{
 		TicketID:      id,
 		EvidencePaths: f.evidencePaths,
-		Guided:        guided,
-		Quiet:         globals.quiet,
 	})
 	if err != nil {
 		return err
@@ -106,6 +131,114 @@ func runPipeline(ctx context.Context, idArg string, f *investigateFlags, guided 
 		render.Status("saved %s", art.JSONPath)
 	}
 	return nil
+}
+
+// runPipelineTUI runs the pipeline with a ChanReporter and hands the
+// terminal over to bubbletea. On success it saves artifacts (paired
+// .md + .json) and prints the paths to stderr after exit. On user
+// cancellation no artifacts are written.
+func runPipelineTUI(ctx context.Context, idArg string, f *investigateFlags) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	id, err := zendesk.ParseTicketID(idArg)
+	if err != nil {
+		return err
+	}
+	fetcher, err := buildFetcher(f)
+	if err != nil {
+		return err
+	}
+
+	now := func() time.Time { return time.Now().UTC() }
+	assessor := selectAssessor(f)
+
+	runner := func(
+		eventCh chan<- investigation.Event,
+		ticketCh chan<- model.Ticket,
+		doneCh chan<- *model.TriageReport,
+		errCh chan<- error,
+	) {
+		// Wrap the fetcher so we can forward the loaded ticket to the TUI
+		// without changing the investigation package surface.
+		wrapped := &ticketTapFetcher{inner: fetcher, ch: ticketCh}
+		deps := investigation.Deps{
+			Fetcher:  wrapped,
+			Assessor: assessor,
+			Now:      now,
+			Reporter: investigation.ChanReporter{Ch: eventCh},
+		}
+		report, runErr := investigation.Run(ctx, deps, investigation.RunOpts{
+			TicketID:      id,
+			EvidencePaths: f.evidencePaths,
+		})
+		close(eventCh)
+		// ticketCh may already be closed by wrapped on success — the
+		// fetcher's tap takes ownership. If the fetch failed we close
+		// it here so the pump unblocks.
+		wrapped.closeOnce()
+		if runErr != nil {
+			errCh <- runErr
+			return
+		}
+		doneCh <- &report
+	}
+
+	report, err := tui.Run(ctx, id, globals.noColor, runner)
+	if errors.Is(err, tui.ErrUserCancelled) {
+		fmt.Fprintln(os.Stderr, "→ cancelled")
+		return nil
+	}
+	if err != nil {
+		// Non-TTY environments cannot host the alt-screen TUI. Surface
+		// a friendly hint rather than the raw bubbletea error.
+		if strings.Contains(err.Error(), "could not open a new TTY") || strings.Contains(err.Error(), "/dev/tty") {
+			return fmt.Errorf("--tui requires an interactive terminal; rerun without --tui or in a real TTY (underlying: %w)", err)
+		}
+		return err
+	}
+
+	mdOut := render.Markdown(*report, render.MarkdownOpts{IncludeTimeline: true})
+	jsonOut, err := render.JSON(*report)
+	if err != nil {
+		return fmt.Errorf("encode json: %w", err)
+	}
+	art, err := store.SaveArtifacts(globals.outputDir, report.TicketID, report.GeneratedAt, mdOut, jsonOut)
+	if err != nil {
+		return fmt.Errorf("save artifacts: %w", err)
+	}
+	render.Status("saved %s", art.MarkdownPath)
+	render.Status("saved %s", art.JSONPath)
+	return nil
+}
+
+// ticketTapFetcher wraps a Fetcher and forwards the loaded ticket on a
+// channel for the TUI. The channel is closed exactly once (on success
+// after sending, or on failure via closeOnce()).
+type ticketTapFetcher struct {
+	inner  zendesk.Fetcher
+	ch     chan<- model.Ticket
+	closed bool
+}
+
+func (t *ticketTapFetcher) FetchTicket(ctx context.Context, id int64) (model.Ticket, error) {
+	tk, err := t.inner.FetchTicket(ctx, id)
+	if err != nil {
+		return tk, err
+	}
+	if !t.closed {
+		t.ch <- tk
+		close(t.ch)
+		t.closed = true
+	}
+	return tk, nil
+}
+
+func (t *ticketTapFetcher) closeOnce() {
+	if !t.closed {
+		close(t.ch)
+		t.closed = true
+	}
 }
 
 // selectAssessor picks the Assessor for this run based on flags.
