@@ -1,0 +1,52 @@
+{
+  "id": 12345,
+  "subject": "Workstation 3 audio dropping intermittently",
+  "description": "Dispatcher reports intermittent audio dropouts on workstation 3 in the primary console room. Issue began around 13:00 UTC today. Audio cuts ~5 seconds into a call and stays muted on the dispatcher side. Caller side reports they can still hear the dispatcher's headset open mic. Workstations 1, 2, and 4 are unaffected.",
+  "requester_org": "Mock County 911",
+  "status": "open",
+  "priority": "high",
+  "created_at": "2026-05-08T13:05:00Z",
+  "updated_at": "2026-05-08T14:30:00Z",
+  "comments": [
+    {
+      "id": 1001,
+      "author_name": "Dispatcher Lead",
+      "public": true,
+      "body": "Started seeing audio cut out on WS3 only. Headset swap didn't help. Reported by two different dispatchers on shift.",
+      "created_at": "2026-05-08T13:10:00Z"
+    },
+    {
+      "id": 1002,
+      "author_name": "NOC Engineer",
+      "public": false,
+      "body": "Internal: pulled SBC metrics. Jitter spike at 13:17 lines up with the first reported drop. CPU/memory normal across the platform. Suspect a station-side network or codec negotiation issue rather than a platform-wide fault.",
+      "created_at": "2026-05-08T13:40:00Z"
+    },
+    {
+      "id": 1003,
+      "author_name": "Dispatcher Lead",
+      "public": true,
+      "body": "Another drop on WS3 at 14:02 local. Caller stayed connected, our side went silent ~6 seconds in.",
+      "created_at": "2026-05-08T14:05:00Z"
+    },
+    {
+      "id": 1004,
+      "author_name": "NOC Engineer",
+      "public": false,
+      "body": "Internal: confirmed second jitter window 14:02-14:03 on the SBC log. Asking site for WS3 headset model, USB hub model, and switch port assignment so we can rule out a hardware path issue.",
+      "created_at": "2026-05-08T14:15:00Z"
+    }
+  ],
+  "attachments": [
+    {
+      "filename": "ws3-screenshot.png",
+      "content_type": "image/png",
+      "size_bytes": 184320
+    },
+    {
+      "filename": "platform-metrics-2026-05-08.csv",
+      "content_type": "text/csv",
+      "size_bytes": 12480
+    }
+  ]
+}

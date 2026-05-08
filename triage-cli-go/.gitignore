@@ -1,0 +1,14 @@
+# Runtime artifacts
+triage-notes/
+*.tmp
+
+# Build output
+/triage-cli
+/triage-cli-go
+
+# OS
+.DS_Store
+
+# Editor
+.idea/
+.vscode/
