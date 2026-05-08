@@ -26,6 +26,8 @@ _STATUS_ICONS: dict[Status, str] = {
     "failed": "✗",
 }
 
+_SELECTED_ICON = "◉"
+
 
 @dataclass
 class RowEntry:
@@ -73,11 +75,26 @@ class TicketListWidget(DataTable):
     ) -> None:
         self._ensure_columns()
         self.clear()
+        sorted_rows = sort_rows(rows)
+        # Resolve where the cursor will land: caller's selection if it exists in
+        # the new row set, otherwise the first row (Textual's default after add).
+        # The ◉ marker tracks the resolved cursor row, not the requested one,
+        # so the icon and the highlight stay in sync.
+        cursor_ticket_id: int | None = None
+        if selected_ticket_id is not None and any(
+            r.ticket_id == selected_ticket_id for r in sorted_rows
+        ):
+            cursor_ticket_id = selected_ticket_id
+        elif sorted_rows:
+            cursor_ticket_id = sorted_rows[0].ticket_id
+
         selected_row = 0
-        for row in sort_rows(rows):
+        for row in sorted_rows:
             row_index = self.row_count
             report = row.report
-            icon = _STATUS_ICONS[row.status]
+            is_selected = row.ticket_id == cursor_ticket_id
+            status_icon = _STATUS_ICONS[row.status]
+            icon = f"{_SELECTED_ICON} {status_icon}" if is_selected else f"  {status_icon}"
             site = report.site_name if report is not None else row.site_hint or "—"
             when = report.generated_at.strftime("%H:%M") if report is not None else "—"
             confidence = report.confidence if report is not None else "—"
@@ -95,7 +112,7 @@ class TicketListWidget(DataTable):
                 summary,
                 key=str(row.ticket_id),
             )
-            if row.ticket_id == selected_ticket_id:
+            if is_selected:
                 selected_row = row_index
 
         if self.row_count:

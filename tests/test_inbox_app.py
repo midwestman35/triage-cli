@@ -206,6 +206,29 @@ def test_reconcile_and_status_callbacks_update_rows(tmp_path: Path) -> None:
     asyncio.run(run())
 
 
+def test_selected_row_icon_marks_cursor_row(tmp_path: Path) -> None:
+    """The selected row's icon column carries the ◉ marker; other rows do not."""
+    now = datetime.now(UTC)
+    _write_report(tmp_path, 1, now - timedelta(hours=2))
+    _write_report(tmp_path, 2, now - timedelta(minutes=5))
+
+    async def run() -> None:
+        app = InboxApp(_opts(tmp_path), notes_dir=tmp_path, poll_on_mount=False)
+        async with app.run_test() as pilot:
+            table = app.query_one("#list", TicketListWidget)
+            assert table.row_count == 2
+            # Newest first: row 0 = #2, row 1 = #1. Cursor starts at row 0 (#2).
+            assert "◉" in table.get_cell_at((0, 0))
+            assert "◉" not in table.get_cell_at((1, 0))
+            # Move cursor to #1 and re-sort; the marker should follow.
+            await pilot.press("down")
+            app._refresh_list()
+            assert "◉" in table.get_cell_at((1, 0))
+            assert "◉" not in table.get_cell_at((0, 0))
+
+    asyncio.run(run())
+
+
 def test_refresh_preserves_selected_ticket_after_resort(tmp_path: Path) -> None:
     old_report = _write_report(tmp_path, 101, datetime.now(UTC) - timedelta(hours=2))
     new_report = _write_report(tmp_path, 202, datetime.now(UTC) - timedelta(minutes=5))
@@ -230,11 +253,12 @@ def test_poll_tick_has_single_flight_guard(tmp_path: Path, monkeypatch) -> None:
     release = threading.Event()
     calls = 0
 
-    def run_iteration_blocking(_app: InboxApp) -> None:
+    def run_iteration_blocking(_app: InboxApp, state):
         nonlocal calls
         calls += 1
         started.set()
         assert release.wait(timeout=2)
+        return state
 
     monkeypatch.setattr(InboxApp, "_run_iteration_blocking", run_iteration_blocking)
 
@@ -251,6 +275,34 @@ def test_poll_tick_has_single_flight_guard(tmp_path: Path, monkeypatch) -> None:
         assert calls == 1
         assert app._polling is False
         assert app._last_poll is not None
+
+    asyncio.run(run())
+
+
+def test_poll_tick_assigns_state_on_event_loop(tmp_path: Path, monkeypatch) -> None:
+    """Regression: ``self._state`` is reassigned by ``_poll_tick``, not by the worker.
+
+    The worker must return the new state so that ``self._state`` is mutated only on
+    the event-loop thread — preventing concurrent reads/writes if the single-flight
+    guard is ever loosened.
+    """
+    seen_state_ids: list[int] = []
+
+    def run_iteration_blocking(self: InboxApp, state):
+        # Worker thread observes the state passed in; it must NOT mutate self._state itself.
+        seen_state_ids.append(id(state))
+        return {"version": 1, "triaged": {"abc": "ts"}}
+
+    monkeypatch.setattr(InboxApp, "_run_iteration_blocking", run_iteration_blocking)
+
+    async def run() -> None:
+        app = InboxApp(_opts(tmp_path), notes_dir=tmp_path, poll_on_mount=False)
+        original_state_id = id(app._state)
+        await app._poll_tick()
+        # The worker saw the original state object…
+        assert seen_state_ids == [original_state_id]
+        # …and after _poll_tick returns, the event loop has installed the new one.
+        assert app._state == {"version": 1, "triaged": {"abc": "ts"}}
 
     asyncio.run(run())
 
@@ -327,7 +379,7 @@ def test_run_iteration_blocking_uses_watcher_dependencies(
 
     opts = _opts(tmp_path)
     app = InboxApp(opts, notes_dir=tmp_path)
-    app._run_iteration_blocking()
+    new_state = app._run_iteration_blocking(app._state)
 
     assert captured["site_map_path"] == Path("data/cnc-map.json")
     assert captured["zd"] is zd
@@ -337,8 +389,8 @@ def test_run_iteration_blocking_uses_watcher_dependencies(
     assert captured["dd_client"] is dd
     assert captured["backfill_cutoff"].tzinfo is UTC
     assert all(callable(callback) for callback in captured["callbacks"])
-    assert app._state == {"version": 1, "triaged": {"123": "timestamp"}}
-    assert saved == {"path": opts.state_file, "state": app._state}
+    assert new_state == {"version": 1, "triaged": {"123": "timestamp"}}
+    assert saved == {"path": opts.state_file, "state": new_state}
     assert captured["backfill_cutoff"] == app._backfill_cutoff
 
 
@@ -384,8 +436,8 @@ def test_run_iteration_blocking_keeps_stable_backfill_cutoff(
         verbose=False,
     )
     app = InboxApp(opts, notes_dir=tmp_path)
-    app._run_iteration_blocking()
-    app._run_iteration_blocking()
+    app._run_iteration_blocking(app._state)
+    app._run_iteration_blocking(app._state)
 
     assert len(cutoffs) == 2
     assert cutoffs[0] == cutoffs[1] == app._backfill_cutoff
@@ -428,7 +480,7 @@ def test_run_iteration_blocking_routes_watcher_stderr_to_log(
         notes_dir=tmp_path,
     )
     with caplog.at_level("WARNING", logger="triage_cli.inbox.app"):
-        app._run_iteration_blocking()
+        app._run_iteration_blocking(app._state)
 
     assert "watcher status line" in caplog.text
     assert "watcher status line" not in capsys.readouterr().err

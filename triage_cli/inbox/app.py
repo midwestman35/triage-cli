@@ -22,7 +22,7 @@ from triage_cli.inbox import clipboard, hydrate
 from triage_cli.inbox.widgets import ReportPaneWidget, RowEntry, Status, TicketListWidget
 from triage_cli.models import TriageReport
 from triage_cli.render import DEFAULT_OUTPUT_DIR
-from triage_cli.watcher import WatcherOptions
+from triage_cli.watcher import State, WatcherOptions
 from triage_cli.zendesk import ZendeskClient
 
 logger = logging.getLogger(__name__)
@@ -90,7 +90,9 @@ class InboxApp(App):
 
     def _hydrate_recent_reports(self) -> int:
         hydrated_count = 0
-        for report in hydrate.recent_reports(self.notes_dir, hours=24):
+        for report in hydrate.recent_reports(
+            self.notes_dir, hours=24, verbose=self.opts.verbose,
+        ):
             self._rows[report.ticket_id] = RowEntry(
                 ticket_id=report.ticket_id,
                 status="triaged",
@@ -126,15 +128,26 @@ class InboxApp(App):
 
         self._polling = True
         try:
-            await asyncio.to_thread(self._run_iteration_blocking)
+            new_state = await asyncio.to_thread(
+                self._run_iteration_blocking, self._state,
+            )
         finally:
             self._polling = False
             self._last_poll = datetime.now(UTC)
+            # The state assignment lives on the event-loop thread so the
+            # worker is the only producer and the main thread is the only
+            # consumer — no concurrent access to ``self._state``.
+            if "new_state" in locals():
+                self._state = new_state
             if self.is_running:
                 self._refresh_list()
 
-    def _run_iteration_blocking(self) -> None:
-        """Run one watcher iteration in a worker thread."""
+    def _run_iteration_blocking(self, state: State) -> State:
+        """Run one watcher iteration in a worker thread; return the new state.
+
+        Touches no ``self.*`` attributes for state mutation — the caller in
+        ``_poll_tick`` reassigns ``self._state`` on the event-loop thread.
+        """
         sites = extract.load_site_map(Path("data/cnc-map.json"))
 
         stderr_buffer = io.StringIO()
@@ -143,7 +156,7 @@ class InboxApp(App):
                 new_state = watcher.run_iteration(
                     zd,
                     sites,
-                    self._state,
+                    state,
                     self.opts,
                     self._backfill_cutoff,
                     dd_client=None,
@@ -157,7 +170,7 @@ class InboxApp(App):
                     new_state = watcher.run_iteration(
                         zd,
                         sites,
-                        self._state,
+                        state,
                         self.opts,
                         self._backfill_cutoff,
                         dd_client=dd,
@@ -170,8 +183,8 @@ class InboxApp(App):
         for line in stderr_buffer.getvalue().splitlines():
             logger.warning(line)
 
-        self._state = new_state
         watcher.save_state(self.opts.state_file, watcher.prune_state(new_state))
+        return new_state
 
     def _on_view_listed(self, view_ids: list[int]) -> None:
         self.call_from_thread(self._reconcile_pending, set(view_ids))

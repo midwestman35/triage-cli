@@ -128,12 +128,6 @@ class TriageBundle(BaseModel):
         return "\n".join(lines)
 
 
-class TriageNote(BaseModel):
-    """Raw markdown response from the triage LLM call; no schema enforcement."""
-
-    markdown: str
-
-
 Confidence = Literal["low", "medium", "high"]
 
 

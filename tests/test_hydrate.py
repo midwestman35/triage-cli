@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+
+import pytest
 
 from triage_cli.inbox import hydrate
 from triage_cli.models import TimeWindow, TriageReport
@@ -77,3 +80,23 @@ def test_recent_reports_sorted_newest_first(tmp_path: Path) -> None:
     out = hydrate.recent_reports(tmp_path, hours=24)
     ids = [report.ticket_id for report in out]
     assert ids == [2, 3, 1]
+
+
+def test_corrupt_file_logs_at_debug_by_default(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    (tmp_path / "999-bad.json").write_text("{not json", encoding="utf-8")
+    with caplog.at_level(logging.DEBUG, logger="triage_cli.inbox.hydrate"):
+        hydrate.recent_reports(tmp_path, hours=24)
+    levels = {r.levelno for r in caplog.records if "skipping corrupt" in r.message}
+    assert levels == {logging.DEBUG}
+
+
+def test_corrupt_file_logs_at_warning_when_verbose(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    (tmp_path / "999-bad.json").write_text("{not json", encoding="utf-8")
+    with caplog.at_level(logging.DEBUG, logger="triage_cli.inbox.hydrate"):
+        hydrate.recent_reports(tmp_path, hours=24, verbose=True)
+    levels = {r.levelno for r in caplog.records if "skipping corrupt" in r.message}
+    assert levels == {logging.WARNING}

@@ -19,7 +19,7 @@ def copy_to_clipboard(text: str) -> bool:
     """
     for cmd in _TOOLS:
         try:
-            result = subprocess.run(
+            subprocess.run(
                 list(cmd),
                 input=text.encode("utf-8"),
                 check=True,
@@ -29,8 +29,6 @@ def copy_to_clipboard(text: str) -> bool:
             continue
         except (subprocess.SubprocessError, OSError):
             continue
-
-        if result.returncode == 0:
-            return True
+        return True
 
     return False

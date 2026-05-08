@@ -14,7 +14,12 @@ from triage_cli.models import TriageReport
 logger = logging.getLogger(__name__)
 
 
-def recent_reports(notes_dir: Path, *, hours: int = 24) -> list[TriageReport]:
+def recent_reports(
+    notes_dir: Path,
+    *,
+    hours: int = 24,
+    verbose: bool = False,
+) -> list[TriageReport]:
     """Return recent report sidecars, deduped by ticket and sorted newest first."""
     if not notes_dir.exists():
         return []
@@ -26,7 +31,8 @@ def recent_reports(notes_dir: Path, *, hours: int = 24) -> list[TriageReport]:
         try:
             report = TriageReport.model_validate_json(json_path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError, ValidationError) as exc:
-            logger.warning("hydrate: skipping corrupt sidecar %s: %s", json_path.name, exc)
+            log = logger.warning if verbose else logger.debug
+            log("hydrate: skipping corrupt sidecar %s: %s", json_path.name, exc)
             continue
 
         if report.generated_at < cutoff:
