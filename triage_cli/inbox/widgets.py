@@ -65,10 +65,17 @@ class TicketListWidget(DataTable):
         self.add_columns(" ", "Ticket", "Site", "When", "Conf", "Summary")
         self._columns_added = True
 
-    def refresh_rows(self, rows: list[RowEntry]) -> None:
+    def refresh_rows(
+        self,
+        rows: list[RowEntry],
+        *,
+        selected_ticket_id: int | None = None,
+    ) -> None:
         self._ensure_columns()
         self.clear()
+        selected_row = 0
         for row in sort_rows(rows):
+            row_index = self.row_count
             report = row.report
             icon = _STATUS_ICONS[row.status]
             site = report.site_name if report is not None else row.site_hint or "—"
@@ -88,10 +95,17 @@ class TicketListWidget(DataTable):
                 summary,
                 key=str(row.ticket_id),
             )
+            if row.ticket_id == selected_ticket_id:
+                selected_row = row_index
+
+        if self.row_count:
+            self.move_cursor(row=selected_row)
 
 
 class ReportPaneWidget(Static):
     """Inbox right pane: renders the selected TriageReport via Rich layout."""
+
+    can_focus = True
 
     DEFAULT_CSS = """
     ReportPaneWidget { padding: 1 2; overflow-y: auto; }

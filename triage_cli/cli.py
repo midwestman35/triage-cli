@@ -72,6 +72,29 @@ def _parse_backfill(value: str) -> float:
     _die(f"--backfill must be 'inf', '0', 'Nh', or 'Nd' (got {value!r})")
 
 
+def _configure_inbox_logging(view: int, verbose: bool) -> Path:
+    """Route triage_cli logs to the inbox log file before Textual starts."""
+    log_path = Path("data") / f"inbox-{view}.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    log_logger = logging.getLogger("triage_cli")
+    for handler in log_logger.handlers:
+        handler.close()
+    log_logger.handlers.clear()
+
+    level = logging.DEBUG if verbose else logging.WARNING
+    file_handler = logging.FileHandler(log_path, mode="a", encoding="utf-8")
+    file_handler.setLevel(level)
+    file_handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    )
+    log_logger.addHandler(file_handler)
+    log_logger.setLevel(level)
+    log_logger.propagate = False
+
+    return log_path
+
+
 @app.command()
 def triage(
     ticket: str = typer.Argument(..., help="Zendesk ticket ID or full URL"),
@@ -198,7 +221,7 @@ def inbox(
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
     """Launch the interactive inbox TUI for a Zendesk view."""
-    if not sys.stdout.isatty():
+    if not sys.stdout.isatty() or not sys.stdin.isatty():
         _die("inbox requires an interactive terminal. Use `watch` for headless runs.")
 
     from triage_cli.inbox import InboxApp
@@ -208,6 +231,8 @@ def inbox(
     level_list = _parse_levels(levels)
     state_file = Path("data") / f"watcher-state-{view}.json"
     state_file.parent.mkdir(parents=True, exist_ok=True)
+
+    log_path = _configure_inbox_logging(view, verbose)
 
     opts = WatcherOptions(
         view_id=view,
@@ -220,6 +245,7 @@ def inbox(
         print_notes=False,
         verbose=verbose,
     )
+    typer.echo(f"Logging to {log_path}", err=True)
     InboxApp(opts).run()
 
 
