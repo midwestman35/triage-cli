@@ -47,10 +47,12 @@ Behavioral concepts, not implementation:
 - **Assessment is honest about confidence.** When evidence is thin, the
   report says "unknown" rather than fabricating a root cause. The Python
   prompt allowed this; the Go report enforces it as a struct field.
-- **Single binary, no Python/Claude-CLI dependency at the edges.** Mock
-  mode and deterministic stub assessment let `investigate --mock` run
-  with zero external dependencies. LLM integration plugs in behind an
-  interface later.
+- **Single binary; LLM is opt-out, not opt-in.** The default assessor
+  shells out to the local `claude` CLI (preserving the no-API-key UX
+  of the Python tool, which uses the Agent SDK). `--no-llm` falls
+  back to the deterministic stub; if `claude` is missing on PATH,
+  we warn and fall back automatically. Mock fixtures still let
+  `investigate --mock --no-llm` run with zero external dependencies.
 - **Cobra-first command surface** with a `doctor` command for env checks
   and a `version` command — patterns borrowed from polished operator
   CLIs (Printing Press Library mindset).
@@ -183,14 +185,12 @@ go run ./cmd/triage-cli doctor
 
 ## What the next agent should pick up
 
-1. Real LLM-backed `Assessor` (Anthropic or local) behind the
-   `Assessor` interface — keep the stub as a `--no-llm` option.
-2. Attachment download + text extraction.
-3. Watcher: actual polling loop against Zendesk views.
-4. Bubble Tea three-pane TUI for `investigate`, kept as a flag
+1. Attachment download + text extraction.
+2. Watcher: actual polling loop against Zendesk views.
+3. Bubble Tea three-pane TUI for `investigate`, kept as a flag
    (`--tui`); the linear flow remains the default for piping.
-5. Optional Datadog evidence source.
-6. `build-map` command parity (parse `apex-cnc-inventory.md`).
+4. Optional Datadog evidence source.
+5. `build-map` command parity (parse `apex-cnc-inventory.md`).
 
 ## Iteration log
 
@@ -227,3 +227,58 @@ Verified: `gofmt -l .` clean, `go vet ./...` clean,
 target. The error printed when `investigate 12345` runs without env is:
 `zendesk config: missing required environment variable(s):
 ZENDESK_API_TOKEN, ZENDESK_EMAIL, ZENDESK_SUBDOMAIN`.
+
+### 2026-05-08 — Iteration 2: claude CLI Assessor
+
+Shipped:
+
+- `internal/assessment/prompt.go` — `BuildPrompt(session)` is a pure
+  string-builder that emits the system instruction, the literal JSON
+  schema (matching `model.Assessment`'s tags) with confidence
+  calibration and a thin-evidence example, then `=== TICKET ===` /
+  `=== EVIDENCE ===` / `=== TIMELINE ===` blocks and a closing
+  "Output ONLY the JSON object" instruction.
+- `internal/assessment/claudecli.go` — `ClaudeCLIAssessor` shells out
+  to `claude -p <prompt> --output-format json [--model <m>]`. Parses
+  the `{"type":"result","subtype":"success","result":"..."}` wrapper,
+  strips ```json``` fences and surrounding prose with a balanced-brace
+  scanner that respects strings/escapes, validates Confidence enum +
+  required non-empty fields, and maps errors:
+  - missing binary → `ErrClaudeNotFound` sentinel (caller can
+    `errors.Is` against it)
+  - non-zero exit → wraps stderr (truncated to 1KB)
+  - JSON parse failure → wraps with truncated raw output
+  - context cancellation propagates
+  `Exec` is an injectable `ExecFunc` for tests; the default uses
+  `exec.CommandContext` and (in `--llm-verbose`) mirrors stderr to
+  `os.Stderr` via `io.MultiWriter`.
+- `internal/assessment/claudecli_test.go` — table-driven coverage of
+  happy path, fence stripping, prose-around-JSON, invalid Confidence,
+  empty Summary, non-zero exit, `ErrClaudeNotFound` sentinel match,
+  context cancellation, wrapper-reports-error, `extractJSONObject`
+  edge cases, and `BuildPrompt` field presence.
+- `internal/cli/investigate.go` — adds `--no-llm`, `--llm-model`,
+  `--llm-verbose` flags via `addCommonInvestigateFlags`. New
+  `selectAssessor` chooses between `StubAssessor` (when `--no-llm`)
+  and a `fallbackAssessor` that delegates to the claude CLI but
+  silently falls back to the stub on `ErrClaudeNotFound` (with a
+  stderr warning). All other claude errors surface to the operator.
+- `internal/cli/triage.go` — uses the same flag helper, no
+  duplication.
+- `internal/cli/doctor.go` — adds `probeClaudeCLI` which checks
+  `exec.LookPath`, runs `claude --version` with a 5s timeout, and
+  prints `✓ claude: <version>` / `✗ claude: ... failed: ...` /
+  `− claude: not on PATH (...)`.
+- `internal/investigation/flow.go` — phase 6 status string changed
+  from `Running assessment (stub)...` to `Running assessment...`
+  since the assessor is now operator-selected.
+
+Confirmed wrapper shape from `claude --output-format json` (claude
+2.1.123): `{"type":"result","subtype":"success","is_error":false,
+"result":"<text>","duration_ms":...,"usage":{...},"session_id":...}`.
+
+Verified: `gofmt -l .` clean, `go vet ./...` clean, `go test -race
+./... -count=1` green. `investigate 12345 --mock` with claude
+available produces a content-aware assessment (Confidence: likely;
+ties SBC jitter windows to reported drop times); `--mock --no-llm`
+produces the deterministic stub.

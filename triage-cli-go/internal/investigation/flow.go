@@ -88,7 +88,7 @@ func Run(ctx context.Context, deps Deps, opts RunOpts) (model.TriageReport, erro
 	step(5, 6, "Building timeline...")
 	timeline := evidence.BuildTimeline(ticket, allEvidence)
 
-	step(6, 6, "Running assessment (stub)...")
+	step(6, 6, "Running assessment...")
 	session := model.InvestigationSession{
 		Ticket:   ticket,
 		Evidence: allEvidence,

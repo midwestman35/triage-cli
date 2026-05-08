@@ -1,13 +1,16 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -52,6 +55,8 @@ func newDoctorCmd() *cobra.Command {
 				}
 				fmt.Fprintf(out, "  %s %s: %s\n", mark, key, note)
 			}
+
+			probeClaudeCLI(cmd.Context(), out)
 
 			outputDir := globals.outputDir
 			if outputDir == "" {
@@ -125,6 +130,36 @@ func probeZendesk(ctx context.Context, out io.Writer) {
 	default:
 		fmt.Fprintf(out, "  ✗ zendesk: HTTP %d\n", resp.StatusCode)
 	}
+}
+
+// probeClaudeCLI checks whether the `claude` binary is on PATH and
+// emits a single status line. Missing claude is informational, not
+// critical — the operator can still --no-llm.
+func probeClaudeCLI(ctx context.Context, out io.Writer) {
+	path, err := exec.LookPath("claude")
+	if err != nil {
+		fmt.Fprintln(out, "  − claude: not on PATH (LLM-backed assessment unavailable; --no-llm forces the stub)")
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(probeCtx, path, "--version")
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		fmt.Fprintf(out, "  ✗ claude: found at %s but --version failed: %v (stderr: %s)\n",
+			path, err, strings.TrimSpace(stderr.String()))
+		return
+	}
+	version := strings.TrimSpace(stdout.String())
+	if version == "" {
+		version = "(empty version output)"
+	}
+	fmt.Fprintf(out, "  ✓ claude: %s\n", version)
 }
 
 func ensureWritable(out io.Writer, dir, label string) error {
