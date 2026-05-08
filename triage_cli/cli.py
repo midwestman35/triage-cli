@@ -183,6 +183,47 @@ def triage(
 
 
 @app.command()
+def inbox(
+    view: int = typer.Option(..., "--view", help="Zendesk view ID to monitor"),
+    poll: int = typer.Option(60, "--poll", min=10, help="Seconds between polls"),
+    backfill: str = typer.Option(
+        "0", "--backfill", help="Initial backfill horizon: inf, 0, Nh, Nd"
+    ),
+    window_minutes: int = typer.Option(
+        15, "--window-minutes", min=1, help="Window radius around the anchor in minutes"
+    ),
+    levels: str = typer.Option(
+        "error,warn", "--levels", help="Datadog log levels: comma-separated"
+    ),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Launch the interactive inbox TUI for a Zendesk view."""
+    if not sys.stdout.isatty():
+        _die("inbox requires an interactive terminal. Use `watch` for headless runs.")
+
+    from triage_cli.inbox import InboxApp
+    from triage_cli.watcher import WatcherOptions
+
+    backfill_hours = _parse_backfill(backfill)
+    level_list = _parse_levels(levels)
+    state_file = Path("data") / f"watcher-state-{view}.json"
+    state_file.parent.mkdir(parents=True, exist_ok=True)
+
+    opts = WatcherOptions(
+        view_id=view,
+        interval=poll,
+        state_file=state_file,
+        backfill_hours=backfill_hours,
+        window_minutes=window_minutes,
+        levels=level_list,
+        no_logs=False,
+        print_notes=False,
+        verbose=verbose,
+    )
+    InboxApp(opts).run()
+
+
+@app.command()
 def watch(
     view: int = typer.Option(..., "--view", help="Zendesk view ID to watch"),
     interval: int = typer.Option(
