@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from enum import StrEnum
+from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
@@ -27,6 +28,17 @@ class AnchorSource(StrEnum):
     CREATED_AT = "created_at"
 
 
+class AttachmentEvidence(BaseModel):
+    """Metadata for an attachment discovered on a Zendesk ticket."""
+
+    filename: str
+    content_type: str | None = None
+    size_bytes: int | None = None
+    source: Literal["zendesk_attachment"] = "zendesk_attachment"
+    local_path: Path | None = None
+    extracted_text: str | None = None
+
+
 class Comment(BaseModel):
     """A single Zendesk ticket comment, public or internal."""
 
@@ -34,6 +46,7 @@ class Comment(BaseModel):
     body: str
     created_at: datetime
     is_public: bool
+    attachments: list[AttachmentEvidence] = Field(default_factory=list)
 
 
 class Ticket(BaseModel):
@@ -47,6 +60,72 @@ class Ticket(BaseModel):
     created_at: datetime
     updated_at: datetime
     comments: list[Comment] = Field(default_factory=list)
+
+
+class LocalFileEvidence(BaseModel):
+    """Evidence read from a local path supplied during guided investigation."""
+
+    path: Path
+    size_bytes: int | None = None
+    detected_type: Literal["text", "log", "json", "unknown"] | None = None
+    extracted_text: str | None = None
+
+
+class PastedEvidence(BaseModel):
+    """User-pasted text evidence captured during guided investigation."""
+
+    label: str
+    text: str
+
+
+class InvestigationEvidence(BaseModel):
+    """All evidence gathered for an investigation session."""
+
+    ticket_id: int
+    comments: list[Comment] = Field(default_factory=list)
+    attachments: list[AttachmentEvidence] = Field(default_factory=list)
+    local_files: list[LocalFileEvidence] = Field(default_factory=list)
+    pasted_logs: list[PastedEvidence] = Field(default_factory=list)
+    optional_sources: list[str] = Field(default_factory=list)
+
+
+class TimelineEvent(BaseModel):
+    """A normalized event in the investigation timeline."""
+
+    timestamp: datetime | None = None
+    source: str
+    kind: str
+    message: str
+    raw_ref: str | None = None
+
+    @field_validator("timestamp")
+    @classmethod
+    def _timestamp_as_utc(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+
+
+class Assessment(BaseModel):
+    """Deterministic investigation assessment suitable for a Zendesk handoff draft."""
+
+    summary: str
+    likely_root_cause: str
+    confidence: Confidence
+    correlation: list[str] = Field(default_factory=list)
+    unknowns: list[str] = Field(default_factory=list)
+    next_steps: list[str] = Field(default_factory=list)
+    suggested_internal_note: str
+
+
+class InvestigationSession(BaseModel):
+    """State container for guided investigation before and after assessment."""
+
+    ticket: Ticket
+    evidence: InvestigationEvidence
+    timeline: list[TimelineEvent] = Field(default_factory=list)
+    assessment: Assessment | None = None
+    report: TriageReport | None = None
 
 
 class LogLine(BaseModel):

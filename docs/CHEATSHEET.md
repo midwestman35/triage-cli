@@ -2,11 +2,12 @@
 
 ## What it is
 
-A CLI that triages Zendesk tickets for the Carbyne APEX NG911/E911 platform. Four subcommands:
+A CLI that investigates and triages Zendesk tickets for the Carbyne APEX NG911/E911 platform. Guided Investigation is the primary workflow; the older one-shot and watcher paths remain available.
 
 | Command | Purpose |
 | --- | --- |
-| `triage <id>` | One-shot: fetch ticket → resolve site → query Datadog → call Claude → print a paste-ready report. |
+| `investigate <id>` | Guided investigation: fetch ticket/comments/attachment metadata, add local/pasted evidence, print or save a local handoff draft. |
+| `triage <id>` | One-shot: fetch ticket → optional site/Datadog enrichment → call Claude → print a paste-ready report. |
 | `inbox --view N` | Interactive Textual TUI: live list of view tickets on the left, selected report on the right. Use this at the keyboard. |
 | `watch --view N` | Headless poll loop: forever poll a Zendesk view, save each new triage to `./triage-notes/`, print status to stderr. Use this in tmux/cron/systemd. |
 | `build-map` | Regenerate `data/cnc-map.json` from `apex-cnc-inventory.md`. Run after editing the inventory. |
@@ -14,23 +15,42 @@ A CLI that triages Zendesk tickets for the Carbyne APEX NG911/E911 platform. Fou
 ## First-time setup
 
 ```bash
-# 1. Install (editable, with dev deps)
-pip install -e ".[dev]"
+# 1. Create and activate a Python 3.11+ virtualenv
+python3.11 -m venv .venv
+source .venv/bin/activate
 
-# 2. Create .env from the template
+# 2. Install pip into the venv if needed, then install editable with dev deps
+python -m ensurepip --upgrade
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install -e ".[dev]"
+
+# 3. Create .env from the template
 cp .env.example .env
 
-# 3. Fill in:
+# 4. Fill in:
 #    ZENDESK_SUBDOMAIN, ZENDESK_EMAIL, ZENDESK_API_TOKEN
-#    DD_API_KEY, DD_APP_KEY
+#    DD_API_KEY, DD_APP_KEY only if using Datadog enrichment
 #    (DD_SITE, DD_CALL_CENTER_TAG, ANTHROPIC_MODEL have working defaults)
 
-# 4. Authenticate Claude CLI once (the Agent SDK reuses this session)
+# 5. Authenticate Claude CLI once if using triage/watch reports
 claude   # type a message, confirm OAuth, exit
 
-# 5. Build the site map
+# 6. Build the site map if using triage/watch site resolution
 triage-cli build-map
 ```
+
+## `investigate <id>` — guided investigation
+
+```bash
+triage-cli investigate 12345
+triage-cli investigate 'https://acme.zendesk.com/agent/tickets/12345'
+triage-cli investigate 12345 --file ./station.log
+triage-cli investigate 12345 --paste 'console=WARN audio dropped'
+triage-cli investigate 12345 --file ./station.log --paste 'dispatch=PTT failures' --save
+triage-cli investigate 12345 --verbose
+```
+
+This path needs Zendesk only. It does not resolve CNC/site metadata, query Datadog, call Claude, or post notes back to Zendesk. Output is a local markdown handoff draft; `--save` writes paired `.md` and `.json` artifacts to `triage-notes/`.
 
 ## `triage <id>` — one-shot
 
@@ -96,7 +116,7 @@ Use `tmux` / `nohup` / `systemd` to keep it running. The watcher saves `triage-n
 triage-cli build-map        # regenerate data/cnc-map.json + data/cnc-map-gaps.md
 ```
 
-Run after editing `apex-cnc-inventory.md`. Both subcommands depend on the JSON map.
+Run after editing `apex-cnc-inventory.md`. `triage` and watcher site resolution depend on the JSON map; `investigate` does not.
 
 ## Where things live
 
@@ -116,13 +136,13 @@ ZENDESK_SUBDOMAIN          # required — the part before .zendesk.com
 ZENDESK_EMAIL              # required — the agent email used as Basic-auth user
 ZENDESK_API_TOKEN          # required — Zendesk API token (NOT a password)
 
-DD_API_KEY                 # required — Datadog API key
-DD_APP_KEY                 # required — Datadog application key
+DD_API_KEY                 # optional — Datadog API key for triage/watch enrichment
+DD_APP_KEY                 # optional — Datadog application key for triage/watch enrichment
 DD_SITE                    # default datadoghq.com (eu = datadoghq.eu, us3, etc.)
 DD_CALL_CENTER_TAG         # default @log.machineData.callCenterName
 DD_STATION_TAG             # reserved for v2 station-level filtering; unused today
 
-ANTHROPIC_MODEL            # default claude-sonnet-4-6 (used by both triage and anchor calls)
+ANTHROPIC_MODEL            # default claude-sonnet-4-6 (used by triage/watch LLM calls)
 ```
 
 The Agent SDK reuses Claude CLI's OAuth session — there is intentionally **no `ANTHROPIC_API_KEY`** here.
@@ -130,9 +150,12 @@ The Agent SDK reuses Claude CLI's OAuth session — there is intentionally **no 
 ## Common workflows
 
 ```bash
-# "Triage one ticket and paste the note into Zendesk"
+# "Investigate one ticket and prepare a local handoff draft"
+triage-cli investigate 12345 --file ./station.log --save
+# triage-notes/<id>-<ts>.md is paste-ready; no Zendesk write occurs
+
+# "Fast one-shot triage with optional enrichment"
 triage-cli triage 12345 --save
-# inbox/triage-notes/<id>-<ts>.md is paste-ready; or copy from the on-screen render
 
 # "What's been happening overnight?"
 triage-cli inbox --view 360123 --backfill 12h

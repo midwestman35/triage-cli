@@ -15,6 +15,13 @@ from dotenv import load_dotenv
 
 from triage_cli import extract, pipeline, render
 from triage_cli.datadog import DatadogClient, DatadogError
+from triage_cli.investigation import (
+    add_local_file,
+    add_pasted_evidence,
+    build_timeline,
+    create_session,
+    session_to_report,
+)
 from triage_cli.models import SiteEntry, TriageReport
 from triage_cli.pipeline import spinner as _spinner
 from triage_cli.zendesk import ZendeskClient
@@ -74,6 +81,14 @@ def _parse_backfill(value: str) -> float:
     _die(f"--backfill must be 'inf', '0', 'Nh', or 'Nd' (got {value!r})")
 
 
+def _parse_paste(value: str) -> tuple[str, str]:
+    """Parse a repeatable --paste LABEL=TEXT value."""
+    label, sep, text = value.partition("=")
+    if not sep or not label.strip():
+        _die("--paste must be LABEL=TEXT")
+    return label.strip(), text
+
+
 def _resolve_view(view: str | None) -> tuple[int | None, str]:
     """Resolve --view to (view_id, state_key).
 
@@ -118,6 +133,79 @@ def _configure_inbox_logging(view_key: str, verbose: bool) -> Path:
     log_logger.propagate = False
 
     return log_path
+
+
+@app.command()
+def investigate(
+    ticket: str = typer.Argument(..., help="Zendesk ticket ID or full URL"),
+    files: list[Path] = typer.Option(  # noqa: B008
+        [],
+        "--file",
+        help="Local evidence file to include; may be repeated.",
+        exists=False,
+        file_okay=True,
+        dir_okay=False,
+        readable=True,
+        resolve_path=True,
+    ),
+    pastes: list[str] = typer.Option(  # noqa: B008
+        [],
+        "--paste",
+        help="Pasted evidence as LABEL=TEXT; may be repeated.",
+    ),
+    save: bool = typer.Option(False, "--save", help="Also save markdown/JSON to ./triage-notes/"),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Run a guided investigation from Zendesk plus local/pasted evidence."""
+    try:
+        ticket_id = extract.parse_ticket_id(ticket)
+    except ValueError as e:
+        _die(str(e))
+
+    parsed_pastes = [_parse_paste(value) for value in pastes]
+
+    for path in files:
+        if not path.exists():
+            _die(f"Local evidence file not found: {path}")
+        if not path.is_file():
+            _die(f"Local evidence path is not a file: {path}")
+
+    try:
+        with ZendeskClient.from_env() as zd:
+            ticket_obj = zd.get_ticket(ticket_id)
+    except RuntimeError as e:
+        _die(str(e))
+
+    _vecho(verbose, f"Fetched ticket #{ticket_obj.id} — subject: {ticket_obj.subject}")
+
+    session = create_session(ticket_obj)
+    for path in files:
+        try:
+            add_local_file(session, path)
+        except OSError as e:
+            _die(f"Could not read local evidence file {path}: {e}")
+    for label, text in parsed_pastes:
+        add_pasted_evidence(session, label, text)
+    build_timeline(session)
+    report = session_to_report(session)
+
+    if verbose:
+        attachments_count = len(session.evidence.attachments)
+        sources_str = ", ".join(report.sources)
+        typer.echo(
+            "Investigation evidence: "
+            f"comments: {len(session.evidence.comments)} · "
+            f"attachments metadata: {attachments_count} · "
+            f"local files: {len(session.evidence.local_files)} · "
+            f"pasted evidence: {len(session.evidence.pasted_logs)} · "
+            f"sources: {sources_str}",
+            err=True,
+        )
+
+    render.print_note(report)
+    if save:
+        md_path, json_path = render.save_note(report, ticket_obj.id)
+        typer.echo(f"Saved: {md_path} and {json_path}", err=True)
 
 
 @app.command()

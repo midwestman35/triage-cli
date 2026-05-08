@@ -2,14 +2,16 @@
 
 ## What this is
 
-A local CLI for Axon network engineers working the Carbyne APEX NG911/E911 platform. Give it a Zendesk ticket (URL or numeric ID) and it pulls the ticket and its full comment thread, resolves which APEX site it belongs to via a local CNC inventory, queries Datadog for logs in a window around the incident anchor, hands the bundle to Claude, and prints a four-section markdown triage note to your terminal. Single-shot, terminal-only, no posting back, no daemons.
+A local CLI for Axon network engineers working the Carbyne APEX NG911/E911 platform. The primary workflow is Guided Investigation: give it a Zendesk ticket URL or ID, it fetches the ticket body, comments, and attachment metadata, optionally folds in local files or pasted logs, and generates a local markdown/JSON handoff draft. Nothing is posted back to Zendesk.
+
+`triage-cli triage <ticket>` remains available as a fast one-shot summary/report path. `triage-cli watch --view <id>` remains the automated watcher for Zendesk views. Datadog is useful enrichment for `triage` and watcher mode, but it is not required for `investigate`.
 
 ## Prerequisites
 
-- **Claude Code CLI installed and authenticated.** The `claude` command must work in your shell. The Claude Agent SDK piggybacks on Claude Code's existing OAuth session, so there is no API key to provision. If you have not run `claude` interactively at least once, do that first.
 - **Python 3.11+** (the package is pinned to `>=3.11` in `pyproject.toml`).
 - **Zendesk credentials** with read scope on tickets: an agent email plus an API token.
-- **Datadog credentials**: an API key and an APP key with permission to read logs.
+- **Claude Code CLI installed and authenticated** for `triage` and watcher reports. The guided `investigate` command does not require Claude.
+- **Datadog credentials** are optional enrichment for `triage` and watcher mode. `investigate` works without Datadog.
 
 ## Install
 
@@ -17,7 +19,9 @@ A local CLI for Axon network engineers working the Carbyne APEX NG911/E911 platf
 git clone <repo-url> && cd triage-cli
 python3.11 -m venv .venv
 source .venv/bin/activate
-pip install -e .
+python -m ensurepip --upgrade
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install -e .
 ```
 
 `uv` works too if you prefer it:
@@ -26,7 +30,7 @@ pip install -e .
 uv pip install -e .
 ```
 
-After install, `triage-cli --help` should list the `triage` and `build-map` subcommands.
+After install, `triage-cli --help` should list the `investigate`, `triage`, `watch`, and `build-map` subcommands.
 
 ## Configuration
 
@@ -41,8 +45,8 @@ cp .env.example .env
 | `ZENDESK_SUBDOMAIN` | Your Zendesk subdomain (the `<sub>` in `<sub>.zendesk.com`). |
 | `ZENDESK_EMAIL` | Agent email used for Basic auth. |
 | `ZENDESK_API_TOKEN` | Zendesk API token. The client appends `/token` to the email automatically; do not append it yourself. |
-| `DD_API_KEY` | Datadog API key. |
-| `DD_APP_KEY` | Datadog application key. |
+| `DD_API_KEY` | Optional Datadog API key for `triage`/watch enrichment. |
+| `DD_APP_KEY` | Optional Datadog application key for `triage`/watch enrichment. |
 | `DD_SITE` | Datadog site host. Leave at default `datadoghq.com` unless you are on a non-US tenant. |
 | `DD_CALL_CENTER_TAG` | Datadog tag key for the call-center filter. Leave at default `@log.machineData.callCenterName`. |
 | `DD_STATION_TAG` | Reserved for v2 station-level filtering. Leave at default; v1 does not use it. |
@@ -64,14 +68,43 @@ This rewrites `data/cnc-map.json` and `data/cnc-map-gaps.md` (the latter records
 
 ## Usage
 
-### Basic happy path
+### Guided investigation
+
+```bash
+triage-cli investigate 12345
+triage-cli investigate https://<sub>.zendesk.com/agent/tickets/12345
+```
+
+This is the primary daily-use path. It reads Zendesk ticket content, comments, and attachment metadata, then creates a local handoff draft with an evidence-first assessment. Attachment contents are not downloaded yet; metadata is recorded so the gap is visible.
+
+Add local or pasted evidence in a testable, non-interactive way:
+
+```bash
+triage-cli investigate 12345 --file ./station.log --paste 'console=WARN audio dropped'
+triage-cli investigate 12345 --save
+triage-cli investigate 12345 --verbose
+```
+
+`--file` and `--paste LABEL=TEXT` may be repeated. `--save` writes paired markdown and JSON files under `./triage-notes/`. The generated note is local and paste-ready; the CLI does not write to Zendesk.
+
+Evidence sources currently supported by Guided Investigation:
+
+- Zendesk ticket body and metadata
+- Zendesk comments
+- Zendesk attachment metadata
+- Local files
+- Pasted logs or console excerpts
+
+Datadog remains optional enrichment for `triage` and watcher mode; it is not used by `investigate`. Site map lookup, CNC resolution, and Claude are not required for `investigate`.
+
+### Fast one-shot triage
 
 ```bash
 triage-cli triage 12345
 triage-cli triage https://<sub>.zendesk.com/agent/tickets/12345
 ```
 
-The CLI accepts either a raw ticket ID or a full Zendesk URL. The output is a four-section markdown note printed to stdout.
+The CLI accepts either a raw ticket ID or a full Zendesk URL. This path is optimized for a quick terminal report and can use site/CNC lookup, Datadog logs, and Claude.
 
 ### Save the note to disk
 
@@ -107,13 +140,13 @@ triage-cli triage 12345 --cnc de9ee414-da5a-471d-bac2-10643190da0b
 
 `--site` skips the lookup entirely and uses the value as-is in the Datadog filter. `--cnc` looks the entry up by UUID in `data/cnc-map.json` and uses its `site_name`. Use `--site` when the requester org or ticket text does not match any inventory entry.
 
-### Skip Datadog
+### Skip Datadog for one-shot triage
 
 ```bash
 triage-cli triage 12345 --no-logs
 ```
 
-Runs the LLM call on the ticket content alone. Useful when iterating on the system prompt without burning Datadog query quota, and when the site cannot be resolved but you still want a ticket-only summary.
+Runs the LLM call on the ticket content alone. Guided Investigation does not need this flag because Datadog is not part of its required path.
 
 ### Adjust log levels
 
@@ -172,9 +205,9 @@ Common flags:
 
 See `docs/runbooks/06-watching-a-view.md` for a full operator runbook.
 
-## Output format
+## One-Shot Output Format
 
-The triage note is plain markdown with four fixed sections, in this order:
+The one-shot `triage` note is plain markdown with four fixed sections, in this order:
 
 ```markdown
 ## Summary
@@ -215,10 +248,11 @@ triage-cli/
 ├── apex-cnc-inventory.md       # source of truth for the CNC map
 ├── .env.example
 ├── triage_cli/
-│   ├── cli.py                  # typer app: triage, watch, and build-map subcommands
+│   ├── cli.py                  # typer app: investigate, triage, watch, and build-map subcommands
 │   ├── zendesk.py              # ticket + comment fetch (httpx)
 │   ├── datadog.py              # log query (datadog-api-client)
 │   ├── extract.py              # ticket ID parsing, site lookup, window/anchor
+│   ├── investigation.py        # guided investigation session/evidence/report bridge
 │   ├── llm.py                  # Claude Agent SDK calls + system prompts
 │   ├── models.py               # pydantic models
 │   ├── pipeline.py             # triage_one single-ticket orchestration
@@ -250,7 +284,7 @@ triage-cli/
 ## Troubleshooting
 
 **`ImportError: claude_agent_sdk`**
-The package was not installed (run `pip install -e .` again from the repo root with your venv active), or your venv is not actually activated. The SDK is a runtime dependency declared in `pyproject.toml`.
+The package was not installed (run `python -m pip install -e .` again from the repo root with your venv active), or your venv is not actually activated. The SDK is a runtime dependency declared in `pyproject.toml`.
 
 **`Claude Agent SDK call failed` / `extracted_dt None and SDK error in --verbose`**
 The SDK could not reach Claude Code's session. Run `claude` once interactively to confirm the CLI is installed and your OAuth session is valid. The Agent SDK does not read `ANTHROPIC_API_KEY` — Claude Code's auth is the only path.

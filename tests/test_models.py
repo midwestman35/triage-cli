@@ -2,13 +2,23 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 
 from triage_cli.models import (
+    Assessment,
+    AttachmentEvidence,
+    Comment,
     EvidenceItem,
+    InvestigationEvidence,
+    InvestigationSession,
     LLMTriageOutput,
+    LocalFileEvidence,
+    PastedEvidence,
+    Ticket,
+    TimelineEvent,
     TimeWindow,
     TriageReport,
 )
@@ -137,3 +147,114 @@ def test_report_datetimes_normalize_to_utc():
     assert report.window.start == datetime(2026, 5, 7, 14, 0, 0, tzinfo=UTC)
     assert report.window.end == datetime(2026, 5, 7, 14, 15, 0, tzinfo=UTC)
     assert report.generated_at == datetime(2026, 5, 7, 14, 0, 0, tzinfo=UTC)
+
+
+def test_investigation_models_round_trip_and_defaults():
+    now = datetime(2026, 5, 7, 14, 0, 0, tzinfo=UTC)
+    ticket = Ticket(
+        id=42,
+        subject="Audio dropouts",
+        description="Caller audio drops after reboot.",
+        created_at=now,
+        updated_at=now,
+    )
+    evidence = InvestigationEvidence(
+        ticket_id=42,
+        attachments=[
+            AttachmentEvidence(
+                filename="station_logs.zip",
+                content_type="application/zip",
+                size_bytes=2048,
+            ),
+        ],
+        local_files=[
+            LocalFileEvidence(
+                path="/tmp/station.log",
+                size_bytes=11,
+                detected_type="log",
+                extracted_text="line one",
+            ),
+        ],
+        pasted_logs=[PastedEvidence(label="console", text="WARN audio dropped")],
+        optional_sources=["datadog"],
+    )
+    assessment = Assessment(
+        summary="Ticket evidence reviewed.",
+        likely_root_cause="Insufficient evidence for a specific root cause.",
+        confidence="low",
+        correlation=["Ticket description mentions audio dropouts."],
+        unknowns=["No station logs were provided."],
+        next_steps=["Collect workstation logs."],
+        suggested_internal_note="Reviewed ticket evidence.",
+    )
+    session = InvestigationSession(
+        ticket=ticket,
+        evidence=evidence,
+        timeline=[
+            TimelineEvent(
+                timestamp=now,
+                source="zendesk",
+                kind="ticket_created",
+                message="Ticket created: Audio dropouts",
+            ),
+        ],
+        assessment=assessment,
+    )
+
+    restored = InvestigationSession.model_validate_json(session.model_dump_json())
+
+    assert restored.evidence.attachments[0].source == "zendesk_attachment"
+    assert restored.evidence.attachments[0].local_path is None
+    assert restored.evidence.attachments[0].extracted_text is None
+    assert restored.evidence.optional_sources == ["datadog"]
+    assert restored.assessment is not None
+    assert restored.assessment.confidence == "low"
+
+
+def test_investigation_evidence_comments_are_comment_models():
+    now = datetime(2026, 5, 7, 14, 0, 0, tzinfo=UTC)
+
+    evidence = InvestigationEvidence(
+        ticket_id=42,
+        comments=[
+            {
+                "author": "Agent One",
+                "body": "Customer reports intermittent audio loss.",
+                "created_at": now,
+                "is_public": False,
+            },
+        ],
+    )
+
+    assert evidence.comments == [
+        Comment(
+            author="Agent One",
+            body="Customer reports intermittent audio loss.",
+            created_at=now,
+            is_public=False,
+        ),
+    ]
+
+
+def test_attachment_evidence_local_path_is_path():
+    path = Path("/tmp/station_logs.zip")
+
+    evidence = AttachmentEvidence(filename="station_logs.zip", local_path=path)
+    restored = AttachmentEvidence.model_validate_json(evidence.model_dump_json())
+
+    assert evidence.local_path == path
+    assert isinstance(evidence.local_path, Path)
+    assert restored.local_path == path
+    assert isinstance(restored.local_path, Path)
+
+
+def test_local_file_evidence_path_is_intentionally_path():
+    path = Path("/tmp/station.log")
+
+    evidence = LocalFileEvidence(path=path)
+    restored = LocalFileEvidence.model_validate_json(evidence.model_dump_json())
+
+    assert evidence.path == path
+    assert isinstance(evidence.path, Path)
+    assert restored.path == path
+    assert isinstance(restored.path, Path)

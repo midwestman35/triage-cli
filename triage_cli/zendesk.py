@@ -9,7 +9,7 @@ from typing import Any
 
 import httpx
 
-from triage_cli.models import Comment, Ticket
+from triage_cli.models import AttachmentEvidence, Comment, Ticket
 
 logger = logging.getLogger(__name__)
 
@@ -252,7 +252,28 @@ def _to_comment(rc: dict[str, Any], users_by_id: dict[int, dict[str, Any]]) -> C
         body=body,
         created_at=_parse_iso(rc["created_at"]),
         is_public=bool(rc.get("public", False)),
+        attachments=_attachments_from_raw(rc.get("attachments") or []),
     )
+
+
+def _attachments_from_raw(raw_attachments: list[dict[str, Any]]) -> list[AttachmentEvidence]:
+    """Map Zendesk attachment metadata without preserving downloadable URLs."""
+    attachments: list[AttachmentEvidence] = []
+    for raw in raw_attachments:
+        filename = raw.get("file_name") or raw.get("filename") or raw.get("name")
+        if not filename:
+            continue
+        size = raw.get("size") if raw.get("size") is not None else raw.get("size_bytes")
+        attachments.append(
+            AttachmentEvidence(
+                filename=str(filename),
+                content_type=(
+                    str(raw["content_type"]) if raw.get("content_type") is not None else None
+                ),
+                size_bytes=int(size) if size is not None else None,
+            )
+        )
+    return attachments
 
 
 def _resolve_author(
