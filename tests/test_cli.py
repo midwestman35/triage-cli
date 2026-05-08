@@ -22,7 +22,7 @@ def test_configure_inbox_logging_replaces_handlers_and_writes_file(
     logger.addHandler(stale_handler)
 
     try:
-        log_path = cli._configure_inbox_logging(view=42, verbose=True)
+        log_path = cli._configure_inbox_logging(view_key="42", verbose=True)
         assert log_path == tmp_path.joinpath("data", "inbox-42.log").relative_to(
             tmp_path
         )

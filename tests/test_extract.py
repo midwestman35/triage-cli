@@ -285,6 +285,45 @@ def test_lookup_site_empty_org_falls_through_to_substring(
     assert entry is not None and entry.site_name == "us-nv-nvdps-apex"
 
 
+def test_lookup_site_subject_bracket_double_underscore(
+    sites: list[SiteEntry],
+) -> None:
+    ticket = _ticket(subject="[us__nv__nvdps__apex] Calls dropping")
+    entry, strategy = lookup_site(ticket, sites)
+    assert strategy == "subject_bracket"
+    assert entry is not None and entry.site_name == "us-nv-nvdps-apex"
+
+
+def test_lookup_site_subject_bracket_mixed_underscore(
+    sites: list[SiteEntry],
+) -> None:
+    # single underscore within a segment (e.g. pine_ridge) also normalizes to "-"
+    ticket = _ticket(subject="[us__va__fairfax__pine_ridge__apex] Issue")
+    entry, strategy = lookup_site(ticket, sites)
+    assert strategy == "subject_bracket"
+    assert entry is not None and entry.site_name == "us-va-fairfax-pine-ridge-apex"
+
+
+def test_lookup_site_subject_bracket_beats_substring(
+    sites: list[SiteEntry],
+) -> None:
+    # Both bracket and substring would match; bracket tier runs first.
+    ticket = _ticket(subject="[us__co__aurora__apex] us-nv-nvdps-apex mentioned too")
+    entry, strategy = lookup_site(ticket, sites)
+    assert strategy == "subject_bracket"
+    assert entry is not None and entry.site_name == "us-co-aurora-apex"
+
+
+def test_lookup_site_subject_bracket_unknown_falls_through(
+    sites: list[SiteEntry],
+) -> None:
+    # Bracket present but not in site map → fall through to substring search.
+    ticket = _ticket(subject="[us__xx__unknown__site] us-nv-nvdps-apex also here")
+    entry, strategy = lookup_site(ticket, sites)
+    assert strategy == "site_substring"
+    assert entry is not None and entry.site_name == "us-nv-nvdps-apex"
+
+
 # ---------- build_window ----------
 
 

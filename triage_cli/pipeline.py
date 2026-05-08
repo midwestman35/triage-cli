@@ -19,6 +19,7 @@ from unicode_animations import live_spinner as _live_spinner
 from triage_cli import extract
 from triage_cli.datadog import DatadogClient
 from triage_cli.llm import extract_anchor as _llm_extract_anchor
+from triage_cli.llm import extract_site as _llm_extract_site
 from triage_cli.llm import triage as _llm_triage
 from triage_cli.models import SiteEntry, Ticket, TimeWindow, TriageBundle, TriageReport
 
@@ -39,6 +40,48 @@ def _vecho(verbose: bool, msg: str) -> None:
     """Echo to stderr only when verbose is set."""
     if verbose:
         print(msg, file=sys.stderr, flush=True)
+
+
+def resolve_site(
+    ticket: Ticket,
+    sites: list[SiteEntry],
+    *,
+    cnc_override: str | None = None,
+    site_override: str | None = None,
+    verbose: bool = False,
+    show_spinner: bool = False,
+) -> tuple[SiteEntry | None, str]:
+    """Resolve which SiteEntry a ticket is about, with LLM fallback on no_match.
+
+    Runs extract.lookup_site first (fast, pure). If that returns no_match,
+    asks Claude to identify the site from the ticket text against the known list.
+    Returns (entry, strategy); strategy is 'llm_extraction' when the LLM wins.
+    Returns (None, 'no_match') when both strategies fail.
+    """
+    site_entry, strategy = extract.lookup_site(
+        ticket, sites, cnc_override=cnc_override, site_override=site_override,
+    )
+    if site_entry is not None:
+        return site_entry, strategy
+
+    _vecho(verbose, "Site lookup: no_match — asking Claude to identify site")
+    try:
+        with spinner("Asking Claude to identify site", show=show_spinner):
+            llm_name = asyncio.run(_llm_extract_site(ticket, sites))
+    except Exception as e:
+        _vecho(verbose, f"LLM site extraction failed: {e}")
+        return None, "no_match"
+
+    if llm_name is None:
+        _vecho(verbose, "LLM could not identify site")
+        return None, "no_match"
+
+    site_entry, _ = extract.lookup_site(ticket, sites, site_override=llm_name)
+    if site_entry is not None:
+        _vecho(verbose, f"LLM identified site: {llm_name}")
+        return site_entry, "llm_extraction"
+
+    return None, "no_match"
 
 
 def triage_one(

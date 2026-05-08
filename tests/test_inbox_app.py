@@ -58,7 +58,7 @@ def test_inbox_app_hydrates_and_updates_detail(tmp_path: Path) -> None:
         async with app.run_test() as pilot:
             table = app.query_one("#list", TicketListWidget)
             assert table.row_count == 1
-            assert app.sub_title == "view 99 - 1 ticket - last poll: -"
+            assert app.sub_title == "99 - 1 ticket - last poll: -"
 
             await pilot.press("down")
             detail = app.query_one("#detail", ReportPaneWidget)
@@ -73,7 +73,7 @@ def test_inbox_app_empty_state_subtitle_and_detail_copy(tmp_path: Path) -> None:
         async with app.run_test():
             table = app.query_one("#list", TicketListWidget)
             assert table.row_count == 0
-            assert app.sub_title == "view 99 - no tickets - last poll: -"
+            assert app.sub_title == "99 - no tickets - last poll: -"
 
             detail = app.query_one("#detail", ReportPaneWidget)
             assert detail.current_report is None
@@ -184,8 +184,8 @@ def test_reconcile_and_status_callbacks_update_rows(tmp_path: Path) -> None:
         app = InboxApp(_opts(tmp_path), notes_dir=tmp_path, poll_on_mount=False)
         async with app.run_test() as pilot:
             app._reconcile_pending({101, 202})
-            assert app._rows[101].status == "pending"
-            assert app._rows[202].status == "pending"
+            assert app._rows[101].status == "queued"
+            assert app._rows[202].status == "queued"
 
             app._set_status(101, "triaging")
             assert app._rows[101].status == "triaging"
