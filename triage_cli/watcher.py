@@ -17,6 +17,7 @@ import math
 import os
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -24,7 +25,7 @@ from typing import Any
 
 from triage_cli import extract, pipeline, render
 from triage_cli.datadog import DatadogClient
-from triage_cli.models import SiteEntry, Ticket
+from triage_cli.models import SiteEntry, Ticket, TriageReport
 from triage_cli.zendesk import ZendeskClient
 
 logger = logging.getLogger(__name__)
@@ -138,6 +139,11 @@ def run_iteration(
     opts: WatcherOptions,
     backfill_cutoff: datetime,
     dd_client: DatadogClient | None,
+    *,
+    on_view_listed: Callable[[list[int]], None] | None = None,
+    on_progress: Callable[[int, str], None] | None = None,
+    on_complete: Callable[[TriageReport], None] | None = None,
+    on_failure: Callable[[int, str], None] | None = None,
 ) -> State:
     """Run one poll-and-triage pass over the view. Returns the updated state."""
     triaged_map: dict[str, str] = dict(state.get("triaged") or {})
@@ -153,12 +159,17 @@ def run_iteration(
         _emit(f"[{_now_local_hms()}] iteration aborted: {e}")
         return new_state
 
+    if on_view_listed is not None:
+        on_view_listed(view_ids)
+
     for tid in view_ids:
         key = str(tid)
         try:
             ticket = zd.get_ticket(tid)
         except (RuntimeError, ValueError) as e:
             _emit(f"[{_now_local_hms()}] #{tid} failed: {e} (will retry)")
+            if on_failure is not None:
+                on_failure(tid, str(e))
             continue
 
         stored = triaged_map.get(key)
@@ -173,9 +184,13 @@ def run_iteration(
         site_entry, _strategy = extract.lookup_site(ticket, sites)
         if site_entry is None:
             _emit(f"[{_now_local_hms()}] #{tid} skipped: site unresolvable")
+            if on_failure is not None:
+                on_failure(tid, "site unresolvable")
             continue
 
         try:
+            if on_progress is not None:
+                on_progress(tid, "triaging")
             report = pipeline.triage_one(
                 ticket,
                 site_entry,
@@ -188,14 +203,20 @@ def run_iteration(
             )
         except (RuntimeError, ValueError) as e:
             _emit(f"[{_now_local_hms()}] #{tid} failed: {e} (will retry)")
+            if on_failure is not None:
+                on_failure(tid, str(e))
             continue
 
         try:
             md_path, _json_path = render.save_note(report, ticket.id)
         except OSError as e:
             _emit(f"[{_now_local_hms()}] #{tid} failed: could not write note: {e} (will retry)")
+            if on_failure is not None:
+                on_failure(tid, f"could not write note: {e}")
             continue
         _emit(f"[{_now_local_hms()}] #{tid} triaged → {md_path}")
+        if on_complete is not None:
+            on_complete(report)
         if opts.verbose:
             sources_str = ", ".join(report.sources)
             _emit(

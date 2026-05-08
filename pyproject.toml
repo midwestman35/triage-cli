@@ -16,6 +16,7 @@ dependencies = [
     "python-dotenv>=1.0",
     "unicode-animations>=0.2",
     "rich>=13",
+    "textual>=0.80",
 ]
 
 [project.optional-dependencies]
