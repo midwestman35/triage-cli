@@ -15,6 +15,16 @@ A local CLI for Axon network engineers working the Carbyne APEX NG911/E911 platf
 
 ## Install
 
+For first-time setup, use the interactive setup script. It creates the venv,
+installs the package with dev dependencies, prompts for `.env`, builds the site
+map, and resumes safely if interrupted:
+
+```bash
+python3.11 scripts/setup.py
+```
+
+Manual install remains available when you need to run the steps yourself:
+
 ```bash
 git clone <repo-url> && cd triage-cli
 python3.11 -m venv .venv
@@ -30,7 +40,8 @@ python -m pip install -e .
 uv pip install -e .
 ```
 
-After install, `triage-cli --help` should list the `investigate`, `triage`, `watch`, and `build-map` subcommands.
+After install, `triage-cli --help` should list the `investigate`, `triage`, `inbox`,
+`watch`, and `build-map` subcommands.
 
 ## Configuration
 

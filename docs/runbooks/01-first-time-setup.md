@@ -4,6 +4,20 @@
 
 ## Steps
 
+Run the interactive setup script from the repo root:
+
+```bash
+python3.11 scripts/setup.py
+```
+
+The script verifies prerequisites, creates `.venv`, installs the package with
+dev dependencies, prompts for `.env`, builds the site map, and smoke-tests the
+installed CLI. It writes `.setup-state.json` after each completed phase, so
+rerunning it resumes from the first incomplete phase.
+
+Use the manual steps below only when you need to diagnose or perform a setup
+step yourself.
+
 1. **Verify prerequisites.** Both commands must exit cleanly:
 
    ```bash
