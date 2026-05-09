@@ -74,6 +74,8 @@ class RowEntry:
     report: TriageReport | None
     site_hint: str | None = None
     failure_reason: str | None = None
+    phase_label: str | None = None
+    phase_step: int = 0
 
 
 def sort_rows(rows: list[RowEntry]) -> list[RowEntry]:

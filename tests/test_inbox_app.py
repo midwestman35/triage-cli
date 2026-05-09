@@ -486,3 +486,21 @@ def test_run_iteration_blocking_routes_watcher_stderr_to_log(
 
     assert "watcher status line" in caplog.text
     assert "watcher status line" not in capsys.readouterr().err
+
+
+def test_set_phase_updates_row_entry(tmp_path: Path) -> None:
+    """_set_phase stores phase label and step on the RowEntry."""
+    from triage_cli.inbox.widgets import RowEntry
+
+    async def run() -> None:
+        app = InboxApp(_opts(tmp_path), notes_dir=tmp_path, poll_on_mount=False)
+        async with app.run_test():
+            app._rows[999] = RowEntry(ticket_id=999, status="triaging", report=None)
+            app._set_phase(999, "Asking Claude", 4)
+            await asyncio.sleep(0)
+
+            entry = app._rows[999]
+            assert entry.phase_label == "Asking Claude"
+            assert entry.phase_step == 4
+
+    asyncio.run(run())

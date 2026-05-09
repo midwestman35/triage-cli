@@ -308,6 +308,15 @@ class InboxApp(App):
             entry.failure_reason = error
         self._refresh_list()
 
+    def _set_phase(self, ticket_id: int, label: str, step: int) -> None:
+        entry = self._rows.get(ticket_id)
+        if entry is None:
+            return
+        entry.phase_label = label
+        entry.phase_step = step
+        if self._selected_ticket_id() == ticket_id:
+            self.query_one("#detail", ReportPaneWidget).show_progress(label, step)
+
     def _selected_ticket_id(self) -> int | None:
         list_widget = self.query_one("#list", TicketListWidget)
         if list_widget.row_count and list_widget.is_valid_coordinate(
@@ -364,6 +373,7 @@ class InboxApp(App):
         The modal's dismiss handler restarts triage with the user-provided site override.
         """
         self.call_from_thread(self._set_status, ticket_id, "triaging")
+        self.call_from_thread(self._set_phase, ticket_id, "Fetching ticket", 1)
 
         try:
             sites = extract.load_site_map(Path("data/cnc-map.json"))
@@ -390,6 +400,9 @@ class InboxApp(App):
         self, ticket_id: int, ticket: Ticket, site_entry: SiteEntry
     ) -> None:
         """Run the triage pipeline for a resolved ticket+site (worker thread)."""
+        def _phase(label: str, step: int) -> None:
+            self.call_from_thread(self._set_phase, ticket_id, label, step)
+
         try:
             if self.opts.no_logs:
                 report = pipeline.triage_one(
@@ -397,6 +410,7 @@ class InboxApp(App):
                     window_minutes=self.opts.window_minutes,
                     levels=self.opts.levels, at=None,
                     verbose=self.opts.verbose, show_spinner=False,
+                    on_phase=_phase,
                 )
             else:
                 with DatadogClient.from_env() as dd:
@@ -405,6 +419,7 @@ class InboxApp(App):
                         window_minutes=self.opts.window_minutes,
                         levels=self.opts.levels, at=None,
                         verbose=self.opts.verbose, show_spinner=False,
+                        on_phase=_phase,
                     )
             render.save_note(report, ticket_id)
             self._on_complete(report)
@@ -486,10 +501,7 @@ class InboxApp(App):
         elif entry.status == "queued":
             detail.show_placeholder("[dim]○ In queue — press [bold]Enter[/] to triage now[/]")
         elif entry.status == "triaging":
-            detail.show_progress(
-                getattr(entry, "phase_label", None) or "Triaging…",
-                getattr(entry, "phase_step", 0),
-            )
+            detail.show_progress(entry.phase_label or "Triaging…", entry.phase_step)
         elif entry.status == "failed":
             reason = entry.failure_reason or "Unknown error"
             detail.show_placeholder(f"[red]✗ Triage failed:[/red]\n\n{reason}")
