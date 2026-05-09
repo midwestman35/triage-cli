@@ -285,3 +285,32 @@ def test_attachment_evidence_excludes_content_url_when_dumped_with_exclude():
     )
     dumped = a.model_dump(exclude={"content_url"})
     assert "content_url" not in dumped
+
+
+def test_triage_bundle_evidence_fields_default_empty():
+    """All three evidence lists default to []; constructing a bundle without
+    them still works (watcher path)."""
+    from triage_cli.models import (
+        AnchorSource, SiteEntry, Ticket, TriageBundle,
+    )
+
+    ts = datetime(2026, 5, 7, 12, 0, 0, tzinfo=UTC)
+    bundle = TriageBundle(
+        ticket=Ticket(
+            id=1, subject="x", description="y",
+            created_at=ts, updated_at=ts, comments=[],
+        ),
+        site_entry=SiteEntry(
+            friendly_name="Aurora 911, CO",
+            site_name="us-co-aurora-apex",
+            cnc="abc",
+        ),
+        anchor=ts,
+        anchor_source=AnchorSource.CREATED_AT,
+        window_start=ts,
+        window_end=ts,
+    )
+
+    assert bundle.downloaded_attachments == []
+    assert bundle.local_files == []
+    assert bundle.pasted_logs == []

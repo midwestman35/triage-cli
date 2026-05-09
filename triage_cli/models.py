@@ -157,6 +157,9 @@ class TriageBundle(BaseModel):
     anchor_source: AnchorSource
     window_start: datetime
     window_end: datetime
+    downloaded_attachments: list[AttachmentEvidence] = Field(default_factory=list)
+    local_files: list[LocalFileEvidence] = Field(default_factory=list)
+    pasted_logs: list[PastedEvidence] = Field(default_factory=list)
 
     def as_user_message(self) -> str:
         t = self.ticket
