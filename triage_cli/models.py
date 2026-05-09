@@ -20,6 +20,26 @@ def indent_continuations(s: str) -> str:
     return s.replace("\n", "\n  ")
 
 
+EVIDENCE_HEAD_BYTES = 32_000
+EVIDENCE_TAIL_BYTES = 8_000
+
+
+def truncate_head_tail(text: str, head_bytes: int, tail_bytes: int) -> str:
+    """Keep the first head_bytes and last tail_bytes; insert a marker between.
+
+    Operates on str (utf-8 byte counts via .encode()). Used to bound per-file
+    evidence size in the LLM prompt without losing both the boot-sequence at
+    the top and the failing line near the bottom.
+    """
+    encoded = text.encode("utf-8")
+    if len(encoded) <= head_bytes + tail_bytes:
+        return text
+    truncated_count = len(encoded) - head_bytes - tail_bytes
+    head_part = encoded[:head_bytes].decode("utf-8", errors="replace")
+    tail_part = encoded[-tail_bytes:].decode("utf-8", errors="replace")
+    return f"{head_part}\n\n[truncated {truncated_count} bytes]\n\n{tail_part}"
+
+
 class AnchorSource(StrEnum):
     """Where the anchor timestamp on a TriageBundle came from."""
 

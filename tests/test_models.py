@@ -314,3 +314,39 @@ def test_triage_bundle_evidence_fields_default_empty():
     assert bundle.downloaded_attachments == []
     assert bundle.local_files == []
     assert bundle.pasted_logs == []
+
+
+def test_truncate_head_tail_short_content_unchanged():
+    """Content under the cap is returned verbatim — no marker added."""
+    from triage_cli.models import truncate_head_tail
+
+    text = "small log\n" * 5
+    result = truncate_head_tail(text, head_bytes=1000, tail_bytes=500)
+    assert result == text
+
+
+def test_truncate_head_tail_long_content_keeps_head_and_tail():
+    """Long content keeps head_bytes from the front, tail_bytes from the back,
+    and inserts a [truncated N bytes] marker between them."""
+    from triage_cli.models import truncate_head_tail
+
+    head = "A" * 100
+    middle = "B" * 1000
+    tail = "C" * 50
+    text = head + middle + tail
+
+    result = truncate_head_tail(text, head_bytes=100, tail_bytes=50)
+    assert result.startswith(head)
+    assert result.endswith(tail)
+    assert "[truncated 1000 bytes]" in result
+    assert "B" not in result  # middle is excised entirely
+
+
+def test_truncate_head_tail_exact_cap_no_marker():
+    """At exactly head + tail, no truncation marker is inserted."""
+    from triage_cli.models import truncate_head_tail
+
+    text = "X" * 150
+    result = truncate_head_tail(text, head_bytes=100, tail_bytes=50)
+    assert result == text
+    assert "[truncated" not in result
