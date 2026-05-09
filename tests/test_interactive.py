@@ -164,3 +164,61 @@ def test_download_attachments_no_attachments_returns_empty(
 
     result = download_attachments(ticket, fake_zd, ws)
     assert result == []
+
+
+def test_prompt_drop_and_wait_empty_local_returns_empty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """User types ready; local/ is empty → returns []."""
+    from triage_cli.interactive import ensure_workspace, prompt_drop_and_wait
+
+    ws = ensure_workspace(tmp_path, ticket_id=44496)
+
+    # Simulate one empty-enter from stdin.
+    inputs = iter([""])
+    monkeypatch.setattr("builtins.input", lambda _prompt="": next(inputs))
+
+    result = prompt_drop_and_wait(ws)
+    assert result == []
+
+
+def test_prompt_drop_and_wait_skip_returns_empty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """User types 'skip' → returns []; even if local/ has files, none are ingested."""
+    from triage_cli.interactive import ensure_workspace, prompt_drop_and_wait
+
+    ws = ensure_workspace(tmp_path, ticket_id=44496)
+    (ws.local_dir / "ignored.log").write_text("data", encoding="utf-8")
+
+    inputs = iter(["skip"])
+    monkeypatch.setattr("builtins.input", lambda _prompt="": next(inputs))
+
+    result = prompt_drop_and_wait(ws)
+    assert result == []
+
+
+def test_prompt_drop_and_wait_classifies_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Three files dropped; text/log are ingested with extracted_text, binary is metadata-only."""
+    from triage_cli.interactive import ensure_workspace, prompt_drop_and_wait
+
+    ws = ensure_workspace(tmp_path, ticket_id=44496)
+    (ws.local_dir / "apex.log").write_text("boot ok\n", encoding="utf-8")
+    (ws.local_dir / "notes.txt").write_text("hello\n", encoding="utf-8")
+    (ws.local_dir / "dump.bin").write_bytes(b"\x00\x01\x02\x03")
+
+    inputs = iter([""])  # empty enter → ready
+    monkeypatch.setattr("builtins.input", lambda _prompt="": next(inputs))
+
+    result = prompt_drop_and_wait(ws)
+    by_name = {lf.path.name: lf for lf in result}
+
+    assert "apex.log" in by_name
+    assert by_name["apex.log"].extracted_text == "boot ok\n"
+    assert "notes.txt" in by_name
+    assert by_name["notes.txt"].extracted_text == "hello\n"
+    assert "dump.bin" in by_name
+    assert by_name["dump.bin"].extracted_text is None
+    assert by_name["dump.bin"].detected_type == "unknown"

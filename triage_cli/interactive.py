@@ -16,7 +16,8 @@ from typing import Literal
 
 import typer
 
-from triage_cli.models import AttachmentEvidence, Ticket
+from triage_cli.investigation import _detect_file_type, _read_text_if_supported
+from triage_cli.models import AttachmentEvidence, LocalFileEvidence, Ticket
 
 _MANIFEST_NAME = ".download-manifest.json"
 
@@ -217,4 +218,61 @@ def _flatten_attachments(ticket: Ticket) -> list[AttachmentEvidence]:
     out: list[AttachmentEvidence] = []
     for c in ticket.comments:
         out.extend(c.attachments)
+    return out
+
+
+_SKIP_TOKENS = {"skip", "quit", "q", "abort"}
+
+
+def prompt_drop_and_wait(workspace: Workspace) -> list[LocalFileEvidence]:
+    """Block until user types 'ready' (or empty enter); then scan local/.
+
+    Returns LocalFileEvidence for every file in local/, classified by type.
+    Text/log/json files have extracted_text populated; binaries do not.
+    Empty input or 'ready' → ingest. 'skip'/'quit'/'q'/'abort' → return [].
+    """
+    print(
+        "\nDrop supplemental logs in:\n"
+        f"  {workspace.local_dir}\n"
+        "Suggested types: zipped Apex station logs, Homer/Twilio SIP extracts,\n"
+        "Datadog CSV. Press <enter> when ready (or 'skip' to continue with\n"
+        "no local evidence).",
+        file=sys.stderr,
+    )
+
+    while True:
+        try:
+            response = input("ready> ").strip().lower()
+        except EOFError:
+            response = ""
+        if response in _SKIP_TOKENS:
+            return []
+        if response in ("", "ready"):
+            return _ingest_local(workspace.local_dir)
+        # Unknown token: re-prompt.
+        print("(type 'ready' or press <enter> to ingest; 'skip' to skip)", file=sys.stderr)
+
+
+def _ingest_local(local_dir: Path) -> list[LocalFileEvidence]:
+    """Scan local_dir, classify each file, build LocalFileEvidence list."""
+    if not local_dir.exists():
+        return []
+    out: list[LocalFileEvidence] = []
+    for path in sorted(local_dir.iterdir()):
+        if not path.is_file():
+            continue
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        detected = _detect_file_type(path)
+        text = _read_text_if_supported(path, detected)
+        out.append(
+            LocalFileEvidence(
+                path=path,
+                size_bytes=stat.st_size,
+                detected_type=detected,
+                extracted_text=text,
+            ),
+        )
     return out
