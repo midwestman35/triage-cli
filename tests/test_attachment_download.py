@@ -114,3 +114,41 @@ def test_download_attachment_midstream_abort_unlinks_partial(
     assert not dest.exists()
     # .partial should have been unlinked too.
     assert not (tmp_path / "log.bin.partial").exists()
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_download_attachment_auth_failure_raises(
+    status: int, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """401/403 raise — auth boundary; the whole investigate run should abort."""
+    def fake_stream(self: httpx.Client, method: str, url: str, **_kw: Any):  # noqa: ARG001
+        class _StreamCtx:
+            def __enter__(_inner) -> httpx.Response:
+                return httpx.Response(status, content=b"")
+            def __exit__(_inner, *args: Any) -> None:
+                return None
+        return _StreamCtx()
+
+    monkeypatch.setattr(httpx.Client, "stream", fake_stream)
+
+    with _client() as zd, pytest.raises(RuntimeError, match="auth failed"):
+        zd.download_attachment("https://x/y", tmp_path / "x", max_bytes=10_000)
+
+
+def test_download_attachment_404_raises_specific_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """404 raises a RuntimeError with a specific 'not found' message so the
+    interactive layer can recognize it and skip-and-continue."""
+    def fake_stream(self: httpx.Client, method: str, url: str, **_kw: Any):  # noqa: ARG001
+        class _StreamCtx:
+            def __enter__(_inner) -> httpx.Response:
+                return httpx.Response(404, content=b"")
+            def __exit__(_inner, *args: Any) -> None:
+                return None
+        return _StreamCtx()
+
+    monkeypatch.setattr(httpx.Client, "stream", fake_stream)
+
+    with _client() as zd, pytest.raises(RuntimeError, match="not found"):
+        zd.download_attachment("https://x/y", tmp_path / "x", max_bytes=10_000)
