@@ -229,7 +229,10 @@ class InboxApp(App):
         if self._shutdown_event.is_set():
             return state
 
-        sites = extract.load_site_map(Path("data/cnc-map.json"))
+        try:
+            sites = extract.load_site_map(self.opts.site_map_path)
+        except FileNotFoundError as e:
+            raise RuntimeError(str(e)) from e
 
         stderr_buffer = io.StringIO()
         with contextlib.redirect_stderr(stderr_buffer), ZendeskClient.from_env() as zd:
@@ -401,7 +404,7 @@ class InboxApp(App):
         self.call_from_thread(self._set_phase, ticket_id, "Fetching ticket", 1)
 
         try:
-            sites = extract.load_site_map(Path("data/cnc-map.json"))
+            sites = extract.load_site_map(self.opts.site_map_path)
         except (FileNotFoundError, ValueError) as e:
             self._on_failure(ticket_id, f"Site map error: {e}")
             return
