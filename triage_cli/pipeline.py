@@ -94,12 +94,16 @@ def triage_one(
     at: datetime | None,
     verbose: bool,
     show_spinner: bool,
+    downloaded_attachments: list | None = None,
+    local_files: list | None = None,
+    pasted_logs: list | None = None,
 ) -> TriageReport:
     """Run the triage pipeline for a fetched ticket and resolved site.
 
     Returns a `TriageReport` (LLM output + pipeline-derived metadata).
     Raises RuntimeError on Datadog or Claude failure.
     Raises ValueError on validation failure (e.g. invalid window).
+    Optional evidence kwargs default to empty lists.
     """
     # Anchor: best-effort LLM extraction unless --at was supplied.
     extracted_dt: datetime | None = None
@@ -136,6 +140,9 @@ def triage_one(
         anchor_source=anchor_source,
         window_start=start,
         window_end=end,
+        downloaded_attachments=downloaded_attachments or [],
+        local_files=local_files or [],
+        pasted_logs=pasted_logs or [],
     )
 
     with spinner("Generating triage note", show=show_spinner):

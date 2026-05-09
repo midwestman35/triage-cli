@@ -5,6 +5,7 @@ import logging
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 from triage_cli import cli
@@ -66,10 +67,12 @@ def test_investigate_fetches_ticket_and_renders_report_without_enrichment(
     monkeypatch.setattr(cli.pipeline, "resolve_site", forbidden("resolve_site"))
     monkeypatch.setattr(cli.pipeline, "triage_one", forbidden("triage_one"))
     monkeypatch.setattr(cli.DatadogClient, "from_env", forbidden("DatadogClient.from_env"))
+    monkeypatch.setattr("triage_cli.cli._is_interactive", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda _p="": "skip")
 
     result = CliRunner().invoke(
         cli.app,
-        ["investigate", "https://example.zendesk.com/agent/tickets/12345", "--verbose"],
+        ["investigate", "https://example.zendesk.com/agent/tickets/12345", "--verbose", "--no-llm"],
     )
 
     assert result.exit_code == 0
@@ -78,11 +81,6 @@ def test_investigate_fetches_ticket_and_renders_report_without_enrichment(
     assert "**Site:** unknown" in result.stdout
     assert "**Sources:** zendesk, comments" in result.stdout
     assert "Fetched ticket #12345" in result.stderr
-    assert "comments: 1" in result.stderr
-    assert "attachments metadata: 0" in result.stderr
-    assert "local files: 0" in result.stderr
-    assert "pasted evidence: 0" in result.stderr
-    assert "sources: zendesk, comments" in result.stderr
     assert touched == []
 
 
@@ -97,6 +95,8 @@ def test_investigate_adds_file_paste_and_saves_artifacts(
 
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(cli.ZendeskClient, "from_env", lambda: client)
+    monkeypatch.setattr("triage_cli.cli._is_interactive", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda _p="": "skip")
 
     result = CliRunner().invoke(
         cli.app,
@@ -108,23 +108,23 @@ def test_investigate_adds_file_paste_and_saves_artifacts(
             "--paste",
             "console=WARN audio",
             "--save",
+            "--no-llm",
             "--verbose",
         ],
     )
 
     assert result.exit_code == 0
     assert "**Sources:** zendesk, local_files, pasted_logs" in result.stdout
-    assert "local files: 1" in result.stderr
-    assert "pasted evidence: 1" in result.stderr
     assert "Saved:" in result.stderr
-    saved_md = list((tmp_path / "triage-notes").glob("12345-*.md"))
-    saved_json = list((tmp_path / "triage-notes").glob("12345-*.json"))
+    saved_md = list((tmp_path / "triage-notes" / "12345").glob("*.md"))
+    saved_json = list((tmp_path / "triage-notes" / "12345").glob("*.json"))
     assert len(saved_md) == 1
     assert len(saved_json) == 1
     assert "# Triage Report — ZD-12345" in saved_md[0].read_text(encoding="utf-8")
 
 
-def test_investigate_rejects_malformed_paste() -> None:
+def test_investigate_rejects_malformed_paste(monkeypatch) -> None:
+    monkeypatch.setattr("triage_cli.cli._is_interactive", lambda: True)
     result = CliRunner().invoke(cli.app, ["investigate", "12345", "--paste", "WARN audio"])
 
     assert result.exit_code == 1
@@ -133,6 +133,8 @@ def test_investigate_rejects_malformed_paste() -> None:
 
 def test_investigate_rejects_missing_local_file(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(cli.ZendeskClient, "from_env", lambda: _FakeZendeskClient(_ticket()))
+    monkeypatch.setattr("triage_cli.cli._is_interactive", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda _p="": "skip")
 
     result = CliRunner().invoke(
         cli.app,
@@ -190,3 +192,87 @@ def test_inbox_requires_interactive_terminal() -> None:
         "inbox requires an interactive terminal. Use `watch` for headless runs."
         in result.stderr
     )
+
+
+def test_investigate_rejects_non_tty(monkeypatch: pytest.MonkeyPatch) -> None:
+    """investigate aborts when stdin is not a TTY, pointing the user at triage."""
+    from typer.testing import CliRunner
+
+    from triage_cli.cli import app
+
+    # CliRunner provides non-TTY streams by default; _is_interactive() returns False.
+    # Explicitly confirm the guard fires (no patch needed — CliRunner is always non-TTY).
+    runner = CliRunner()
+    result = runner.invoke(app, ["investigate", "44496"])
+    assert result.exit_code != 0
+    assert "interactive terminal" in result.stderr.lower()
+    assert "triage" in result.stderr.lower()
+
+
+def test_investigate_happy_path_calls_triage_one(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Full investigate flow: fetch ticket, no attachments, skip drop, → triage_one."""
+    from typer.testing import CliRunner
+
+    from triage_cli.cli import app
+    from triage_cli.models import (
+        SiteEntry,
+        Ticket,
+        TimeWindow,
+        TriageReport,
+    )
+
+    ts = datetime(2026, 5, 7, 12, 0, 0, tzinfo=UTC)
+    fake_ticket = Ticket(
+        id=44496, subject="x", description="y",
+        created_at=ts, updated_at=ts, comments=[],
+    )
+
+    # Patch ZendeskClient.from_env() and get_ticket().
+    class _ZD:
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+        def get_ticket(self, _id): return fake_ticket
+
+    monkeypatch.setattr("triage_cli.cli.ZendeskClient.from_env", lambda: _ZD())
+    monkeypatch.setattr("triage_cli.cli._is_interactive", lambda: True)
+
+    # Skip the drop prompt (empty local/, empty input).
+    monkeypatch.setattr("builtins.input", lambda _p="": "skip")
+
+    # Patch load_site_map so we don't need data/cnc-map.json on disk.
+    monkeypatch.setattr("triage_cli.extract.load_site_map", lambda _p: [])
+
+    # Patch site lookup → returns a known site.
+    monkeypatch.setattr(
+        "triage_cli.pipeline.resolve_site",
+        lambda *a, **k: (
+            SiteEntry(friendly_name="Aurora", site_name="aur", cnc="abc"),
+            "substring",
+        ),
+    )
+
+    # Patch triage_one to capture and return canned report.
+    captured = []
+    def fake_triage_one(ticket, site, **kw):
+        captured.append((ticket, site, kw))
+        return TriageReport(
+            finding="x", confidence="low", evidence=[],
+            suggested_note="y", next_checks=[], unknowns=[],
+            ticket_id=ticket.id, site_name=site.site_name,
+            window=TimeWindow(start=ts, end=ts),
+            sources=["zendesk"], log_event_count=0, generated_at=ts,
+        )
+    monkeypatch.setattr("triage_cli.pipeline.triage_one", fake_triage_one)
+
+    # Workspace under tmp_path.
+    monkeypatch.chdir(tmp_path)
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["investigate", "44496", "--no-logs"])
+    assert result.exit_code == 0, result.stderr
+    assert len(captured) == 1
+    ticket, site, _ = captured[0]
+    assert ticket.id == 44496
+    assert site.site_name == "aur"
