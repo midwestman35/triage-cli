@@ -77,3 +77,40 @@ def test_download_attachment_preflight_rejects_oversize(
 
     assert not dest.exists()
     assert not dest.with_suffix(".bin.partial").exists()
+
+
+def test_download_attachment_midstream_abort_unlinks_partial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the stream exceeds max_bytes during read, abort and unlink partial."""
+    from triage_cli.zendesk import AttachmentTooLargeError
+
+    # 20 KB body sent as a chunked generator so Content-Length is absent.
+    # Pre-flight skips (no Content-Length header); mid-stream check catches the overrun.
+    payload = b"X" * 20_000
+
+    def fake_stream(self: httpx.Client, method: str, url: str, **_kw: Any):  # noqa: ARG001
+        class _StreamCtx:
+            def __enter__(_inner) -> httpx.Response:
+                # Use chunked transfer (no Content-Length).
+                def gen():
+                    yield payload[:10_000]
+                    yield payload[10_000:]
+                resp = httpx.Response(200, content=gen())
+                # Strip Content-Length so the pre-flight skips and mid-stream catches.
+                if "content-length" in resp.headers:
+                    del resp.headers["content-length"]
+                return resp
+            def __exit__(_inner, *args: Any) -> None:
+                return None
+        return _StreamCtx()
+
+    monkeypatch.setattr(httpx.Client, "stream", fake_stream)
+
+    dest = tmp_path / "log.bin"
+    with _client() as zd, pytest.raises(AttachmentTooLargeError):
+        zd.download_attachment("https://x/y", dest, max_bytes=5_000)
+
+    assert not dest.exists()
+    # .partial should have been unlinked too.
+    assert not (tmp_path / "log.bin.partial").exists()
