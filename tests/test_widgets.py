@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-from triage_cli.inbox.widgets import _CONFIDENCE_STYLE, _relative_time
+from triage_cli.inbox.widgets import _CONFIDENCE_STYLE, _ROW_STYLE, _relative_time
 
 
 def _now() -> datetime:
@@ -46,3 +46,19 @@ def test_confidence_style_low() -> None:
 
 def test_confidence_style_unknown_falls_through() -> None:
     assert _CONFIDENCE_STYLE.get("unexpected", "unexpected") == "unexpected"
+
+
+def test_row_style_failed_is_dark_red() -> None:
+    assert _ROW_STYLE["failed"] == "on dark_red"
+
+
+def test_row_style_triaging_is_dark_goldenrod() -> None:
+    assert _ROW_STYLE["triaging"] == "on dark_goldenrod"
+
+
+def test_row_style_triaged_is_none() -> None:
+    assert _ROW_STYLE["triaged"] is None
+
+
+def test_row_style_queued_is_none() -> None:
+    assert _ROW_STYLE["queued"] is None

@@ -39,6 +39,13 @@ _CONFIDENCE_STYLE: dict[str, str] = {
     "low":    "[red]low[/]",
 }
 
+_ROW_STYLE: dict[Status, str | None] = {
+    "failed":   "on dark_red",
+    "triaging": "on dark_goldenrod",
+    "triaged":  None,
+    "queued":   None,
+}
+
 _SELECTED_ICON = "◉"
 
 
@@ -133,9 +140,17 @@ class TicketListWidget(DataTable):
                 if report is not None
                 else row.failure_reason or _STATUS_LABELS[row.status]
             )
+            style = _ROW_STYLE[row.status]
+            if style:
+                icon, ticket_col, site, when, confidence, summary = (
+                    f"[{style}]{v}[/]"
+                    for v in (icon, f"#{row.ticket_id}", site, when, confidence, summary)
+                )
+            else:
+                ticket_col = f"#{row.ticket_id}"
             self.add_row(
                 icon,
-                f"#{row.ticket_id}",
+                ticket_col,
                 site,
                 when,
                 confidence,
