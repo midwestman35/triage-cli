@@ -276,3 +276,67 @@ def test_investigate_happy_path_calls_triage_one(
     ticket, site, _ = captured[0]
     assert ticket.id == 44496
     assert site.site_name == "aur"
+
+
+def test_investigate_datadog_error_then_pipeline_failure_dies_cleanly(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """If Datadog fails and the no-logs retry also fails, exit cleanly via _die.
+
+    Regression: the retry call inside the DatadogError handler must be wrapped
+    in its own try/except (RuntimeError, ValueError); otherwise pipeline
+    failures during the no-logs retry leak as a traceback.
+    """
+    from typer.testing import CliRunner
+
+    from triage_cli.cli import app
+    from triage_cli.datadog import DatadogError
+    from triage_cli.models import SiteEntry, Ticket
+
+    ts = datetime(2026, 5, 7, 12, 0, 0, tzinfo=UTC)
+    fake_ticket = Ticket(
+        id=44496, subject="x", description="y",
+        created_at=ts, updated_at=ts, comments=[],
+    )
+
+    class _ZD:
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+        def get_ticket(self, _id): return fake_ticket
+
+    monkeypatch.setattr("triage_cli.cli.ZendeskClient.from_env", lambda: _ZD())
+    monkeypatch.setattr("triage_cli.cli._is_interactive", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda _p="": "skip")
+    monkeypatch.setattr("typer.confirm", lambda *a, **k: True)  # accept fallback
+    monkeypatch.setattr(
+        "triage_cli.extract.load_site_map", lambda _p: [],
+    )
+    monkeypatch.setattr(
+        "triage_cli.pipeline.resolve_site",
+        lambda *a, **k: (
+            SiteEntry(friendly_name="Aurora", site_name="aur", cnc="abc"),
+            "substring",
+        ),
+    )
+
+    # First call raises DatadogError; second call (the retry) raises RuntimeError.
+    call_count = {"n": 0}
+    def fake_triage_one(*a, **k):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            raise DatadogError("simulated Datadog outage")
+        raise RuntimeError("simulated LLM failure on retry")
+    monkeypatch.setattr("triage_cli.pipeline.triage_one", fake_triage_one)
+
+    monkeypatch.chdir(tmp_path)
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["investigate", "44496"])
+
+    # Should exit cleanly (non-zero) with the LLM failure message in stderr,
+    # NOT propagate as a traceback.
+    assert result.exit_code != 0
+    assert "simulated LLM failure on retry" in result.stderr
+    # The exception did not escape: there should be no Python traceback in stderr.
+    assert "Traceback" not in result.stderr
+    assert call_count["n"] == 2  # both calls were attempted

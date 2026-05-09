@@ -320,7 +320,10 @@ def investigate(
             typer.echo(f"Datadog error: {e}", err=True)
             if not typer.confirm("Continue without Datadog logs?", default=False):
                 _die("Aborted")
-            report = _run_pipeline(use_dd=False)
+            try:
+                report = _run_pipeline(use_dd=False)
+            except (RuntimeError, ValueError) as e2:
+                _die(str(e2))
         except (RuntimeError, ValueError) as e:
             _die(str(e))
 
