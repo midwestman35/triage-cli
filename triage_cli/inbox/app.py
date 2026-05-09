@@ -137,7 +137,7 @@ class InboxApp(App):
     async def on_mount(self) -> None:
         self._hydrate_recent_reports()
         self._refresh_list()
-        self.query_one("#detail", ReportPaneWidget).show(None)
+        self.query_one("#detail", ReportPaneWidget).show_placeholder()
         self.query_one("#list", TicketListWidget).focus()
         if self.poll_on_mount:
             self.set_interval(self.opts.interval, self._poll_tick)
@@ -482,13 +482,16 @@ class InboxApp(App):
         entry = self._rows.get(ticket_id)
         detail = self.query_one("#detail", ReportPaneWidget)
         if entry is None:
-            detail.show(None)
+            detail.show_placeholder()
         elif entry.status == "queued":
-            detail.show(None, placeholder="[dim]○ In queue — press [bold]Enter[/] to triage now[/]")
+            detail.show_placeholder("[dim]○ In queue — press [bold]Enter[/] to triage now[/]")
         elif entry.status == "triaging":
-            detail.show(None, placeholder="[dim]→ Triaging in progress…[/]")
+            detail.show_progress(
+                getattr(entry, "phase_label", None) or "Triaging…",
+                getattr(entry, "phase_step", 0),
+            )
         elif entry.status == "failed":
             reason = entry.failure_reason or "Unknown error"
-            detail.show(None, placeholder=f"[red]✗ Triage failed:[/red]\n\n{reason}")
+            detail.show_placeholder(f"[red]✗ Triage failed:[/red]\n\n{reason}")
         else:
-            detail.show(entry.report)
+            detail.show_report(entry.report)

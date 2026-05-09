@@ -5,7 +5,10 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Literal
 
-from textual.widgets import DataTable, Static
+from textual.app import ComposeResult
+from textual.containers import Vertical
+from textual.widget import Widget
+from textual.widgets import DataTable, Label, ProgressBar, Static
 
 from triage_cli.models import TriageReport
 from triage_cli.render import rich_layout
@@ -164,21 +167,48 @@ class TicketListWidget(DataTable):
             self.move_cursor(row=selected_row)
 
 
-class ReportPaneWidget(Static):
-    """Inbox right pane: renders the selected TriageReport via Rich layout."""
+class ReportPaneWidget(Widget):
+    """Inbox right pane: report view or triage progress bar."""
 
     can_focus = True
 
     DEFAULT_CSS = """
     ReportPaneWidget { padding: 1 2; overflow-y: auto; }
+    #progress-region { align: center middle; height: 1fr; }
+    #phase-label { margin-bottom: 1; }
     """
 
     current_report: TriageReport | None = None
 
-    def show(self, report: TriageReport | None, *, placeholder: str | None = None) -> None:
-        self.current_report = report
-        if report is None:
-            self.update(placeholder or "[dim]Select a ticket to view its report.[/]")
-            return
+    def compose(self) -> ComposeResult:
+        yield Static(
+            "[dim]Select a ticket to view its report.[/]",
+            id="report-body",
+        )
+        with Vertical(id="progress-region"):
+            yield Label("", id="phase-label")
+            yield ProgressBar(total=4, show_eta=False, id="phase-bar")
 
-        self.update(rich_layout(report))
+    def on_mount(self) -> None:
+        self.query_one("#progress-region").display = False
+
+    def show_report(self, report: TriageReport) -> None:
+        self.current_report = report
+        self.query_one("#progress-region").display = False
+        body = self.query_one("#report-body", Static)
+        body.display = True
+        body.update(rich_layout(report))
+
+    def show_progress(self, label: str, step: int, total: int = 4) -> None:
+        self.current_report = None
+        self.query_one("#report-body", Static).display = False
+        self.query_one("#progress-region").display = True
+        self.query_one("#phase-label", Label).update(label)
+        self.query_one("#phase-bar", ProgressBar).update(progress=step)
+
+    def show_placeholder(self, text: str | None = None) -> None:
+        self.current_report = None
+        self.query_one("#progress-region").display = False
+        body = self.query_one("#report-body", Static)
+        body.display = True
+        body.update(text or "[dim]Select a ticket to view its report.[/]")

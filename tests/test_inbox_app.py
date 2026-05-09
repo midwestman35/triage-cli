@@ -12,6 +12,7 @@ from triage_cli.inbox.app import InboxApp
 from triage_cli.inbox.widgets import ReportPaneWidget, TicketListWidget
 from triage_cli.models import TimeWindow, TriageReport
 from triage_cli.watcher import WatcherOptions
+from textual.widgets import Static
 
 
 def _opts(tmp_path: Path) -> WatcherOptions:
@@ -77,7 +78,8 @@ def test_inbox_app_empty_state_subtitle_and_detail_copy(tmp_path: Path) -> None:
 
             detail = app.query_one("#detail", ReportPaneWidget)
             assert detail.current_report is None
-            assert str(detail.render()) == "Select a ticket to view its report."
+            report_body = detail.query_one("#report-body", Static)
+            assert "Select a ticket" in str(report_body.content)
 
     asyncio.run(run())
 
