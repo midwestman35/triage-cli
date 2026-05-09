@@ -40,38 +40,38 @@ def truncate_head_tail(text: str, head_bytes: int, tail_bytes: int) -> str:
     return f"{head_part}\n\n[truncated {truncated_count} bytes]\n\n{tail_part}"
 
 
-def _render_attachment(a: "AttachmentEvidence") -> list[str]:
+def _render_attachment(a: AttachmentEvidence) -> list[str]:
     size = f"{a.size_bytes} bytes" if a.size_bytes is not None else "unknown size"
     ctype = a.content_type or "unknown type"
     out = [f"- {a.filename} ({ctype}, {size})"]
     if a.extracted_text:
         truncated = truncate_head_tail(
             a.extracted_text, EVIDENCE_HEAD_BYTES, EVIDENCE_TAIL_BYTES,
-        )
+        ).rstrip("\n")
         out.append(indent_continuations(f"  {truncated}"))
     else:
         out.append("  (binary, not extracted)")
     return out
 
 
-def _render_local_file(lf: "LocalFileEvidence") -> list[str]:
+def _render_local_file(lf: LocalFileEvidence) -> list[str]:
     size = f"{lf.size_bytes} bytes" if lf.size_bytes is not None else "unknown size"
     dtype = lf.detected_type or "unknown"
     out = [f"- {lf.path.name} ({dtype}, {size})"]
     if lf.extracted_text:
         truncated = truncate_head_tail(
             lf.extracted_text, EVIDENCE_HEAD_BYTES, EVIDENCE_TAIL_BYTES,
-        )
+        ).rstrip("\n")
         out.append(indent_continuations(f"  {truncated}"))
     else:
         out.append("  (binary, not extracted)")
     return out
 
 
-def _render_pasted(p: "PastedEvidence") -> list[str]:
+def _render_pasted(p: PastedEvidence) -> list[str]:
     truncated = truncate_head_tail(
         p.text, EVIDENCE_HEAD_BYTES, EVIDENCE_TAIL_BYTES,
-    )
+    ).rstrip("\n")
     return [f"- {p.label}", indent_continuations(f"  {truncated}")]
 
 

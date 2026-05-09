@@ -478,3 +478,28 @@ def test_as_user_message_truncates_oversized_text():
     bundle = _bundle_with(local=local)
     out = bundle.as_user_message()
     assert "[truncated 5000 bytes]" in out
+
+
+def test_as_user_message_no_trailing_whitespace_only_lines():
+    """Evidence text ending in \\n must not produce whitespace-only lines.
+
+    Regression: indent_continuations replaces every \\n (including a trailing
+    one) with \\n  , which after join produces lines containing only two
+    spaces. The render helpers must strip trailing newlines before indenting.
+    """
+    local = [
+        LocalFileEvidence(
+            path=Path("/tmp/apex.log"),
+            size_bytes=20,
+            detected_type="log",
+            extracted_text="boot ok\nerror at 3am\n",  # trailing \n
+        ),
+    ]
+    pasted = [PastedEvidence(label="SIP", text="INVITE sip:foo\n")]
+    bundle = _bundle_with(local=local, pasted=pasted)
+    out = bundle.as_user_message()
+
+    # No line should consist only of whitespace.
+    for line in out.split("\n"):
+        if line:  # non-empty lines must have non-whitespace content
+            assert line.strip(), f"whitespace-only line found: {line!r}"
