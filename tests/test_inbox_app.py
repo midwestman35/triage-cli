@@ -360,6 +360,7 @@ def test_run_iteration_blocking_uses_watcher_dependencies(
                 ),
             },
         )
+        on_view_listed([])  # must call so _run_iteration_blocking doesn't raise
         return {"version": 1, "triaged": {"123": "timestamp"}}
 
     def prune_state(state):
@@ -414,9 +415,12 @@ def test_run_iteration_blocking_keeps_stable_backfill_cutoff(
         _opts,
         backfill_cutoff,
         dd_client=None,
+        *,
+        on_view_listed,
         **_callbacks,
     ):
         cutoffs.append(backfill_cutoff)
+        on_view_listed([])  # must call so _run_iteration_blocking doesn't raise
         return {"version": 1, "triaged": {}}
 
     monkeypatch.setattr(app_module.extract, "load_site_map", lambda _path: [])
@@ -456,8 +460,9 @@ def test_run_iteration_blocking_routes_watcher_stderr_to_log(
         def __exit__(self, *_exc: object) -> None:
             return None
 
-    def run_iteration(*_args, **_kwargs):
+    def run_iteration(*_args, on_view_listed, **_kwargs):
         print("watcher status line", file=sys.stderr)
+        on_view_listed([])  # must call so _run_iteration_blocking doesn't raise
         return {"version": 1, "triaged": {}}
 
     monkeypatch.setattr(app_module.extract, "load_site_map", lambda _path: [])
