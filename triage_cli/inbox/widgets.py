@@ -33,6 +33,12 @@ _STATUS_LABELS: dict[Status, str] = {
     "failed": "failed",
 }
 
+_CONFIDENCE_STYLE: dict[str, str] = {
+    "high":   "[bold green]high[/]",
+    "medium": "[yellow]med[/]",
+    "low":    "[red]low[/]",
+}
+
 _SELECTED_ICON = "◉"
 
 
@@ -117,7 +123,11 @@ class TicketListWidget(DataTable):
             icon = f"{_SELECTED_ICON} {status_icon}" if is_selected else f"  {status_icon}"
             site = report.site_name if report is not None else row.site_hint or "—"
             when = _relative_time(report.generated_at) if report is not None else "—"
-            confidence = report.confidence if report is not None else "—"
+            confidence = (
+                _CONFIDENCE_STYLE.get(report.confidence, report.confidence)
+                if report is not None
+                else "—"
+            )
             summary = (
                 report.finding[:60]
                 if report is not None

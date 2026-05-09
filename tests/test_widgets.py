@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-from triage_cli.inbox.widgets import _relative_time
+from triage_cli.inbox.widgets import _CONFIDENCE_STYLE, _relative_time
 
 
 def _now() -> datetime:
@@ -30,3 +30,19 @@ def test_relative_time_hours() -> None:
 
 def test_relative_time_days() -> None:
     assert _relative_time(_now() - timedelta(days=2), now=_now()) == "2d ago"
+
+
+def test_confidence_style_high() -> None:
+    assert _CONFIDENCE_STYLE["high"] == "[bold green]high[/]"
+
+
+def test_confidence_style_medium() -> None:
+    assert _CONFIDENCE_STYLE["medium"] == "[yellow]med[/]"
+
+
+def test_confidence_style_low() -> None:
+    assert _CONFIDENCE_STYLE["low"] == "[red]low[/]"
+
+
+def test_confidence_style_unknown_falls_through() -> None:
+    assert _CONFIDENCE_STYLE.get("unexpected", "unexpected") == "unexpected"
