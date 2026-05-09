@@ -53,6 +53,8 @@ _SELECTED_ICON = "◉"
 
 
 def _relative_time(dt: datetime, *, now: datetime | None = None) -> str:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
     _now = now or datetime.now(UTC)
     minutes = int((_now - dt).total_seconds() / 60)
     if minutes < 2:
@@ -201,7 +203,7 @@ class ReportPaneWidget(Widget):
         body.display = True
         body.update(rich_layout(report))
 
-    def show_progress(self, label: str, step: int, total: int = 4) -> None:
+    def show_progress(self, label: str, step: int) -> None:
         self.current_report = None
         self.query_one("#report-body", Static).display = False
         self.query_one("#progress-region").display = True

@@ -62,3 +62,9 @@ def test_row_style_triaged_is_none() -> None:
 
 def test_row_style_queued_is_none() -> None:
     assert _ROW_STYLE["queued"] is None
+
+
+def test_relative_time_naive_datetime_treated_as_utc() -> None:
+    now = datetime(2026, 5, 9, 12, 0, 0, tzinfo=UTC)
+    naive_dt = datetime(2026, 5, 9, 11, 50, 0)  # no tzinfo, 10 minutes before now
+    assert _relative_time(naive_dt, now=now) == "10m ago"
