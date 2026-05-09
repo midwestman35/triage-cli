@@ -50,3 +50,30 @@ def test_download_attachment_happy_path(
     assert bytes_written == 4500
     assert sha == expected_sha
     assert dest.read_bytes() == payload
+
+
+def test_download_attachment_preflight_rejects_oversize(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When Content-Length > cap, raise without writing to disk."""
+    from triage_cli.zendesk import AttachmentTooLargeError
+
+    def fake_stream(self: httpx.Client, method: str, url: str, **_kw: Any):  # noqa: ARG001
+        class _StreamCtx:
+            def __enter__(_inner) -> httpx.Response:
+                # 200 MB Content-Length, but body is empty (we should never read it).
+                return httpx.Response(
+                    200, content=b"", headers={"Content-Length": "200000000"},
+                )
+            def __exit__(_inner, *args: Any) -> None:
+                return None
+        return _StreamCtx()
+
+    monkeypatch.setattr(httpx.Client, "stream", fake_stream)
+
+    dest = tmp_path / "huge.bin"
+    with _client() as zd, pytest.raises(AttachmentTooLargeError):
+        zd.download_attachment("https://x/y", dest, max_bytes=10_000)
+
+    assert not dest.exists()
+    assert not dest.with_suffix(".bin.partial").exists()
