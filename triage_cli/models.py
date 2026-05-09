@@ -35,8 +35,8 @@ def truncate_head_tail(text: str, head_bytes: int, tail_bytes: int) -> str:
     if len(encoded) <= head_bytes + tail_bytes:
         return text
     truncated_count = len(encoded) - head_bytes - tail_bytes
-    head_part = encoded[:head_bytes].decode("utf-8", errors="replace")
-    tail_part = encoded[-tail_bytes:].decode("utf-8", errors="replace")
+    head_part = encoded[:head_bytes].decode("utf-8", errors="replace") if head_bytes > 0 else ""
+    tail_part = encoded[-tail_bytes:].decode("utf-8", errors="replace") if tail_bytes > 0 else ""
     return f"{head_part}\n\n[truncated {truncated_count} bytes]\n\n{tail_part}"
 
 

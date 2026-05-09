@@ -350,3 +350,33 @@ def test_truncate_head_tail_exact_cap_no_marker():
     result = truncate_head_tail(text, head_bytes=100, tail_bytes=50)
     assert result == text
     assert "[truncated" not in result
+
+
+def test_truncate_head_tail_zero_tail_does_not_duplicate():
+    """tail_bytes=0 must produce empty tail, not the full encoded string.
+
+    Regression: encoded[-0:] in Python is the entire slice, not empty. The
+    function must guard against this so callers that ask for head-only get
+    head-only.
+    """
+    from triage_cli.models import truncate_head_tail
+
+    text = "A" * 100 + "B" * 100  # 200 bytes
+    result = truncate_head_tail(text, head_bytes=50, tail_bytes=0)
+    # head: 50 A's; truncated marker; empty tail
+    assert result.startswith("A" * 50)
+    assert "[truncated 150 bytes]" in result
+    assert "B" not in result
+    # And the tail position is empty (not 200 bytes of duplicate text).
+    assert not result.endswith("A" * 100)
+
+
+def test_truncate_head_tail_zero_head_returns_only_tail():
+    """head_bytes=0 produces only the tail portion."""
+    from triage_cli.models import truncate_head_tail
+
+    text = "A" * 100 + "B" * 100
+    result = truncate_head_tail(text, head_bytes=0, tail_bytes=50)
+    assert result.endswith("B" * 50)
+    assert "[truncated 150 bytes]" in result
+    assert "A" not in result
