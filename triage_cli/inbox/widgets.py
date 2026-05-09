@@ -36,6 +36,19 @@ _STATUS_LABELS: dict[Status, str] = {
 _SELECTED_ICON = "◉"
 
 
+def _relative_time(dt: datetime, *, now: datetime | None = None) -> str:
+    _now = now or datetime.now(UTC)
+    minutes = int((_now - dt).total_seconds() / 60)
+    if minutes < 2:
+        return "just now"
+    if minutes < 60:
+        return f"{minutes}m ago"
+    hours = minutes // 60
+    if hours < 24:
+        return f"{hours}h ago"
+    return f"{(_now - dt).days}d ago"
+
+
 @dataclass
 class RowEntry:
     """In-memory state for one ticket in the inbox list."""
@@ -103,7 +116,7 @@ class TicketListWidget(DataTable):
             status_icon = _STATUS_ICONS[row.status]
             icon = f"{_SELECTED_ICON} {status_icon}" if is_selected else f"  {status_icon}"
             site = report.site_name if report is not None else row.site_hint or "—"
-            when = report.generated_at.strftime("%H:%M") if report is not None else "—"
+            when = _relative_time(report.generated_at) if report is not None else "—"
             confidence = report.confidence if report is not None else "—"
             summary = (
                 report.finding[:60]
