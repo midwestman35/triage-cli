@@ -258,3 +258,30 @@ def test_local_file_evidence_path_is_intentionally_path():
     assert isinstance(evidence.path, Path)
     assert restored.path == path
     assert isinstance(restored.path, Path)
+
+
+def test_attachment_evidence_accepts_content_url():
+    """content_url is optional; when set it round-trips through Pydantic."""
+    a = AttachmentEvidence(
+        filename="log.txt",
+        content_type="text/plain",
+        size_bytes=1024,
+        content_url="https://example.zendesk.com/attachments/token/abc/log.txt",
+    )
+    assert a.content_url == "https://example.zendesk.com/attachments/token/abc/log.txt"
+
+
+def test_attachment_evidence_content_url_defaults_none():
+    """Existing call sites that omit content_url keep working."""
+    a = AttachmentEvidence(filename="log.txt")
+    assert a.content_url is None
+
+
+def test_attachment_evidence_excludes_content_url_when_dumped_with_exclude():
+    """Render layer can scrub the URL before persisting JSON to disk."""
+    a = AttachmentEvidence(
+        filename="log.txt",
+        content_url="https://example.zendesk.com/attachments/token/abc/log.txt",
+    )
+    dumped = a.model_dump(exclude={"content_url"})
+    assert "content_url" not in dumped

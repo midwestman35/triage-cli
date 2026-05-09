@@ -37,6 +37,7 @@ class AttachmentEvidence(BaseModel):
     source: Literal["zendesk_attachment"] = "zendesk_attachment"
     local_path: Path | None = None
     extracted_text: str | None = None
+    content_url: str | None = None
 
 
 class Comment(BaseModel):
