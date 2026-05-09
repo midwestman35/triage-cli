@@ -14,6 +14,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
+import typer
+
+from triage_cli.models import AttachmentEvidence, Ticket
+
 _MANIFEST_NAME = ".download-manifest.json"
 
 
@@ -121,3 +125,96 @@ def resolve_destination(
         return DownloadDecision(action="skip", path=target)
 
     return DownloadDecision(action="download", path=target)
+
+
+def confirm_download(ticket: Ticket) -> bool:
+    """Prompt the user once for all-or-nothing attachment download.
+
+    Side-effects: prints attachment list to stderr; reads y/n from stdin.
+    Returns True on yes (default Y), False on no.
+    """
+    attachments = _flatten_attachments(ticket)
+    if not attachments:
+        return False
+
+    print(
+        f"Found {len(attachments)} attachment(s) on ticket #{ticket.id}:",
+        file=sys.stderr,
+    )
+    for a in attachments:
+        size = f"{a.size_bytes} bytes" if a.size_bytes is not None else "unknown size"
+        ctype = a.content_type or "unknown"
+        print(f"  - {a.filename} ({ctype}, {size})", file=sys.stderr)
+    return typer.confirm("Download all to workspace?", default=True)
+
+
+def download_attachments(
+    ticket: Ticket,
+    zd_client: object,  # protocol: download_attachment(url, dest, *, max_bytes)
+    workspace: Workspace,
+    *,
+    max_bytes: int = 150 * 1024 * 1024,
+) -> list[AttachmentEvidence]:
+    """Orchestrate the all-or-nothing attachment download.
+
+    Returns a list of AttachmentEvidence — one per attachment on the ticket.
+    Items have local_path set if downloaded (or skipped because already present);
+    None otherwise.
+    """
+    attachments = _flatten_attachments(ticket)
+    if not attachments:
+        return []
+
+    if not confirm_download(ticket):
+        # Return the metadata as-is (local_path stays None).
+        return list(attachments)
+
+    out: list[AttachmentEvidence] = []
+    for a in attachments:
+        if not a.content_url:
+            print(
+                f"warning: no download URL for {a.filename}; skipping.",
+                file=sys.stderr,
+            )
+            out.append(a)
+            continue
+
+        decision = resolve_destination(
+            workspace.attachments_dir,
+            filename=a.filename,
+            remote_size=a.size_bytes,
+        )
+        if decision.action == "skip":
+            print(f"  reused {decision.path.name} (manifest match)", file=sys.stderr)
+            out.append(a.model_copy(update={"local_path": decision.path}))
+            continue
+
+        try:
+            print(f"  downloading {decision.path.name}...", file=sys.stderr, end=" ")
+            bytes_written, sha = zd_client.download_attachment(
+                a.content_url, decision.path, max_bytes=max_bytes,
+            )
+            print(f"done ({bytes_written} bytes)", file=sys.stderr)
+            write_manifest_entry(
+                workspace.attachments_dir,
+                filename=decision.path.name,
+                size=bytes_written,
+                sha256=sha,
+            )
+            out.append(a.model_copy(update={"local_path": decision.path}))
+        except RuntimeError as e:
+            print(f"failed: {e}", file=sys.stderr)
+            out.append(a)
+        except Exception as e:  # AttachmentTooLargeError and friends
+            print(f"skipped: {e}", file=sys.stderr)
+            out.append(a)
+
+    return out
+
+
+def _flatten_attachments(ticket: Ticket) -> list[AttachmentEvidence]:
+    """Return all attachments across the ticket's comments, in comment order."""
+    out: list[AttachmentEvidence] = []
+    for c in ticket.comments:
+        out.extend(c.attachments)
+    return out
