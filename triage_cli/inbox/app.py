@@ -262,7 +262,10 @@ class InboxApp(App):
                     )
 
         for line in stderr_buffer.getvalue().splitlines():
-            logger.debug(line)
+            if "iteration aborted" in line:
+                logger.warning(line)
+            else:
+                logger.debug(line)
 
         watcher.save_state(self.opts.state_file, watcher.prune_state(new_state))
         return new_state

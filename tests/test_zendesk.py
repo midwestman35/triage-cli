@@ -89,7 +89,7 @@ def test_list_my_ticket_ids_fetches_current_user_then_assigned_tickets(
         (
             "https://example.zendesk.com/api/v2/search.json",
             {
-                "query": "assignee:42 status<closed type:ticket",
+                "query": "assignee_id:42 status<closed type:ticket",
                 "sort_by": "created_at",
                 "sort_order": "desc",
                 "page[size]": 100,
@@ -132,7 +132,7 @@ def test_list_my_ticket_ids_uses_legacy_next_page_fallback(
         (
             "https://example.zendesk.com/api/v2/search.json",
             {
-                "query": "assignee:51 status<closed type:ticket",
+                "query": "assignee_id:51 status<closed type:ticket",
                 "sort_by": "created_at",
                 "sort_order": "desc",
                 "page[size]": 100,

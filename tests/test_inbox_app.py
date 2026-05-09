@@ -489,6 +489,61 @@ def test_run_iteration_blocking_routes_watcher_stderr_to_log(
     assert "watcher status line" not in capsys.readouterr().err
 
 
+def test_run_iteration_blocking_logs_iteration_aborted_at_warning(
+    tmp_path: Path,
+    monkeypatch,
+    caplog,
+) -> None:
+    """'iteration aborted' lines from watcher are logged at WARNING, not DEBUG."""
+
+    class Context:
+        def __enter__(self) -> object:
+            return object()
+
+        def __exit__(self, *_exc: object) -> None:
+            return None
+
+    def run_iteration(*_args, **_kwargs):
+        print("[17:00:00] iteration aborted: Zendesk error 400", file=sys.stderr)
+        print("[17:00:00] #12345 unchanged", file=sys.stderr)
+        return {"version": 1, "triaged": {}}
+
+    monkeypatch.setattr(app_module.extract, "load_site_map", lambda _path: [])
+    monkeypatch.setattr(app_module.ZendeskClient, "from_env", lambda: Context())
+    monkeypatch.setattr(app_module.watcher, "run_iteration", run_iteration)
+    monkeypatch.setattr(app_module.watcher, "save_state", lambda *_args: None)
+
+    inbox = InboxApp(
+        WatcherOptions(
+            view_id=99,
+            interval=60,
+            state_file=tmp_path / "state.json",
+            backfill_hours=0.0,
+            window_minutes=15,
+            levels=["error", "warn"],
+            no_logs=True,
+            print_notes=False,
+            verbose=False,
+        ),
+        notes_dir=tmp_path,
+    )
+    with caplog.at_level("DEBUG", logger="triage_cli.inbox.app"):
+        inbox._run_iteration_blocking(inbox._state)
+
+    warning_lines = [r.message for r in caplog.records if r.levelname == "WARNING"]
+    debug_lines = [r.message for r in caplog.records if r.levelname == "DEBUG"]
+
+    assert any("iteration aborted" in m for m in warning_lines), (
+        "'iteration aborted' must be logged at WARNING so it appears in the default log"
+    )
+    assert any("#12345 unchanged" in m for m in debug_lines), (
+        "normal watcher status lines must stay at DEBUG"
+    )
+    assert not any("iteration aborted" in m for m in debug_lines), (
+        "'iteration aborted' must not be logged at DEBUG"
+    )
+
+
 def test_set_phase_updates_row_entry(tmp_path: Path) -> None:
     """_set_phase stores phase label and step on the RowEntry."""
     from triage_cli.inbox.widgets import RowEntry

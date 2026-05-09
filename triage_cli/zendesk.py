@@ -145,7 +145,7 @@ class ZendeskClient:
         """Return IDs of open tickets assigned to the authenticated user.
 
         Fetches the current user via /users/me.json, then pages through the
-        search API with ``assignee:<user_id> status<closed type:ticket``.
+        search API with ``assignee_id:<user_id> status<closed type:ticket``.
         Closed tickets and CC'd tickets are excluded.
         """
         me = self._get("/users/me.json", params=None, ticket_id=0)
@@ -155,7 +155,7 @@ class ZendeskClient:
 
         path: str | None = "/search.json"
         params: dict[str, Any] | None = {
-            "query": f"assignee:{user_id} status<closed type:ticket",
+            "query": f"assignee_id:{user_id} status<closed type:ticket",
             "sort_by": "created_at",
             "sort_order": "desc",
             "page[size]": _PAGE_SIZE,
