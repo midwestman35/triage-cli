@@ -340,9 +340,7 @@ def _sources_for(session: InvestigationSession) -> list[str]:
 
 
 def _unknowns_for(session: InvestigationSession) -> list[str]:
-    unknowns = [
-        "Attachment download/extraction is future work; attachment contents were not ingested.",
-    ]
+    unknowns: list[str] = []
     if not session.evidence.attachments:
         unknowns.append("No Zendesk attachment metadata was available.")
     if not session.evidence.local_files:

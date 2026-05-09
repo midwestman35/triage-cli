@@ -191,7 +191,7 @@ def test_assessment_and_report_are_deterministic_without_datadog_or_site(tmp_pat
     assert assessment.confidence == "medium"
     assert "internal note" not in assessment.suggested_internal_note.lower()
     assert "Zendesk ticket #123" in assessment.suggested_internal_note
-    assert any("Attachment download/extraction" in unknown for unknown in assessment.unknowns)
+    assert not any("Attachment download/extraction" in unknown for unknown in assessment.unknowns)
     assert isinstance(report, TriageReport)
     assert report.ticket_id == 123
     assert report.site_name == "unknown"
@@ -201,6 +201,24 @@ def test_assessment_and_report_are_deterministic_without_datadog_or_site(tmp_pat
     assert report.window.end == datetime(2026, 5, 7, 14, 30, 0, tzinfo=UTC)
     assert report.finding == assessment.likely_root_cause
     assert report.suggested_note == assessment.suggested_internal_note
+
+
+def test_unknowns_no_longer_says_attachment_download_is_future_work():
+    """Pipeline v2 actually downloads attachments; this stale unknown must go."""
+    from datetime import UTC, datetime
+
+    from triage_cli.investigation import _unknowns_for, create_session
+    from triage_cli.models import Ticket
+
+    ts = datetime(2026, 5, 7, 12, 0, 0, tzinfo=UTC)
+    ticket = Ticket(
+        id=1, subject="x", description="y",
+        created_at=ts, updated_at=ts, comments=[],
+    )
+    session = create_session(ticket)
+    unknowns = _unknowns_for(session)
+
+    assert not any("future work" in u.lower() for u in unknowns)
 
 
 def test_report_and_assessment_include_local_and_pasted_evidence_text(tmp_path: Path):
