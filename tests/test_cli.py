@@ -328,6 +328,11 @@ def test_investigate_datadog_error_then_pipeline_failure_dies_cleanly(
         raise RuntimeError("simulated LLM failure on retry")
     monkeypatch.setattr("triage_cli.pipeline.triage_one", fake_triage_one)
 
+    class _DD:
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+    monkeypatch.setattr("triage_cli.cli.DatadogClient.from_env", lambda: _DD())
+
     monkeypatch.chdir(tmp_path)
 
     runner = CliRunner()
