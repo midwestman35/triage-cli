@@ -108,3 +108,69 @@ def test_print_note_to_tty_uses_rich() -> None:
     out = buf.getvalue()
     assert "Finding" in out
     assert "Suggested Internal Note" in out
+
+
+def test_save_note_to_workspace_dir(tmp_path: Path) -> None:
+    """When output_dir is the per-ticket workspace, files land there."""
+    from triage_cli.render import save_note
+
+    ts = datetime(2026, 5, 7, 12, 0, 0, tzinfo=UTC)
+    report = TriageReport(
+        finding="x", confidence="low",
+        evidence=[EvidenceItem(message="seen")],
+        suggested_note="y",
+        next_checks=[], unknowns=[],
+        ticket_id=44496, site_name="aur",
+        window=TimeWindow(start=ts, end=ts),
+        sources=["zendesk"], log_event_count=0,
+        generated_at=ts,
+    )
+
+    workspace = tmp_path / "44496"
+    workspace.mkdir(parents=True)
+    md_path, json_path = save_note(report, 44496, output_dir=workspace)
+
+    assert md_path.parent == workspace
+    assert json_path.parent == workspace
+    assert md_path.exists()
+    assert json_path.exists()
+
+
+def test_save_note_strips_content_url_from_json(tmp_path: Path) -> None:
+    """No matter what's in the report, the saved JSON has no content_url field."""
+    import json as _json  # noqa: PLC0415
+
+    from triage_cli.render import save_note
+
+    ts = datetime(2026, 5, 7, 12, 0, 0, tzinfo=UTC)
+
+    # The report itself doesn't carry attachments today; this test pins
+    # behavior so that any future schema additions don't accidentally
+    # serialize a content_url.
+    report = TriageReport(
+        finding="x", confidence="low",
+        evidence=[EvidenceItem(message="seen")],
+        suggested_note="y",
+        next_checks=[], unknowns=[],
+        ticket_id=44496, site_name="aur",
+        window=TimeWindow(start=ts, end=ts),
+        sources=["zendesk"], log_event_count=0,
+        generated_at=ts,
+    )
+
+    workspace = tmp_path / "44496"
+    workspace.mkdir(parents=True)
+    _, json_path = save_note(report, 44496, output_dir=workspace)
+    parsed = _json.loads(json_path.read_text(encoding="utf-8"))
+
+    # Walk the dict; assert no content_url key appears anywhere.
+    def has_key(obj, key):
+        if isinstance(obj, dict):
+            if key in obj:
+                return True
+            return any(has_key(v, key) for v in obj.values())
+        if isinstance(obj, list):
+            return any(has_key(v, key) for v in obj)
+        return False
+
+    assert not has_key(parsed, "content_url")

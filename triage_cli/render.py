@@ -133,6 +133,9 @@ def print_note(report: TriageReport, *, console: Console | None = None) -> None:
 
 
 def save_note(report: TriageReport, ticket_id: int, output_dir: Path | None = None) -> Paths:
+    """Save markdown + JSON. Strips content_url from any nested AttachmentEvidence."""
+    import json as _json
+
     target_dir = output_dir if output_dir is not None else DEFAULT_OUTPUT_DIR
     target_dir.mkdir(parents=True, exist_ok=True)
 
@@ -150,5 +153,19 @@ def save_note(report: TriageReport, ticket_id: int, output_dir: Path | None = No
 
     md_text = to_markdown(report)
     md_path.write_text(md_text if md_text.endswith("\n") else f"{md_text}\n", encoding="utf-8")
-    json_path.write_text(report.model_dump_json(indent=2) + "\n", encoding="utf-8")
+    # exclude defensively: even if a future TriageReport gains attachments, no URL leaks.
+    payload = report.model_dump(mode="json", exclude={"content_url"})
+    json_path.write_text(
+        _json.dumps(_strip_nested_key(payload, "content_url"), indent=2) + "\n",
+        encoding="utf-8",
+    )
     return md_path, json_path
+
+
+def _strip_nested_key(obj: object, key: str) -> object:
+    """Recursively remove a key from nested dicts/lists. Defensive."""
+    if isinstance(obj, dict):
+        return {k: _strip_nested_key(v, key) for k, v in obj.items() if k != key}
+    if isinstance(obj, list):
+        return [_strip_nested_key(v, key) for v in obj]
+    return obj
