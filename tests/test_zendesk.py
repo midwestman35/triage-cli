@@ -55,22 +55,19 @@ def test_list_view_ticket_ids_404_message(monkeypatch: pytest.MonkeyPatch) -> No
 def test_list_my_ticket_ids_fetches_current_user_then_assigned_tickets(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """list_my_ticket_ids discovers the authenticated user before reading assignments."""
+    """list_my_ticket_ids discovers the authenticated user then searches assigned open tickets."""
     calls: list[tuple[str, Any]] = []
     pages: list[dict[str, Any]] = [
         {"user": {"id": 42}},
         {
-            "tickets": [{"id": 1001}, {"id": 1002}],
+            "results": [{"id": 1001}, {"id": 1002}],
             "meta": {"has_more": True},
             "links": {
-                "next": (
-                    "https://example.zendesk.com/api/v2/users/42/"
-                    "tickets/assigned.json?page%5Bafter%5D=abc"
-                )
+                "next": "https://example.zendesk.com/api/v2/search.json?page%5Bafter%5D=abc"
             },
         },
         {
-            "tickets": [{"id": 1003}],
+            "results": [{"id": 1003}],
             "meta": {"has_more": False},
             "links": {},
         },
@@ -90,14 +87,15 @@ def test_list_my_ticket_ids_fetches_current_user_then_assigned_tickets(
     assert calls == [
         ("https://example.zendesk.com/api/v2/users/me.json", None),
         (
-            "https://example.zendesk.com/api/v2/users/42/tickets/assigned.json",
-            {"page[size]": 100},
+            "https://example.zendesk.com/api/v2/search.json",
+            {
+                "query": "assignee:42 status<closed type:ticket",
+                "sort_by": "created_at",
+                "sort_order": "desc",
+                "page[size]": 100,
+            },
         ),
-        (
-            "https://example.zendesk.com/api/v2/users/42/"
-            "tickets/assigned.json?page%5Bafter%5D=abc",
-            None,
-        ),
+        ("https://example.zendesk.com/api/v2/search.json?page%5Bafter%5D=abc", None),
     ]
 
 
@@ -109,14 +107,11 @@ def test_list_my_ticket_ids_uses_legacy_next_page_fallback(
     pages: list[dict[str, Any]] = [
         {"user": {"id": 51}},
         {
-            "tickets": [{"id": 7}],
-            "next_page": (
-                "https://example.zendesk.com/api/v2/users/51/"
-                "tickets/assigned.json?page=2"
-            ),
+            "results": [{"id": 7}],
+            "next_page": "https://example.zendesk.com/api/v2/search.json?page=2",
         },
         {
-            "tickets": [{"id": 8}],
+            "results": [{"id": 8}],
             "next_page": None,
         },
     ]
@@ -135,14 +130,15 @@ def test_list_my_ticket_ids_uses_legacy_next_page_fallback(
     assert calls == [
         ("https://example.zendesk.com/api/v2/users/me.json", None),
         (
-            "https://example.zendesk.com/api/v2/users/51/tickets/assigned.json",
-            {"page[size]": 100},
+            "https://example.zendesk.com/api/v2/search.json",
+            {
+                "query": "assignee:51 status<closed type:ticket",
+                "sort_by": "created_at",
+                "sort_order": "desc",
+                "page[size]": 100,
+            },
         ),
-        (
-            "https://example.zendesk.com/api/v2/users/51/"
-            "tickets/assigned.json?page=2",
-            None,
-        ),
+        ("https://example.zendesk.com/api/v2/search.json?page=2", None),
     ]
 
 

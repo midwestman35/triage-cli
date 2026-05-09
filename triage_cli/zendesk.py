@@ -142,28 +142,33 @@ class ZendeskClient:
         return ids
 
     def list_my_ticket_ids(self) -> list[int]:
-        """Return IDs of tickets assigned to the authenticated user.
+        """Return IDs of open tickets assigned to the authenticated user.
 
-        Fetches the current user via /users/me.json, then pages through
-        /users/{id}/tickets/assigned.json. Returns all assignment statuses;
-        callers use should_triage to decide what to act on.
+        Fetches the current user via /users/me.json, then pages through the
+        search API with ``assignee:<user_id> status<closed type:ticket``.
+        Closed tickets and CC'd tickets are excluded.
         """
         me = self._get("/users/me.json", params=None, ticket_id=0)
         user_id = (me.get("user") or {}).get("id")
         if user_id is None:
             raise RuntimeError("Could not determine current Zendesk user ID from /users/me.json")
 
-        path: str | None = f"/users/{user_id}/tickets/assigned.json"
-        params: dict[str, Any] | None = {"page[size]": _PAGE_SIZE}
+        path: str | None = "/search.json"
+        params: dict[str, Any] | None = {
+            "query": f"assignee:{user_id} status<closed type:ticket",
+            "sort_by": "created_at",
+            "sort_order": "desc",
+            "page[size]": _PAGE_SIZE,
+        }
         ids: list[int] = []
 
         for _ in range(_MAX_PAGES):
             if path is None:
                 break
             payload = self._get(path, params=params, ticket_id=user_id)
-            for t in payload.get("tickets") or []:
-                if "id" in t:
-                    ids.append(int(t["id"]))
+            for result in payload.get("results") or []:
+                if "id" in result:
+                    ids.append(int(result["id"]))
 
             meta = payload.get("meta") or {}
             links = payload.get("links") or {}
@@ -173,7 +178,7 @@ class ZendeskClient:
                 path = payload.get("next_page")
             params = None
         else:
-            raise RuntimeError("Zendesk assigned-tickets pagination exceeded limit")
+            raise RuntimeError("Zendesk assigned-tickets search pagination exceeded limit")
 
         return ids
 

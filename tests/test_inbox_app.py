@@ -7,12 +7,13 @@ import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from textual.widgets import Static
+
 import triage_cli.inbox.app as app_module
 from triage_cli.inbox.app import InboxApp
 from triage_cli.inbox.widgets import ReportPaneWidget, TicketListWidget
 from triage_cli.models import TimeWindow, TriageReport
 from triage_cli.watcher import WatcherOptions
-from textual.widgets import Static
 
 
 def _opts(tmp_path: Path) -> WatcherOptions:
@@ -481,7 +482,7 @@ def test_run_iteration_blocking_routes_watcher_stderr_to_log(
         ),
         notes_dir=tmp_path,
     )
-    with caplog.at_level("WARNING", logger="triage_cli.inbox.app"):
+    with caplog.at_level("DEBUG", logger="triage_cli.inbox.app"):
         app._run_iteration_blocking(app._state)
 
     assert "watcher status line" in caplog.text

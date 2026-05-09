@@ -7,6 +7,7 @@ import io
 import logging
 import math
 import os
+import threading
 import webbrowser
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -16,6 +17,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, Footer, Header, Input, Label
+from textual.worker import Worker
 
 from triage_cli import extract, pipeline, render, watcher
 from triage_cli.datadog import DatadogClient
@@ -90,7 +92,8 @@ class InboxApp(App):
         Binding("up,k", "cursor_up", "up", priority=True),
         Binding("down,j", "cursor_down", "down", priority=True),
         Binding("enter", "focus_detail", "focus", priority=True),
-        Binding("escape", "focus_list", "", priority=True),
+        Binding("escape", "focus_list", "list", priority=True),
+        Binding("ctrl+p", "focus_list", "back to list", priority=True),
         Binding("r", "refresh", "refresh", priority=True),
         Binding("y", "copy_note", "copy", priority=True),
         Binding("o", "open_zendesk", "open", priority=True),
@@ -126,6 +129,8 @@ class InboxApp(App):
             if math.isfinite(self.opts.backfill_hours)
             else datetime.min.replace(tzinfo=UTC)
         )
+        self._shutdown_event = threading.Event()
+        self._pending_workers: set[Worker] = set()
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -134,6 +139,20 @@ class InboxApp(App):
             yield ReportPaneWidget(id="detail")
         yield Footer()
 
+    async def on_unmount(self) -> None:
+        self._shutdown_event.set()
+        for worker in list(self._pending_workers):
+            if worker.is_running:
+                worker.cancel()
+        self._pending_workers.clear()
+        watcher.save_state(self.opts.state_file, watcher.prune_state(self._state))
+
+    def _tracked_worker(self, coro, **kwargs) -> Worker:
+        self._pending_workers = {w for w in self._pending_workers if w.is_running}
+        worker = self.run_worker(coro, **kwargs)
+        self._pending_workers.add(worker)
+        return worker
+
     async def on_mount(self) -> None:
         self._hydrate_recent_reports()
         self._refresh_list()
@@ -141,7 +160,7 @@ class InboxApp(App):
         self.query_one("#list", TicketListWidget).focus()
         if self.poll_on_mount:
             self.set_interval(self.opts.interval, self._poll_tick)
-            self.run_worker(self._poll_tick(), exclusive=False)
+            self._tracked_worker(self._poll_tick(), exclusive=False)
 
     def _hydrate_recent_reports(self) -> int:
         hydrated_count = 0
@@ -207,6 +226,9 @@ class InboxApp(App):
         Touches no ``self.*`` attributes for state mutation — the caller in
         ``_poll_tick`` reassigns ``self._state`` on the event-loop thread.
         """
+        if self._shutdown_event.is_set():
+            return state
+
         sites = extract.load_site_map(Path("data/cnc-map.json"))
 
         stderr_buffer = io.StringIO()
@@ -240,7 +262,7 @@ class InboxApp(App):
                     )
 
         for line in stderr_buffer.getvalue().splitlines():
-            logger.warning(line)
+            logger.debug(line)
 
         watcher.save_state(self.opts.state_file, watcher.prune_state(new_state))
         return new_state
@@ -352,7 +374,7 @@ class InboxApp(App):
     async def action_focus_detail(self) -> None:
         entry = self._currently_selected()
         if entry is not None and entry.status == "queued":
-            self.run_worker(self._triage_ticket_async(entry.ticket_id), exclusive=False)
+            self._tracked_worker(self._triage_ticket_async(entry.ticket_id), exclusive=False)
             self.notify("Starting triage…", timeout=2)
             return
         self.query_one("#detail", ReportPaneWidget).focus()
@@ -433,7 +455,7 @@ class InboxApp(App):
                 self._set_failure(ticket.id, "Triage cancelled — no site provided")
                 return
             site_entry, _ = extract.lookup_site(ticket, sites, site_override=site_name)
-            self.run_worker(
+            self._tracked_worker(
                 asyncio.to_thread(self._run_pipeline_blocking, ticket.id, ticket, site_entry),
                 exclusive=False,
             )
@@ -445,7 +467,7 @@ class InboxApp(App):
 
     async def action_refresh(self) -> None:
         if self.poll_on_mount:
-            self.run_worker(self._poll_tick(), exclusive=False)
+            self._tracked_worker(self._poll_tick(), exclusive=False)
             self.notify("Refreshing...", timeout=1)
             return
 
