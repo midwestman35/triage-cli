@@ -291,7 +291,10 @@ def test_triage_bundle_evidence_fields_default_empty():
     """All three evidence lists default to []; constructing a bundle without
     them still works (watcher path)."""
     from triage_cli.models import (
-        AnchorSource, SiteEntry, Ticket, TriageBundle,
+        AnchorSource,
+        SiteEntry,
+        Ticket,
+        TriageBundle,
     )
 
     ts = datetime(2026, 5, 7, 12, 0, 0, tzinfo=UTC)
@@ -385,7 +388,10 @@ def test_truncate_head_tail_zero_head_returns_only_tail():
 def _bundle_with(downloaded=None, local=None, pasted=None):
     """Helper to build a minimal bundle with chosen evidence fields."""
     from triage_cli.models import (
-        AnchorSource, SiteEntry, Ticket, TriageBundle,
+        AnchorSource,
+        SiteEntry,
+        Ticket,
+        TriageBundle,
     )
 
     ts = datetime(2026, 5, 7, 12, 0, 0, tzinfo=UTC)
