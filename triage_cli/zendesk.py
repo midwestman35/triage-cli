@@ -1,9 +1,11 @@
 """Read-only Zendesk client for fetching a ticket and its full comment thread."""
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 from datetime import datetime
+from pathlib import Path
 from types import TracebackType
 from typing import Any
 
@@ -16,6 +18,10 @@ logger = logging.getLogger(__name__)
 _USER_AGENT = "triage-cli/0.1"
 _PAGE_SIZE = 100
 _MAX_PAGES = 1000  # 100k comments at page[size]=100 - far past any real ticket
+
+
+class AttachmentTooLargeError(Exception):
+    """Raised when a Zendesk attachment exceeds the size cap."""
 
 
 class ZendeskClient:
@@ -242,6 +248,67 @@ class ZendeskClient:
             raise RuntimeError(f"Zendesk rate-limited; retry after {retry_after} seconds")
         raise RuntimeError(f"Zendesk error {status}: {(resp.text or '')[:200]}")
 
+    def download_attachment(
+        self,
+        url: str,
+        dest_path: Path,
+        *,
+        max_bytes: int = 150 * 1024 * 1024,
+    ) -> tuple[int, str]:
+        """Stream-download a Zendesk attachment to disk.
+
+        Returns (bytes_written, sha256_hex). Aborts mid-stream and unlinks the
+        partial file if max_bytes is exceeded. Reuses the authenticated client.
+        """
+        partial = dest_path.with_suffix(dest_path.suffix + ".partial")
+        hasher = hashlib.sha256()
+        bytes_written = 0
+        try:
+            with self._client.stream("GET", url, follow_redirects=True) as resp:
+                if resp.status_code == 404:
+                    raise RuntimeError(f"Attachment not found at {url}")
+                if resp.status_code in (401, 403):
+                    raise RuntimeError(
+                        "Zendesk auth failed during attachment download"
+                    )
+                if resp.status_code == 429:
+                    retry_after = resp.headers.get("Retry-After", "unknown")
+                    raise RuntimeError(
+                        f"Zendesk rate-limited; retry after {retry_after} seconds"
+                    )
+                if not resp.is_success:
+                    raise RuntimeError(
+                        f"Zendesk error {resp.status_code} downloading attachment"
+                    )
+
+                # Pre-flight Content-Length check.
+                cl = resp.headers.get("Content-Length")
+                if cl is not None and int(cl) > max_bytes:
+                    raise AttachmentTooLargeError(
+                        f"attachment is {cl} bytes; cap is {max_bytes} bytes"
+                    )
+
+                with partial.open("wb") as f:
+                    for chunk in resp.iter_bytes():
+                        if bytes_written + len(chunk) > max_bytes:
+                            f.close()
+                            partial.unlink(missing_ok=True)
+                            raise AttachmentTooLargeError(
+                                f"attachment exceeded cap {max_bytes} bytes mid-stream"
+                            )
+                        f.write(chunk)
+                        hasher.update(chunk)
+                        bytes_written += len(chunk)
+        except httpx.HTTPError as e:
+            partial.unlink(missing_ok=True)
+            raise RuntimeError(f"Attachment download failed: {e}") from e
+        except BaseException:
+            partial.unlink(missing_ok=True)
+            raise
+
+        partial.replace(dest_path)
+        return bytes_written, hasher.hexdigest()
+
 
 def _to_comment(rc: dict[str, Any], users_by_id: dict[int, dict[str, Any]]) -> Comment:
     """Map a raw Zendesk comment dict to a Comment model."""
@@ -257,7 +324,11 @@ def _to_comment(rc: dict[str, Any], users_by_id: dict[int, dict[str, Any]]) -> C
 
 
 def _attachments_from_raw(raw_attachments: list[dict[str, Any]]) -> list[AttachmentEvidence]:
-    """Map Zendesk attachment metadata without preserving downloadable URLs."""
+    """Map Zendesk attachment metadata, including the pre-signed content_url.
+
+    The url is kept in-memory only; the render layer strips it before
+    serializing to disk (see triage_cli.render.save_note).
+    """
     attachments: list[AttachmentEvidence] = []
     for raw in raw_attachments:
         filename = raw.get("file_name") or raw.get("filename") or raw.get("name")
@@ -271,6 +342,9 @@ def _attachments_from_raw(raw_attachments: list[dict[str, Any]]) -> list[Attachm
                     str(raw["content_type"]) if raw.get("content_type") is not None else None
                 ),
                 size_bytes=int(size) if size is not None else None,
+                content_url=(
+                    str(raw["content_url"]) if raw.get("content_url") is not None else None
+                ),
             )
         )
     return attachments

@@ -8,6 +8,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import NoReturn
 
+import httpx
 from dotenv import load_dotenv
 
 from triage_cli import render
@@ -21,6 +22,31 @@ from triage_cli.investigation import (
 from triage_cli.zendesk import ZendeskClient
 
 REQUIRED_ZENDESK_ENV = ("ZENDESK_SUBDOMAIN", "ZENDESK_EMAIL", "ZENDESK_API_TOKEN")
+
+# ---------------------------------------------------------------------------
+# HTTP method recorder — patched into httpx.Client.request only during _main()
+# so pytest imports don't pollute the global httpx state.
+# ---------------------------------------------------------------------------
+
+_calls: list[str] = []
+_original_request = httpx.Client.request
+
+
+def _record_request(self: httpx.Client, method: str, url: str, **kwargs: object) -> object:
+    _calls.append(method.upper())
+    return _original_request(self, method, url, **kwargs)
+
+
+def _assert_only_get_calls() -> int:
+    """Return 0 if all httpx calls were GETs; 2 otherwise (FAIL exit code)."""
+    non_get = [m for m in _calls if m != "GET"]
+    if non_get:
+        print(
+            f"FAIL: read-only certification violated; non-GET HTTP methods used: {non_get}",
+            file=sys.stderr,
+        )
+        return 2
+    return 0
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -184,7 +210,15 @@ def main(argv: Sequence[str] | None = None, *, load_env: bool = True) -> int:
 
 
 def _main() -> NoReturn:
-    raise SystemExit(main())
+    _calls.clear()
+    httpx.Client.request = _record_request  # type: ignore[method-assign]
+    try:
+        rc = main()
+    finally:
+        httpx.Client.request = _original_request  # type: ignore[method-assign]
+    if rc == 0:
+        rc = _assert_only_get_calls()
+    raise SystemExit(rc)
 
 
 if __name__ == "__main__":

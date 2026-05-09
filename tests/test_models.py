@@ -258,3 +258,254 @@ def test_local_file_evidence_path_is_intentionally_path():
     assert isinstance(evidence.path, Path)
     assert restored.path == path
     assert isinstance(restored.path, Path)
+
+
+def test_attachment_evidence_accepts_content_url():
+    """content_url is optional; when set it round-trips through Pydantic."""
+    a = AttachmentEvidence(
+        filename="log.txt",
+        content_type="text/plain",
+        size_bytes=1024,
+        content_url="https://example.zendesk.com/attachments/token/abc/log.txt",
+    )
+    assert a.content_url == "https://example.zendesk.com/attachments/token/abc/log.txt"
+
+
+def test_attachment_evidence_content_url_defaults_none():
+    """Existing call sites that omit content_url keep working."""
+    a = AttachmentEvidence(filename="log.txt")
+    assert a.content_url is None
+
+
+def test_attachment_evidence_excludes_content_url_when_dumped_with_exclude():
+    """Render layer can scrub the URL before persisting JSON to disk."""
+    a = AttachmentEvidence(
+        filename="log.txt",
+        content_url="https://example.zendesk.com/attachments/token/abc/log.txt",
+    )
+    dumped = a.model_dump(exclude={"content_url"})
+    assert "content_url" not in dumped
+
+
+def test_triage_bundle_evidence_fields_default_empty():
+    """All three evidence lists default to []; constructing a bundle without
+    them still works (watcher path)."""
+    from triage_cli.models import (
+        AnchorSource,
+        SiteEntry,
+        Ticket,
+        TriageBundle,
+    )
+
+    ts = datetime(2026, 5, 7, 12, 0, 0, tzinfo=UTC)
+    bundle = TriageBundle(
+        ticket=Ticket(
+            id=1, subject="x", description="y",
+            created_at=ts, updated_at=ts, comments=[],
+        ),
+        site_entry=SiteEntry(
+            friendly_name="Aurora 911, CO",
+            site_name="us-co-aurora-apex",
+            cnc="abc",
+        ),
+        anchor=ts,
+        anchor_source=AnchorSource.CREATED_AT,
+        window_start=ts,
+        window_end=ts,
+    )
+
+    assert bundle.downloaded_attachments == []
+    assert bundle.local_files == []
+    assert bundle.pasted_logs == []
+
+
+def test_truncate_head_tail_short_content_unchanged():
+    """Content under the cap is returned verbatim — no marker added."""
+    from triage_cli.models import truncate_head_tail
+
+    text = "small log\n" * 5
+    result = truncate_head_tail(text, head_bytes=1000, tail_bytes=500)
+    assert result == text
+
+
+def test_truncate_head_tail_long_content_keeps_head_and_tail():
+    """Long content keeps head_bytes from the front, tail_bytes from the back,
+    and inserts a [truncated N bytes] marker between them."""
+    from triage_cli.models import truncate_head_tail
+
+    head = "A" * 100
+    middle = "B" * 1000
+    tail = "C" * 50
+    text = head + middle + tail
+
+    result = truncate_head_tail(text, head_bytes=100, tail_bytes=50)
+    assert result.startswith(head)
+    assert result.endswith(tail)
+    assert "[truncated 1000 bytes]" in result
+    assert "B" not in result  # middle is excised entirely
+
+
+def test_truncate_head_tail_exact_cap_no_marker():
+    """At exactly head + tail, no truncation marker is inserted."""
+    from triage_cli.models import truncate_head_tail
+
+    text = "X" * 150
+    result = truncate_head_tail(text, head_bytes=100, tail_bytes=50)
+    assert result == text
+    assert "[truncated" not in result
+
+
+def test_truncate_head_tail_zero_tail_does_not_duplicate():
+    """tail_bytes=0 must produce empty tail, not the full encoded string.
+
+    Regression: encoded[-0:] in Python is the entire slice, not empty. The
+    function must guard against this so callers that ask for head-only get
+    head-only.
+    """
+    from triage_cli.models import truncate_head_tail
+
+    text = "A" * 100 + "B" * 100  # 200 bytes
+    result = truncate_head_tail(text, head_bytes=50, tail_bytes=0)
+    # head: 50 A's; truncated marker; empty tail
+    assert result.startswith("A" * 50)
+    assert "[truncated 150 bytes]" in result
+    assert "B" not in result
+    # And the tail position is empty (not 200 bytes of duplicate text).
+    assert not result.endswith("A" * 100)
+
+
+def test_truncate_head_tail_zero_head_returns_only_tail():
+    """head_bytes=0 produces only the tail portion."""
+    from triage_cli.models import truncate_head_tail
+
+    text = "A" * 100 + "B" * 100
+    result = truncate_head_tail(text, head_bytes=0, tail_bytes=50)
+    assert result.endswith("B" * 50)
+    assert "[truncated 150 bytes]" in result
+    assert "A" not in result
+
+
+def _bundle_with(downloaded=None, local=None, pasted=None):
+    """Helper to build a minimal bundle with chosen evidence fields."""
+    from triage_cli.models import (
+        AnchorSource,
+        SiteEntry,
+        Ticket,
+        TriageBundle,
+    )
+
+    ts = datetime(2026, 5, 7, 12, 0, 0, tzinfo=UTC)
+    return TriageBundle(
+        ticket=Ticket(
+            id=1, subject="x", description="y",
+            created_at=ts, updated_at=ts, comments=[],
+        ),
+        site_entry=SiteEntry(
+            friendly_name="Aurora 911, CO",
+            site_name="us-co-aurora-apex",
+            cnc="abc",
+        ),
+        anchor=ts,
+        anchor_source=AnchorSource.CREATED_AT,
+        window_start=ts,
+        window_end=ts,
+        downloaded_attachments=downloaded or [],
+        local_files=local or [],
+        pasted_logs=pasted or [],
+    )
+
+
+def test_as_user_message_no_evidence_section_when_all_empty():
+    """Headless triage produces a bundle with no evidence; the prompt should
+    not include a Supplemental Evidence header."""
+    bundle = _bundle_with()
+    out = bundle.as_user_message()
+    assert "Supplemental Evidence" not in out
+
+
+def test_as_user_message_renders_local_text_file_with_content():
+    """A short text file is inlined verbatim; the section header appears."""
+    local = [
+        LocalFileEvidence(
+            path=Path("/tmp/apex.log"),
+            size_bytes=20,
+            detected_type="log",
+            extracted_text="boot ok\nerror at 3am\n",
+        ),
+    ]
+    bundle = _bundle_with(local=local)
+    out = bundle.as_user_message()
+    assert "# Supplemental Evidence" in out
+    assert "apex.log" in out
+    assert "boot ok" in out
+    assert "error at 3am" in out
+
+
+def test_as_user_message_renders_binary_attachment_metadata_only():
+    """Binary attachment lists name/size/type but no bytes."""
+    downloaded = [
+        AttachmentEvidence(
+            filename="evt.pdf",
+            content_type="application/pdf",
+            size_bytes=4_000_000,
+            local_path=Path("/tmp/evt.pdf"),
+            extracted_text=None,
+        ),
+    ]
+    bundle = _bundle_with(downloaded=downloaded)
+    out = bundle.as_user_message()
+    assert "evt.pdf" in out
+    assert "application/pdf" in out
+    # Binary file: no text content, just a tag indicating it's not extracted.
+    assert "(binary, not extracted)" in out
+
+
+def test_as_user_message_renders_pasted_evidence():
+    pasted = [PastedEvidence(label="SIP_TRACE", text="INVITE sip:foo")]
+    bundle = _bundle_with(pasted=pasted)
+    out = bundle.as_user_message()
+    assert "SIP_TRACE" in out
+    assert "INVITE sip:foo" in out
+
+
+def test_as_user_message_truncates_oversized_text():
+    """Large extracted_text is bounded by EVIDENCE_HEAD_BYTES + EVIDENCE_TAIL_BYTES."""
+    from triage_cli.models import EVIDENCE_HEAD_BYTES, EVIDENCE_TAIL_BYTES
+
+    huge = "X" * (EVIDENCE_HEAD_BYTES + EVIDENCE_TAIL_BYTES + 5000)
+    local = [
+        LocalFileEvidence(
+            path=Path("/tmp/big.log"),
+            size_bytes=len(huge),
+            detected_type="log",
+            extracted_text=huge,
+        ),
+    ]
+    bundle = _bundle_with(local=local)
+    out = bundle.as_user_message()
+    assert "[truncated 5000 bytes]" in out
+
+
+def test_as_user_message_no_trailing_whitespace_only_lines():
+    """Evidence text ending in \\n must not produce whitespace-only lines.
+
+    Regression: indent_continuations replaces every \\n (including a trailing
+    one) with \\n  , which after join produces lines containing only two
+    spaces. The render helpers must strip trailing newlines before indenting.
+    """
+    local = [
+        LocalFileEvidence(
+            path=Path("/tmp/apex.log"),
+            size_bytes=20,
+            detected_type="log",
+            extracted_text="boot ok\nerror at 3am\n",  # trailing \n
+        ),
+    ]
+    pasted = [PastedEvidence(label="SIP", text="INVITE sip:foo\n")]
+    bundle = _bundle_with(local=local, pasted=pasted)
+    out = bundle.as_user_message()
+
+    # No line should consist only of whitespace.
+    for line in out.split("\n"):
+        if line:  # non-empty lines must have non-whitespace content
+            assert line.strip(), f"whitespace-only line found: {line!r}"

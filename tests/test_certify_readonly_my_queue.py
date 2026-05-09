@@ -263,6 +263,50 @@ def test_rejects_bad_optional_evidence_before_zendesk_fetch(
     assert "--paste must be LABEL=TEXT" in captured.err
 
 
+def test_certify_records_only_get_calls(monkeypatch: pytest.MonkeyPatch) -> None:
+    """_record_request appends the normalised method name to _calls."""
+    import httpx
+
+    from scripts import certify_readonly_my_queue as cert
+
+    cert._calls.clear()  # type: ignore[attr-defined]
+
+    # Patch the real request so no actual network call is made.
+    monkeypatch.setattr(
+        cert,
+        "_original_request",
+        lambda self, method, url, **kw: httpx.Response(200),
+    )
+
+    cert._record_request(httpx.Client(), "GET", "http://x")  # type: ignore[attr-defined]
+    assert cert._calls == ["GET"]  # type: ignore[attr-defined]
+
+
+def test_certify_assertion_flags_non_get_call(capsys: pytest.CaptureFixture[str]) -> None:
+    """_assert_only_get_calls returns 2 and prints to stderr when non-GET seen."""
+    from scripts import certify_readonly_my_queue as cert
+
+    cert._calls.clear()  # type: ignore[attr-defined]
+    cert._calls.extend(["GET", "POST", "GET"])  # type: ignore[attr-defined]
+
+    rc = cert._assert_only_get_calls()  # type: ignore[attr-defined]
+    assert rc == 2
+    captured = capsys.readouterr()
+    assert "POST" in captured.err
+    assert "FAIL" in captured.err
+
+
+def test_certify_assertion_passes_for_only_gets() -> None:
+    """_assert_only_get_calls returns 0 for all-GET history."""
+    from scripts import certify_readonly_my_queue as cert
+
+    cert._calls.clear()  # type: ignore[attr-defined]
+    cert._calls.extend(["GET", "GET", "GET"])  # type: ignore[attr-defined]
+
+    rc = cert._assert_only_get_calls()  # type: ignore[attr-defined]
+    assert rc == 0
+
+
 def test_rejects_unreadable_optional_evidence_before_zendesk_fetch(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

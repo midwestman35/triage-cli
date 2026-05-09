@@ -15,13 +15,6 @@ from dotenv import load_dotenv
 
 from triage_cli import extract, pipeline, render
 from triage_cli.datadog import DatadogClient, DatadogError
-from triage_cli.investigation import (
-    add_local_file,
-    add_pasted_evidence,
-    build_timeline,
-    create_session,
-    session_to_report,
-)
 from triage_cli.models import SiteEntry, TriageReport
 from triage_cli.pipeline import spinner as _spinner
 from triage_cli.zendesk import ZendeskClient
@@ -46,6 +39,11 @@ def _vecho(verbose: bool, msg: str) -> None:
     """Echo to stderr only when --verbose is set, so stdout stays clean for piping."""
     if verbose:
         typer.echo(msg, err=True)
+
+
+def _is_interactive() -> bool:
+    """Return True when both stdin and stdout are connected to a real terminal."""
+    return sys.stdin.isatty() and sys.stdout.isatty()
 
 
 def _parse_at(at: str) -> datetime:
@@ -141,7 +139,7 @@ def investigate(
     files: list[Path] = typer.Option(  # noqa: B008
         [],
         "--file",
-        help="Local evidence file to include; may be repeated.",
+        help="Pre-supplied local evidence file; may be repeated.",
         exists=False,
         file_okay=True,
         dir_okay=False,
@@ -151,18 +149,43 @@ def investigate(
     pastes: list[str] = typer.Option(  # noqa: B008
         [],
         "--paste",
-        help="Pasted evidence as LABEL=TEXT; may be repeated.",
+        help="Pre-supplied pasted evidence as LABEL=TEXT; may be repeated.",
     ),
-    save: bool = typer.Option(False, "--save", help="Also save markdown/JSON to ./triage-notes/"),
+    save: bool = typer.Option(
+        True, "--save/--no-save",
+        help="Save markdown/JSON to triage-notes/<id>/. Default: save.",
+    ),
+    no_llm: bool = typer.Option(
+        False, "--no-llm",
+        help="Skip the LLM call; produce the deterministic report instead.",
+    ),
+    no_logs: bool = typer.Option(
+        False, "--no-logs", help="Skip Datadog; use ticket+evidence only.",
+    ),
+    window_minutes: int = typer.Option(30, "--window-minutes", min=1),
+    at: str | None = typer.Option(None, "--at", help="Anchor override (ISO 8601)"),
+    cnc: str | None = typer.Option(None, "--cnc", help="CNC UUID override"),
+    site: str | None = typer.Option(None, "--site", help="site_name override"),
+    levels: str = typer.Option(
+        "error,warn", "--levels", help="Datadog log levels: comma-separated",
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
-    """Run a guided investigation from Zendesk plus local/pasted evidence."""
+    """Run an interactive investigation on a Zendesk ticket."""
+    if not _is_interactive():
+        _die(
+            "investigate requires an interactive terminal. "
+            "Use 'triage' for headless runs."
+        )
+
     try:
         ticket_id = extract.parse_ticket_id(ticket)
     except ValueError as e:
         _die(str(e))
 
     parsed_pastes = [_parse_paste(value) for value in pastes]
+    at_dt: datetime | None = _parse_at(at) if at is not None else None
+    level_list = _parse_levels(levels)
 
     for path in files:
         if not path.exists():
@@ -178,33 +201,137 @@ def investigate(
 
     _vecho(verbose, f"Fetched ticket #{ticket_obj.id} — subject: {ticket_obj.subject}")
 
-    session = create_session(ticket_obj)
+    # Build the workspace before any prompts (downloads land in it).
+    from triage_cli.interactive import (
+        download_attachments,
+        ensure_workspace,
+        prompt_drop_and_wait,
+        summarize_workspace,
+    )
+    workspace = ensure_workspace(Path("./triage-notes"), ticket_id=ticket_obj.id)
+
+    # Stderr ticket header.
+    typer.echo(
+        f"ZD-{ticket_obj.id} · {ticket_obj.requester_org or '(no org)'} · "
+        f"{sum(len(c.attachments) for c in ticket_obj.comments)} attachment(s) · "
+        f"{len(ticket_obj.comments)} comment(s)",
+        err=True,
+    )
+
+    # Step 4: attachment download prompt.
+    try:
+        with ZendeskClient.from_env() as zd:
+            downloaded = download_attachments(ticket_obj, zd, workspace)
+    except RuntimeError as e:
+        _die(str(e))
+
+    # Step 5: drop-and-ready loop.
+    local_files_evidence = prompt_drop_and_wait(workspace)
+
+    # Pre-supplied --file / --paste are additive.
+    from triage_cli.investigation import (
+        add_local_file as _add_local,
+    )
+    from triage_cli.investigation import (
+        add_pasted_evidence as _add_pasted,
+    )
+    from triage_cli.investigation import (
+        create_session as _create_session,
+    )
+    from triage_cli.investigation import (
+        session_to_report as _session_to_report,
+    )
+    extra_local: list = []
     for path in files:
         try:
-            add_local_file(session, path)
+            session = _create_session(ticket_obj)
+            extra_local.append(_add_local(session, path))
         except OSError as e:
-            _die(f"Could not read local evidence file {path}: {e}")
+            _die(f"Could not read --file {path}: {e}")
+    pasted_logs = []
     for label, text in parsed_pastes:
-        add_pasted_evidence(session, label, text)
-    build_timeline(session)
-    report = session_to_report(session)
+        from triage_cli.models import PastedEvidence
+        pasted_logs.append(PastedEvidence(label=label, text=text))
 
-    if verbose:
-        attachments_count = len(session.evidence.attachments)
-        sources_str = ", ".join(report.sources)
-        typer.echo(
-            "Investigation evidence: "
-            f"comments: {len(session.evidence.comments)} · "
-            f"attachments metadata: {attachments_count} · "
-            f"local files: {len(session.evidence.local_files)} · "
-            f"pasted evidence: {len(session.evidence.pasted_logs)} · "
-            f"sources: {sources_str}",
-            err=True,
+    local_files_evidence.extend(extra_local)
+
+    # Print the summary.
+    typer.echo(
+        summarize_workspace(
+            workspace, local_files=local_files_evidence, downloaded=downloaded,
+        ),
+        err=True,
+    )
+
+    if no_llm:
+        # Deterministic fallback path.
+        session = _create_session(ticket_obj)
+        for lf in local_files_evidence:
+            from triage_cli.investigation import add_local_file as _afl
+            _afl(session, lf.path)
+        for p in pasted_logs:
+            _add_pasted(session, p.label, p.text)
+        from triage_cli.investigation import build_timeline as _bt
+        _bt(session)
+        report = _session_to_report(session)
+    else:
+        # LLM path: site → anchor → datadog → triage_one.
+        try:
+            sites = extract.load_site_map(_SITE_MAP_PATH)
+        except (FileNotFoundError, ValueError) as e:
+            _die(f"{e}\nHint: run 'triage-cli build-map'.")
+
+        site_entry, strategy = pipeline.resolve_site(
+            ticket_obj, sites,
+            cnc_override=cnc, site_override=site,
+            verbose=verbose, show_spinner=True,
         )
+        if site_entry is None:
+            manual = typer.prompt("Enter site_name to query", err=True).strip()
+            if not manual:
+                _die("site_name cannot be empty")
+            site_entry = SiteEntry(
+                friendly_name="(manual)", site_name=manual, cnc="",
+            )
+
+        def _run_pipeline(use_dd: bool) -> TriageReport:
+            with contextlib.ExitStack() as stack:
+                dd_client: DatadogClient | None = None
+                if use_dd:
+                    dd_client = stack.enter_context(DatadogClient.from_env())
+                # Use a kwargs-style call to pass evidence through; pipeline.triage_one
+                # is extended in the next task to accept these.
+                return pipeline.triage_one(
+                    ticket_obj,
+                    site_entry,
+                    dd_client=dd_client,
+                    window_minutes=window_minutes,
+                    levels=level_list,
+                    at=at_dt,
+                    verbose=verbose,
+                    show_spinner=True,
+                    downloaded_attachments=downloaded,
+                    local_files=local_files_evidence,
+                    pasted_logs=pasted_logs,
+                )
+        try:
+            report = _run_pipeline(use_dd=not no_logs)
+        except DatadogError as e:
+            typer.echo(f"Datadog error: {e}", err=True)
+            if not typer.confirm("Continue without Datadog logs?", default=False):
+                _die("Aborted")
+            try:
+                report = _run_pipeline(use_dd=False)
+            except (RuntimeError, ValueError) as e2:
+                _die(str(e2))
+        except (RuntimeError, ValueError) as e:
+            _die(str(e))
 
     render.print_note(report)
     if save:
-        md_path, json_path = render.save_note(report, ticket_obj.id)
+        md_path, json_path = render.save_note(
+            report, ticket_obj.id, output_dir=workspace.root,
+        )
         typer.echo(f"Saved: {md_path} and {json_path}", err=True)
 
 
@@ -353,7 +480,7 @@ def inbox(
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
     """Launch the interactive inbox TUI. Defaults to your assigned tickets."""
-    if not sys.stdout.isatty() or not sys.stdin.isatty():
+    if not _is_interactive():
         _die("inbox requires an interactive terminal. Use `watch` for headless runs.")
 
     from triage_cli.inbox import InboxApp
