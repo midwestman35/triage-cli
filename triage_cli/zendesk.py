@@ -257,7 +257,11 @@ def _to_comment(rc: dict[str, Any], users_by_id: dict[int, dict[str, Any]]) -> C
 
 
 def _attachments_from_raw(raw_attachments: list[dict[str, Any]]) -> list[AttachmentEvidence]:
-    """Map Zendesk attachment metadata without preserving downloadable URLs."""
+    """Map Zendesk attachment metadata, including the pre-signed content_url.
+
+    The url is kept in-memory only; the render layer strips it before
+    serializing to disk (see triage_cli.render.save_note).
+    """
     attachments: list[AttachmentEvidence] = []
     for raw in raw_attachments:
         filename = raw.get("file_name") or raw.get("filename") or raw.get("name")
@@ -271,6 +275,9 @@ def _attachments_from_raw(raw_attachments: list[dict[str, Any]]) -> list[Attachm
                     str(raw["content_type"]) if raw.get("content_type") is not None else None
                 ),
                 size_bytes=int(size) if size is not None else None,
+                content_url=(
+                    str(raw["content_url"]) if raw.get("content_url") is not None else None
+                ),
             )
         )
     return attachments

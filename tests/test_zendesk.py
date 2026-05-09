@@ -186,3 +186,34 @@ def test_to_comment_maps_attachment_metadata_without_download_fields() -> None:
     assert comment.attachments[0].size_bytes == 4096
     assert comment.attachments[0].local_path is None
     assert comment.attachments[0].extracted_text is None
+
+
+def test_attachments_from_raw_preserves_content_url():
+    """The download URL must be preserved so the interactive flow can fetch it."""
+    from triage_cli.zendesk import _attachments_from_raw
+
+    raw = [
+        {
+            "file_name": "log.txt",
+            "content_type": "text/plain",
+            "size": 1024,
+            "content_url": "https://example.zendesk.com/attachments/token/abc/log.txt",
+        },
+    ]
+    attachments = _attachments_from_raw(raw)
+
+    assert len(attachments) == 1
+    assert attachments[0].filename == "log.txt"
+    assert (
+        attachments[0].content_url
+        == "https://example.zendesk.com/attachments/token/abc/log.txt"
+    )
+
+
+def test_attachments_from_raw_handles_missing_content_url():
+    """If Zendesk omits content_url, content_url is None (not an error)."""
+    from triage_cli.zendesk import _attachments_from_raw
+
+    raw = [{"file_name": "log.txt", "content_type": "text/plain", "size": 1024}]
+    attachments = _attachments_from_raw(raw)
+    assert attachments[0].content_url is None
