@@ -276,3 +276,40 @@ def _ingest_local(local_dir: Path) -> list[LocalFileEvidence]:
             ),
         )
     return out
+
+
+def summarize_workspace(
+    workspace: Workspace,
+    *,
+    local_files: list[LocalFileEvidence],
+    downloaded: list[AttachmentEvidence],
+) -> str:
+    """Format the post-collection summary printed to stderr before LLM call."""
+    ingested: list[str] = []
+    skipped: list[str] = []
+
+    for a in downloaded:
+        if a.local_path is not None:
+            size = f"{a.size_bytes} bytes" if a.size_bytes is not None else "?"
+            ingested.append(f"  {a.filename} ({size}, downloaded)")
+        else:
+            skipped.append(f"  {a.filename} (download skipped)")
+
+    for lf in local_files:
+        size = f"{lf.size_bytes} bytes" if lf.size_bytes is not None else "?"
+        if lf.extracted_text is not None:
+            ingested.append(f"  {lf.path.name} ({size}, {lf.detected_type})")
+        else:
+            skipped.append(f"  {lf.path.name} ({size}, binary)")
+
+    if not ingested and not skipped:
+        return "(no local evidence; proceeding with ticket-only context)"
+
+    parts: list[str] = []
+    if ingested:
+        parts.append("Ingesting:")
+        parts.extend(ingested)
+    if skipped:
+        parts.append("Skipping:")
+        parts.extend(skipped)
+    return "\n".join(parts)

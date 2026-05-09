@@ -222,3 +222,43 @@ def test_prompt_drop_and_wait_classifies_files(
     assert "dump.bin" in by_name
     assert by_name["dump.bin"].extracted_text is None
     assert by_name["dump.bin"].detected_type == "unknown"
+
+
+def test_summarize_workspace_mixed_local_files(tmp_path: Path) -> None:
+    """Renders ingested vs skipped lists; binary files marked 'binary'."""
+    from triage_cli.interactive import ensure_workspace, summarize_workspace
+    from triage_cli.models import LocalFileEvidence
+
+    ws = ensure_workspace(tmp_path, ticket_id=44496)
+    local = [
+        LocalFileEvidence(
+            path=ws.local_dir / "apex.log",
+            size_bytes=1024,
+            detected_type="log",
+            extracted_text="boot",
+        ),
+        LocalFileEvidence(
+            path=ws.local_dir / "dump.bin",
+            size_bytes=4096,
+            detected_type="unknown",
+            extracted_text=None,
+        ),
+    ]
+
+    summary = summarize_workspace(ws, local_files=local, downloaded=[])
+    assert "Ingesting:" in summary
+    assert "apex.log" in summary
+    assert "1024" in summary or "1.0KB" in summary or "1KB" in summary
+    assert "Skipping:" in summary
+    assert "dump.bin" in summary
+
+
+def test_summarize_workspace_empty_prints_no_local_evidence(
+    tmp_path: Path,
+) -> None:
+    """Empty local_files + empty downloaded → 'no local evidence'."""
+    from triage_cli.interactive import ensure_workspace, summarize_workspace
+
+    ws = ensure_workspace(tmp_path, ticket_id=44496)
+    summary = summarize_workspace(ws, local_files=[], downloaded=[])
+    assert "no local evidence" in summary.lower() or "no evidence" in summary.lower()
