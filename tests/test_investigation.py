@@ -301,3 +301,37 @@ def test_session_to_report_dedupes_repeated_optional_sources():
     report = session_to_report(session)
 
     assert report.sources == ["zendesk", "comments", "datadog", "local_files"]
+
+
+def test_next_steps_no_longer_says_attachment_ingestion_is_future():
+    """Pipeline v2 actually downloads attachments; this stale next-step phrasing must go.
+
+    Companion to Task 18's removal of the same future-tense language from
+    _unknowns_for. Any wording that says attachment ingestion is "future" or
+    "when available" is now actively misleading.
+    """
+    from datetime import UTC, datetime
+
+    from triage_cli.investigation import _next_steps_for, create_session
+    from triage_cli.models import AttachmentEvidence, Comment, Ticket
+
+    ts = datetime(2026, 5, 7, 12, 0, 0, tzinfo=UTC)
+    # Use a ticket that has at least one attachment so the relevant branch fires.
+    ticket = Ticket(
+        id=1, subject="x", description="y",
+        created_at=ts, updated_at=ts,
+        comments=[
+            Comment(
+                author="agent", body="msg", created_at=ts, is_public=True,
+                attachments=[AttachmentEvidence(filename="log.txt")],
+            ),
+        ],
+    )
+    session = create_session(ticket)
+    next_steps = _next_steps_for(session)
+
+    # The replacement wording about attachments still appears (the branch fired).
+    assert any("attachment" in s.lower() for s in next_steps)
+    # But the stale future-tense wording is gone.
+    assert not any("when attachment ingestion is available" in s for s in next_steps)
+    assert not any("future" in s.lower() for s in next_steps)

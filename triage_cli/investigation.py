@@ -354,7 +354,7 @@ def _next_steps_for(session: InvestigationSession) -> list[str]:
     next_steps = ["Confirm customer impact window and affected workstation/station."]
     if session.evidence.attachments:
         next_steps.append(
-            "Download and extract Zendesk attachments when attachment ingestion is available.",
+            "Review downloaded Zendesk attachments in the workspace for relevant log content.",
         )
     if not session.evidence.local_files:
         next_steps.append(
