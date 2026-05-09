@@ -40,6 +40,41 @@ def truncate_head_tail(text: str, head_bytes: int, tail_bytes: int) -> str:
     return f"{head_part}\n\n[truncated {truncated_count} bytes]\n\n{tail_part}"
 
 
+def _render_attachment(a: "AttachmentEvidence") -> list[str]:
+    size = f"{a.size_bytes} bytes" if a.size_bytes is not None else "unknown size"
+    ctype = a.content_type or "unknown type"
+    out = [f"- {a.filename} ({ctype}, {size})"]
+    if a.extracted_text:
+        truncated = truncate_head_tail(
+            a.extracted_text, EVIDENCE_HEAD_BYTES, EVIDENCE_TAIL_BYTES,
+        )
+        out.append(indent_continuations(f"  {truncated}"))
+    else:
+        out.append("  (binary, not extracted)")
+    return out
+
+
+def _render_local_file(lf: "LocalFileEvidence") -> list[str]:
+    size = f"{lf.size_bytes} bytes" if lf.size_bytes is not None else "unknown size"
+    dtype = lf.detected_type or "unknown"
+    out = [f"- {lf.path.name} ({dtype}, {size})"]
+    if lf.extracted_text:
+        truncated = truncate_head_tail(
+            lf.extracted_text, EVIDENCE_HEAD_BYTES, EVIDENCE_TAIL_BYTES,
+        )
+        out.append(indent_continuations(f"  {truncated}"))
+    else:
+        out.append("  (binary, not extracted)")
+    return out
+
+
+def _render_pasted(p: "PastedEvidence") -> list[str]:
+    truncated = truncate_head_tail(
+        p.text, EVIDENCE_HEAD_BYTES, EVIDENCE_TAIL_BYTES,
+    )
+    return [f"- {p.label}", indent_continuations(f"  {truncated}")]
+
+
 class AnchorSource(StrEnum):
     """Where the anchor timestamp on a TriageBundle came from."""
 
@@ -227,6 +262,29 @@ class TriageBundle(BaseModel):
                 lines.append(f"- {fmt_ts(log.timestamp)} [{log.level}] {msg}")
         else:
             lines.append("(no logs in window)")
+
+        # Supplemental evidence section (only when populated).
+        has_evidence = (
+            self.downloaded_attachments or self.local_files or self.pasted_logs
+        )
+        if has_evidence:
+            lines.append("")
+            lines.append("# Supplemental Evidence")
+            if self.downloaded_attachments:
+                lines.append("")
+                lines.append("## Downloaded attachments")
+                for a in self.downloaded_attachments:
+                    lines.extend(_render_attachment(a))
+            if self.local_files:
+                lines.append("")
+                lines.append("## Local files (analyst-supplied)")
+                for lf in self.local_files:
+                    lines.extend(_render_local_file(lf))
+            if self.pasted_logs:
+                lines.append("")
+                lines.append("## Pasted evidence")
+                for p in self.pasted_logs:
+                    lines.extend(_render_pasted(p))
 
         return "\n".join(lines)
 
