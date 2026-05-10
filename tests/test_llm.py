@@ -89,3 +89,88 @@ def test_triage_verbose_logs_retry(
     with caplog.at_level("WARNING", logger="triage_cli.llm"):
         asyncio.run(llm.triage(_bundle(), verbose=True))
     assert any("retrying" in r.message for r in caplog.records)
+
+
+def test_triage_redacts_phone_in_ticket_before_llm(monkeypatch) -> None:
+    """Verify that ticket text is redacted before being sent to Claude."""
+    captured: dict[str, str] = {}
+
+    async def fake_collect(prompt: str, system_prompt: str, model: str) -> str:
+        captured["prompt"] = prompt
+        return '{"finding": "x", "confidence": "low", "evidence": [], "suggested_note": "x"}'
+
+    from triage_cli import llm
+    from triage_cli.models import (
+        AnchorSource, SiteEntry, Ticket, TriageBundle,
+    )
+    from datetime import datetime, UTC
+    import asyncio
+
+    monkeypatch.setattr(llm, "_collect_text", fake_collect)
+
+    ticket = Ticket(
+        id=1,
+        subject="Outage",
+        description="Caller 555-123-4567 reported issue.",
+        requester_org="Acme",
+        created_at=datetime.now(UTC),
+        updated_at=datetime.now(UTC),
+        comments=[],
+    )
+    bundle = TriageBundle(
+        ticket=ticket,
+        site_entry=SiteEntry(friendly_name="Acme", site_name="acme", cnc="abc"),
+        log_lines=[],
+        log_truncated=False,
+        anchor=datetime.now(UTC),
+        anchor_source=AnchorSource.CREATED_AT,
+        window_start=datetime.now(UTC),
+        window_end=datetime.now(UTC),
+    )
+
+    asyncio.run(llm.triage(bundle, verbose=False))
+
+    assert "555-123-4567" not in captured["prompt"]
+    assert "<PHONE>" in captured["prompt"]
+
+
+def test_triage_no_redact_kwarg_passes_raw(monkeypatch) -> None:
+    captured: dict[str, str] = {}
+
+    async def fake_collect(prompt: str, system_prompt: str, model: str) -> str:
+        captured["prompt"] = prompt
+        return '{"finding": "x", "confidence": "low", "evidence": [], "suggested_note": "x"}'
+
+    from triage_cli import llm
+    from triage_cli.models import (
+        AnchorSource, SiteEntry, Ticket, TriageBundle,
+    )
+    from datetime import datetime, UTC
+    import asyncio
+
+    monkeypatch.setattr(llm, "_collect_text", fake_collect)
+
+    ticket = Ticket(
+        id=1,
+        subject="Outage",
+        description="Caller 555-123-4567 reported issue.",
+        requester_org="Acme",
+        created_at=datetime.now(UTC),
+        updated_at=datetime.now(UTC),
+        comments=[],
+    )
+    bundle = TriageBundle(
+        ticket=ticket,
+        site_entry=SiteEntry(friendly_name="Acme", site_name="acme", cnc="abc"),
+        log_lines=[],
+        log_truncated=False,
+        anchor=datetime.now(UTC),
+        anchor_source=AnchorSource.CREATED_AT,
+        window_start=datetime.now(UTC),
+        window_end=datetime.now(UTC),
+    )
+
+    asyncio.run(llm.triage(bundle, verbose=False, redact_enabled=False))
+
+    assert "555-123-4567" in captured["prompt"]
+    assert "<PHONE>" not in captured["prompt"]
