@@ -53,6 +53,11 @@ _ADDRESS_PATTERN = re.compile(
     r"\b",
 )
 
+# Lat,lon decimal pairs with 4+ decimals to avoid matching version numbers.
+_COORD_PATTERN = re.compile(
+    r"-?\d{1,2}\.\d{4,}\s*[,;\s]\s*-?\d{1,3}\.\d{4,}"
+)
+
 
 class RedactionCounts(BaseModel):
     """Per-call redaction tally surfaced via verbose stderr and saved JSON."""
@@ -88,4 +93,12 @@ def redact(text: str) -> tuple[str, RedactionCounts]:
         return "<ADDR>"
 
     text = _ADDRESS_PATTERN.sub(_sub_address, text)
+
+    def _sub_coord(m: re.Match[str]) -> str:
+        if _is_pre_redacted(m.group(0)):
+            return m.group(0)
+        counts.coords += 1
+        return "<COORDS>"
+
+    text = _COORD_PATTERN.sub(_sub_coord, text)
     return text, counts
