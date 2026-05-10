@@ -1,0 +1,28 @@
+/* triage_cli/inbox/inbox.tcss */
+
+/* ── InboxApp layout ─────────────────────────────────────────────────── */
+
+Horizontal { height: 1fr; }
+TicketListWidget { width: 45%; min-width: 50; }
+ReportPaneWidget { width: 55%; }
+
+/* ── SiteInputModal ──────────────────────────────────────────────────── */
+
+SiteInputModal {
+    align: center middle;
+}
+SiteInputModal Vertical {
+    background: $surface;
+    border: thick $primary;
+    padding: 1 2;
+    width: 70;
+    height: auto;
+}
+SiteInputModal Label { margin-bottom: 1; }
+SiteInputModal Input { margin-bottom: 1; }
+SiteInputModal #buttons { layout: horizontal; height: auto; }
+SiteInputModal Button { margin-right: 1; }
+
+/* ── ReportPaneWidget ────────────────────────────────────────────────── */
+
+ReportPaneWidget { padding: 1 2; overflow-y: auto; }

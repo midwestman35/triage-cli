@@ -32,23 +32,6 @@ logger = logging.getLogger(__name__)
 class SiteInputModal(ModalScreen):
     """Modal that prompts the user for a site_name when auto-resolution fails."""
 
-    DEFAULT_CSS = """
-    SiteInputModal {
-        align: center middle;
-    }
-    SiteInputModal Vertical {
-        background: $surface;
-        border: thick $primary;
-        padding: 1 2;
-        width: 70;
-        height: auto;
-    }
-    SiteInputModal Label { margin-bottom: 1; }
-    SiteInputModal Input { margin-bottom: 1; }
-    SiteInputModal #buttons { layout: horizontal; height: auto; }
-    SiteInputModal Button { margin-right: 1; }
-    """
-
     def __init__(self, ticket_id: int, subject: str, org: str | None) -> None:
         super().__init__()
         self._ticket_id = ticket_id
@@ -97,11 +80,7 @@ class InboxApp(App):
         Binding("q,ctrl+c", "quit", "quit", priority=True),
     ]
 
-    CSS = """
-    Horizontal { height: 1fr; }
-    TicketListWidget { width: 45%; min-width: 50; }
-    ReportPaneWidget { width: 55%; }
-    """
+    CSS_PATH = "inbox.tcss"
 
     TITLE = "triage-cli inbox"
 

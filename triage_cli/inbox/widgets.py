@@ -131,10 +131,6 @@ class ReportPaneWidget(Static):
 
     can_focus = True
 
-    DEFAULT_CSS = """
-    ReportPaneWidget { padding: 1 2; overflow-y: auto; }
-    """
-
     current_report: TriageReport | None = None
 
     def show(self, report: TriageReport | None, *, placeholder: str | None = None) -> None:
