@@ -90,11 +90,13 @@ class InboxApp(App):
         *,
         notes_dir: Path | None = None,
         poll_on_mount: bool = True,
+        density: str = "comfortable",
     ):
         super().__init__()
         self.opts = opts
         self.notes_dir = notes_dir if notes_dir is not None else DEFAULT_OUTPUT_DIR
         self.poll_on_mount = poll_on_mount
+        self._density = density
         self._rows: dict[int, RowEntry] = {}
         self._polling = False
         self._view_ids: set[int] = set()
@@ -109,7 +111,7 @@ class InboxApp(App):
     def compose(self) -> ComposeResult:
         yield Header()
         with Horizontal():
-            yield TicketListWidget(id="list")
+            yield TicketListWidget(id="list", density=self._density)
             yield ReportPaneWidget(id="detail")
         yield Footer()
 

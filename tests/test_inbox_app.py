@@ -448,6 +448,37 @@ def test_run_iteration_blocking_keeps_stable_backfill_cutoff(
     assert cutoffs[0] == cutoffs[1] == app._backfill_cutoff
 
 
+def _build_app_with_one_row(tmp_path: Path, *, density: str = "comfortable") -> InboxApp:
+    """Return an InboxApp pre-populated with one triaged ticket, using the given density."""
+    now = datetime.now(UTC)
+    _write_report(tmp_path, 101, now - timedelta(minutes=5))
+    return InboxApp(_opts(tmp_path), notes_dir=tmp_path, poll_on_mount=False, density=density)
+
+
+def test_ticket_list_widget_density_compact(tmp_path: Path) -> None:
+    """Compact density: TicketListWidget reports density == 'compact'."""
+
+    async def run() -> None:
+        app = _build_app_with_one_row(tmp_path, density="compact")
+        async with app.run_test():
+            table = app.query_one("#list", TicketListWidget)
+            assert table.density == "compact"
+
+    asyncio.run(run())
+
+
+def test_ticket_list_widget_density_comfortable(tmp_path: Path) -> None:
+    """Comfortable density: TicketListWidget reports density == 'comfortable'."""
+
+    async def run() -> None:
+        app = _build_app_with_one_row(tmp_path, density="comfortable")
+        async with app.run_test():
+            table = app.query_one("#list", TicketListWidget)
+            assert table.density == "comfortable"
+
+    asyncio.run(run())
+
+
 def test_run_iteration_blocking_routes_watcher_stderr_to_log(
     tmp_path: Path,
     monkeypatch,

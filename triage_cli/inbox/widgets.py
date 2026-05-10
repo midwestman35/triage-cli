@@ -61,8 +61,9 @@ def sort_rows(rows: list[RowEntry]) -> list[RowEntry]:
 class TicketListWidget(DataTable):
     """Inbox left pane: status icon, ticket number, site, time, confidence, summary."""
 
-    def __init__(self, **kwargs):
+    def __init__(self, *, density: str = "comfortable", **kwargs):
         super().__init__(**kwargs, cursor_type="row", zebra_stripes=True)
+        self.density = density
         self._columns_added = False
 
     def on_mount(self) -> None:
@@ -73,6 +74,39 @@ class TicketListWidget(DataTable):
             return
         self.add_columns(" ", "Ticket", "Site", "When", "Conf", "Summary")
         self._columns_added = True
+
+    def _compact_row(self, row: RowEntry, icon: str) -> tuple:
+        """Single-line row: icon, ticket-id, site, when, confidence, summary."""
+        report = row.report
+        site = report.site_name if report is not None else row.site_hint or "—"
+        when = report.generated_at.strftime("%H:%M") if report is not None else "—"
+        confidence = report.confidence if report is not None else "—"
+        summary = (
+            report.finding[:60]
+            if report is not None
+            else row.failure_reason or _STATUS_LABELS[row.status]
+        )
+        return (icon, f"#{row.ticket_id}", site, when, confidence, summary)
+
+    def _comfortable_row(self, row: RowEntry, icon: str) -> tuple:
+        """Two-line row: line 1 = icon / ticket / site; line 2 = when · confidence · summary."""
+        report = row.report
+        site = report.site_name if report is not None else row.site_hint or "—"
+        when = report.generated_at.strftime("%H:%M") if report is not None else "—"
+        confidence = report.confidence if report is not None else "—"
+        summary = (
+            report.finding[:60]
+            if report is not None
+            else row.failure_reason or _STATUS_LABELS[row.status]
+        )
+        # Embed newline in the summary cell so the comfortable row uses two lines.
+        two_line_summary = f"{summary}\n    {when} · {confidence}"
+        return (icon, f"#{row.ticket_id}", site, "", "", two_line_summary)
+
+    def _row_for(self, row: RowEntry, icon: str) -> tuple:
+        if self.density == "compact":
+            return self._compact_row(row, icon)
+        return self._comfortable_row(row, icon)
 
     def refresh_rows(
         self,
@@ -98,27 +132,12 @@ class TicketListWidget(DataTable):
         selected_row = 0
         for row in sorted_rows:
             row_index = self.row_count
-            report = row.report
             is_selected = row.ticket_id == cursor_ticket_id
             status_icon = _STATUS_ICONS[row.status]
             icon = f"{_SELECTED_ICON} {status_icon}" if is_selected else f"  {status_icon}"
-            site = report.site_name if report is not None else row.site_hint or "—"
-            when = report.generated_at.strftime("%H:%M") if report is not None else "—"
-            confidence = report.confidence if report is not None else "—"
-            summary = (
-                report.finding[:60]
-                if report is not None
-                else row.failure_reason or _STATUS_LABELS[row.status]
-            )
-            self.add_row(
-                icon,
-                f"#{row.ticket_id}",
-                site,
-                when,
-                confidence,
-                summary,
-                key=str(row.ticket_id),
-            )
+            cells = self._row_for(row, icon)
+            height = 2 if self.density == "comfortable" else 1
+            self.add_row(*cells, key=str(row.ticket_id), height=height)
             if is_selected:
                 selected_row = row_index
 
