@@ -1,4 +1,6 @@
 """Tests for triage_cli.redact (PII redactor at the LLM boundary)."""
+from __future__ import annotations
+
 from triage_cli.redact import RedactionCounts, redact
 
 
@@ -50,3 +52,12 @@ def test_counts_default_to_zero() -> None:
     assert counts.addresses == 0
     assert counts.coords == 0
     assert counts.enabled is True
+
+
+def test_bare_numeric_call_id_is_redacted_known_gap() -> None:
+    """Bare numeric Call-IDs that look like 10-digit phones are intentionally
+    redacted in v1. Spec 2026-05-10-final-phase-design.md, Q1 default
+    (permissive phone matching). Documented false positive."""
+    out, counts = redact("Call-ID: 5551234567 initiated.")
+    assert "<PHONE>" in out
+    assert counts.phones == 1
