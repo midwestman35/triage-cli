@@ -87,6 +87,7 @@ triage-cli inbox --view 360123 --verbose         # WARNING+ goes to data/inbox-<
 | --- | --- |
 | `↑` / `k` | Move cursor up |
 | `↓` / `j` | Move cursor down |
+| `d` | Cycle row density (comfortable ↔ compact) |
 | `enter` | Move keyboard focus into the detail pane (so PgUp/PgDn scrolls the report) |
 | `escape` | Return focus to the list |
 | `r` | Force an immediate poll (interval keeps its phase) |

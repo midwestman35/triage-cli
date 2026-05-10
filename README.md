@@ -224,6 +224,31 @@ Common flags:
 
 See `docs/runbooks/06-watching-a-view.md` for a full operator runbook.
 
+## Inbox mode
+
+Run an interactive TUI for a Zendesk view:
+
+```bash
+triage-cli inbox --view 12345
+```
+
+The left pane shows the ticket list; the right pane renders the selected report.
+
+### Inbox keybindings
+
+| Key | Action |
+| --- | --- |
+| Up/Down or `k`/`j` | Navigate the ticket list |
+| `d` | Cycle row density (comfortable ↔ compact) |
+| `enter` | Move focus to the detail pane |
+| `escape` | Return focus to the ticket list |
+| `o` | Open the selected ticket in Zendesk |
+| `q` or Ctrl-C | Quit |
+| `r` | Force an immediate poll |
+| `y` | Copy the selected report's suggested note to clipboard |
+
+See `docs/runbooks/07-inbox-mode.md` for a full operator runbook.
+
 ## One-Shot Output Format
 
 The one-shot `triage` note is plain markdown with four fixed sections, in this order:

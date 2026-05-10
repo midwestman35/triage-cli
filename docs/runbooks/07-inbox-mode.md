@@ -45,12 +45,18 @@ same watcher state file as `watch`, so tickets already triaged at a matching
 | Key | Action |
 | --- | --- |
 | Up/Down or `k`/`j` | navigate the ticket list |
+| `d` | cycle row density (comfortable ↔ compact) |
 | `enter` | move focus to the detail pane |
 | `escape` | return focus to the ticket list |
 | `r` | force a refresh / immediate poll |
 | `y` | copy the selected report's suggested note |
 | `o` | open the selected ticket in Zendesk |
 | `q` or Ctrl-C | quit |
+
+### Density
+
+Press `d` to toggle the ticket list between comfortable (default) and compact row
+layouts. Persists across restarts via the watcher state file.
 
 When the cursor moves in the list, the detail pane updates to the selected
 report. If no row is selected, the detail pane shows
