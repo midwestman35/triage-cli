@@ -128,3 +128,16 @@ def test_does_not_redact_low_precision_pairs() -> None:
 def test_redacts_multiple_coord_pairs() -> None:
     _out, counts = redact("Pings: 33.7490, -84.3880 then 40.7128, -74.0060.")
     assert counts.coords == 2
+
+
+def test_pass_through_already_starred_phone() -> None:
+    out, counts = redact("Pre-redacted: ***-***-1234 in ticket.")
+    assert "***-***-1234" in out
+    # The pattern won't match this anyway because of the asterisks, but
+    # the guard is the safety net for borderline cases.
+    assert counts.phones == 0
+
+
+def test_pass_through_redacted_marker_in_text() -> None:
+    out, _counts = redact("Address [REDACTED] by Zendesk admin.")
+    assert "[REDACTED]" in out
