@@ -1,4 +1,24 @@
-/* triage_cli/inbox/inbox.tcss */
+/* triage_cli/inbox/inbox.tcss
+ *
+ * Organizational tokens — NOT a theme system. The palette doesn't change;
+ * it's just named. See spec 2026-05-10-final-phase-design.md, Feature 3,
+ * "Why 'tokens, not themes'". Adding a --theme flag is an explicit non-goal.
+ */
+
+$status-triaged:  $success;
+$status-triaging: $warning;
+$status-pending:  $secondary;
+$status-failed:   $error;
+
+$priority-urgent: $error;
+$priority-high:   $warning;
+$priority-normal: $foreground;
+$priority-low:    $secondary;
+
+$row-pad-compact:     0;
+$row-pad-comfortable: 1;
+
+$panel-border: $primary-darken-2;
 
 /* ── InboxApp layout ─────────────────────────────────────────────────── */
 
