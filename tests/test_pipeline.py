@@ -42,7 +42,7 @@ def test_triage_one_no_logs_path(monkeypatch: pytest.MonkeyPatch) -> None:
         suggested_note="stub note",
     )
 
-    async def fake_triage(_bundle, model=None, *, verbose=False):  # noqa: ARG001
+    async def fake_triage(_bundle, model=None, *, verbose=False, redact_enabled=True):  # noqa: ARG001
         return canned
 
     # _llm_extract_anchor is not patched: dd_client=None means the pipeline
@@ -81,10 +81,10 @@ def test_triage_one_with_logs_populates_report(monkeypatch: pytest.MonkeyPatch) 
         suggested_note="y",
     )
 
-    async def fake_triage(_bundle, model=None, *, verbose=False):  # noqa: ARG001
+    async def fake_triage(_bundle, model=None, *, verbose=False, redact_enabled=True):  # noqa: ARG001
         return canned
 
-    async def fake_extract(_ticket, model=None):  # noqa: ARG001
+    async def fake_extract(_ticket, model=None, *, redact_enabled=True, verbose=False):  # noqa: ARG001
         return None
 
     class FakeDD:
@@ -128,7 +128,7 @@ def test_triage_one_headless_bundle_has_empty_evidence_fields(
 
     captured_bundles: list = []
 
-    async def fake_triage(bundle, model=None, *, verbose=False):  # noqa: ARG001
+    async def fake_triage(bundle, model=None, *, verbose=False, redact_enabled=True):  # noqa: ARG001
         captured_bundles.append(bundle)
         return LLMTriageOutput(
             finding="x", confidence="low", evidence=[], suggested_note="y",

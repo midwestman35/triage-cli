@@ -45,6 +45,7 @@ class WatcherOptions:
     no_logs: bool
     print_notes: bool
     verbose: bool
+    redact_enabled: bool = True
 
 
 State = dict[str, Any]
@@ -185,7 +186,7 @@ def run_iteration(
             continue
 
         site_entry, _strategy = pipeline.resolve_site(
-            ticket, sites, verbose=opts.verbose,
+            ticket, sites, verbose=opts.verbose, redact_enabled=opts.redact_enabled,
         )
         if site_entry is None:
             _emit(f"[{_now_local_hms()}] #{tid} skipped: site unresolvable")
@@ -205,6 +206,7 @@ def run_iteration(
                 at=None,
                 verbose=opts.verbose,
                 show_spinner=False,
+                redact_enabled=opts.redact_enabled,
             )
         except (RuntimeError, ValueError) as e:
             _emit(f"[{_now_local_hms()}] #{tid} failed: {e} (will retry)")
