@@ -79,3 +79,63 @@ def score_log_line(
         score -= 3
 
     return score
+
+
+def _render_line(line: LogLine) -> str:
+    """Same shape used by TriageBundle.as_user_message — keep in sync."""
+    return f"[{line.timestamp.isoformat()}] [{line.level.upper()}] {line.message}"
+
+
+def build_log_section(
+    lines: list[LogLine],
+    anchor: datetime | None,
+    subject: str,
+    budget: int = 6000,
+) -> tuple[list[LogLine], ContextSummary]:
+    """Score, select, and chronologically order log lines within ``budget`` tokens.
+
+    Returns ``(kept_lines, summary)`` — the caller renders. Tiny inputs
+    (≤25 lines and ≤2000 estimated tokens) bypass scoring entirely.
+    """
+    candidates = len(lines)
+
+    # Tiny-input fast path
+    if candidates <= 25:
+        rendered = "\n".join(_render_line(line) for line in lines)
+        rendered_tokens = estimate_tokens(rendered)
+        if rendered_tokens <= 2000:
+            return lines, ContextSummary(
+                candidates=candidates,
+                kept=candidates,
+                budget_tokens=budget,
+                used_tokens=rendered_tokens,
+            )
+
+    subject_tokens = extract_subject_tokens(subject)
+    already_kept_messages: set[str] = set()
+    scored: list[tuple[int, datetime, int, LogLine]] = []
+    for i, line in enumerate(lines):
+        s = score_log_line(line, anchor, subject_tokens, already_kept_messages)
+        scored.append((s, line.timestamp, i, line))
+
+    # Sort: score desc, timestamp asc, original index asc
+    scored.sort(key=lambda t: (-t[0], t[1], t[2]))
+
+    kept: list[LogLine] = []
+    used_tokens = 0
+    for _, _, _, line in scored:
+        rendered = _render_line(line)
+        line_tokens = estimate_tokens(rendered) + 1  # +1 for the joining newline
+        if used_tokens + line_tokens > budget:
+            continue
+        kept.append(line)
+        used_tokens += line_tokens
+        already_kept_messages.add(line.message)
+
+    kept.sort(key=lambda line: line.timestamp)
+    return kept, ContextSummary(
+        candidates=candidates,
+        kept=len(kept),
+        budget_tokens=budget,
+        used_tokens=used_tokens,
+    )

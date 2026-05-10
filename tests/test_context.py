@@ -78,3 +78,42 @@ def test_score_dedupe_penalty() -> None:
     anchor = datetime(2026, 5, 10, 12, 0, 0, tzinfo=UTC)
     line = _line("error", "duplicate")
     assert score_log_line(line, anchor, [], {"duplicate"}) == 2  # error(5) - dedupe(3)
+
+
+from triage_cli.context import build_log_section
+
+
+def test_build_log_section_tiny_input_fast_path() -> None:
+    """≤25 lines and ≤2000 estimated tokens → return everything unchanged."""
+    anchor = datetime(2026, 5, 10, 12, 0, 0, tzinfo=UTC)
+    lines = [_line("info", f"msg {i}") for i in range(10)]
+    kept, summary = build_log_section(lines, anchor, "subject", budget=6000)
+    assert summary.kept == 10
+    assert summary.candidates == 10
+    assert kept == lines  # untouched
+
+
+def test_build_log_section_orders_kept_chronologically() -> None:
+    """Selection is by score; output is by timestamp."""
+    anchor = datetime(2026, 5, 10, 12, 0, 0, tzinfo=UTC)
+    # Force scoring path: many low-relevance lines + a few high-relevance.
+    lines = [
+        _line("debug", f"noise {i}", ts=anchor + timedelta(seconds=i))
+        for i in range(50)
+    ]
+    lines.append(_line("error", "important early", ts=anchor - timedelta(minutes=5)))
+    lines.append(_line("error", "important late", ts=anchor + timedelta(minutes=5)))
+
+    kept, summary = build_log_section(lines, anchor, "subject", budget=200)
+    # The two errors should be selected first; chronological output puts early before late.
+    msgs = [k.message for k in kept]
+    assert msgs.index("important early") < msgs.index("important late")
+
+
+def test_build_log_section_respects_token_budget() -> None:
+    anchor = datetime(2026, 5, 10, 12, 0, 0, tzinfo=UTC)
+    # 30 lines of error, each ~80 chars → 30 * 20 ≈ 600 estimated tokens
+    lines = [_line("error", "x" * 80, ts=anchor) for _ in range(30)]
+    kept, summary = build_log_section(lines, anchor, "subject", budget=200)
+    assert summary.used_tokens <= 200
+    assert summary.kept < summary.candidates
