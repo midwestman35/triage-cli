@@ -24,12 +24,24 @@ ApiException: 401 Unauthorized
 - The APP key must belong to a user with `logs_read_data` permission.
 - If you're on a non-US Datadog tenant, set `DD_SITE` (e.g. `datadoghq.eu`).
 
-### Claude Agent SDK auth
+### Unleash auth
+
+```
+Unleash API call failed with HTTP ...
+```
+
+- Confirm `UNLEASH_API_KEY`, `UNLEASH_ASSISTANT_ID`, and `UNLEASH_BASE_URL` are set correctly.
+- If using an impersonated API key, confirm `UNLEASH_ACCOUNT` is the intended email or account ID.
+- Include the printed RequestId when escalating the error.
+
+### Claude fallback auth
 
 ```
 Claude Agent SDK call failed: ...
 ```
 
+- This path is used only when `LLM_PROVIDER=claude`.
+- Install the optional fallback dependency with `python -m pip install -e ".[claude]"`.
 - The SDK inherits Claude Code's OAuth session. Run `claude` once interactively in the same shell to verify auth state. If it prompts you to log in, complete that and re-run the triage command.
 - The SDK does **not** read `ANTHROPIC_API_KEY`. Setting one will not help.
 
@@ -78,7 +90,7 @@ Wait the duration suggested in the error and re-run. There are no automatic retr
 
 ### Empty triage note
 
-The LLM returned no assistant text blocks. Almost always an SDK auth issue — re-run `claude` interactively to refresh the session, then retry.
+The LLM returned no assistant text blocks. In production mode, check the Unleash assistant configuration and RequestId. In Claude fallback mode, re-run `claude` interactively to refresh the session, then retry.
 
 ### Anchor extraction returns null in `--verbose`, but the ticket text has a timestamp
 

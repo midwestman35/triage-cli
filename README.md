@@ -10,17 +10,25 @@ A local CLI for Axon network engineers working the Carbyne APEX NG911/E911 platf
 
 - **Python 3.11+** (the package is pinned to `>=3.11` in `pyproject.toml`).
 - **Zendesk credentials** with read scope on tickets: an agent email plus an API token.
-- **Claude Code CLI installed and authenticated** for `triage` and watcher reports. The guided `investigate` command does not require Claude.
+- **Unleash API access** for `triage` and watcher reports: an API key plus the dedicated assistant ID. The guided `investigate` command does not require an LLM.
+- **Claude Code CLI** is optional fallback only when `LLM_PROVIDER=claude`.
 - **Datadog credentials** are optional enrichment for `triage` and watcher mode. `investigate` works without Datadog.
 
 ## Install
 
-For first-time setup, use the interactive setup script. It creates the venv,
-installs the package with dev dependencies, prompts for `.env`, builds the site
-map, and resumes safely if interrupted:
+For first-time setup from a fresh clone, use the interactive bootstrap script.
+It creates the venv, installs the package with dev dependencies, prompts for
+`.env`, builds the site map, and resumes safely if interrupted:
 
 ```bash
 python3.11 scripts/setup.py
+```
+
+After the console command exists, use the packaged command for setup reruns or
+repairs:
+
+```bash
+triage-cli setup
 ```
 
 Manual install remains available when you need to run the steps yourself:
@@ -40,8 +48,8 @@ python -m pip install -e .
 uv pip install -e .
 ```
 
-After install, `triage-cli --help` should list the `investigate`, `triage`, `inbox`,
-`watch`, and `build-map` subcommands.
+After install, `triage-cli --help` should list the `investigate`, `triage`,
+`inbox`, `watch`, `setup`, and `build-map` subcommands.
 
 ## Configuration
 
@@ -61,9 +69,14 @@ cp .env.example .env
 | `DD_SITE` | Datadog site host. Leave at default `datadoghq.com` unless you are on a non-US tenant. |
 | `DD_CALL_CENTER_TAG` | Datadog tag key for the call-center filter. Leave at default `@log.machineData.callCenterName`. |
 | `DD_STATION_TAG` | Reserved for v2 station-level filtering. Leave at default; v1 does not use it. |
-| `ANTHROPIC_MODEL` | Model identifier passed to the Agent SDK. Default `claude-sonnet-4-6`. |
+| `LLM_PROVIDER` | `unleash` by default. Set to `claude` only for local Claude Code fallback. |
+| `UNLEASH_API_KEY` | Unleash API key. Use an assistant-scoped key when possible. |
+| `UNLEASH_BASE_URL` | Unleash API base URL. Default `https://e-api.unleash.so`; private tenants usually use `https://<tenant>/e-api`. |
+| `UNLEASH_ASSISTANT_ID` | Dedicated Unleash assistant ID for triage output. Required when `LLM_PROVIDER=unleash`. |
+| `UNLEASH_ACCOUNT` | Optional impersonation account for Unleash impersonated API keys. Leave blank for non-impersonated keys. |
+| `ANTHROPIC_MODEL` | Claude model identifier used only when `LLM_PROVIDER=claude`. Default `claude-sonnet-4-6`. |
 
-`ANTHROPIC_API_KEY` is intentionally absent. The Claude Agent SDK inherits Claude Code's auth.
+`ANTHROPIC_API_KEY` is intentionally absent. Claude fallback uses the local Claude Code OAuth session and requires the optional `claude` extra.
 
 ## Building the site map
 
@@ -106,7 +119,7 @@ Evidence sources currently supported by Guided Investigation:
 - Local files
 - Pasted logs or console excerpts
 
-Datadog remains optional enrichment for `triage` and watcher mode; it is not used by `investigate`. Site map lookup, CNC resolution, and Claude are not required for `investigate`.
+Datadog remains optional enrichment for `triage` and watcher mode; it is not used by `investigate`. Site map lookup, CNC resolution, and LLM access are not required for `investigate`.
 
 ### Fast one-shot triage
 
@@ -277,7 +290,7 @@ These are the v1 boundary; do not assume any of them have been addressed:
 
 - Site map is manually curated; refreshing the underlying Confluence inventory is an out-of-band step.
 - No station-level log filtering. Only call-center level via `@log.machineData.callCenterName`. The `DD_STATION_TAG` env var is reserved for v2.
-- Internal Zendesk comments are sent to Claude. Caller PII is redacted by default (`--no-redact` disables this), but output is terminal-only for v1 — be aware before adding any "post back to Zendesk" feature.
+- Internal Zendesk comments are sent to the configured LLM provider. Caller PII is redacted by default (`--no-redact` disables this), but output is terminal-only for v1 — be aware before adding any "post back to Zendesk" feature.
 - No retries on transient API failures; if Datadog or Zendesk hiccups, re-run the command.
 - Single-user, local execution. No scheduling, no shared state. (`watch` mode provides local single-user polling without external scheduling.)
 
@@ -292,12 +305,13 @@ triage-cli/
 ├── apex-cnc-inventory.md       # source of truth for the CNC map
 ├── .env.example
 ├── triage_cli/
-│   ├── cli.py                  # typer app: investigate, triage, watch, and build-map subcommands
+│   ├── cli.py                  # typer app: investigate, triage, setup, watch, and build-map subcommands
+│   ├── setup.py                # shared setup engine used by scripts/setup.py and triage-cli setup
 │   ├── zendesk.py              # ticket + comment fetch (httpx)
 │   ├── datadog.py              # log query (datadog-api-client)
 │   ├── extract.py              # ticket ID parsing, site lookup, window/anchor
 │   ├── investigation.py        # guided investigation session/evidence/report bridge
-│   ├── llm.py                  # Claude Agent SDK calls + system prompts
+│   ├── llm.py                  # Unleash/Claude LLM provider calls + system prompts
 │   ├── models.py               # pydantic models
 │   ├── pipeline.py             # triage_one single-ticket orchestration
 │   ├── render.py               # markdown print + --save handling
@@ -327,11 +341,17 @@ triage-cli/
 
 ## Troubleshooting
 
-**`ImportError: claude_agent_sdk`**
-The package was not installed (run `python -m pip install -e .` again from the repo root with your venv active), or your venv is not actually activated. The SDK is a runtime dependency declared in `pyproject.toml`.
+**`UNLEASH_API_KEY must be set` / `UNLEASH_ASSISTANT_ID must be set`**
+One-shot `triage` or watcher mode is using the production Unleash provider without the required Unleash credentials. Fill in `.env`, then re-run.
+
+**`Unleash API call failed with HTTP ...`**
+The Unleash API rejected or could not complete the chat request. Re-check `UNLEASH_API_KEY`, `UNLEASH_ASSISTANT_ID`, `UNLEASH_BASE_URL`, and `UNLEASH_ACCOUNT` if using an impersonated key. The error includes a RequestId when Unleash returns one.
+
+**`ImportError: claude_agent_sdk` / `claude-agent-sdk is not installed`**
+Claude fallback was selected without installing the optional dependency. Install with `python -m pip install -e ".[claude]"`, confirm the venv is active, and verify the local `claude` CLI is authenticated.
 
 **`Claude Agent SDK call failed` / `extracted_dt None and SDK error in --verbose`**
-The SDK could not reach Claude Code's session. Run `claude` once interactively to confirm the CLI is installed and your OAuth session is valid. The Agent SDK does not read `ANTHROPIC_API_KEY` — Claude Code's auth is the only path.
+The SDK could not reach Claude Code's session while `LLM_PROVIDER=claude`. Run `claude` once interactively to confirm the CLI is installed and your OAuth session is valid. The Agent SDK does not read `ANTHROPIC_API_KEY`.
 
 **Zendesk auth failed (401 / 403)**
 Check that `ZENDESK_API_TOKEN` is the API token (not your password) and that `ZENDESK_EMAIL` is the agent email associated with the token. The client appends `/token` to the email when forming Basic auth — do not pre-append it in `.env`. Also confirm the token has read scope on tickets.

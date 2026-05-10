@@ -598,6 +598,14 @@ def watch(
         _die(str(e))
 
 
+@app.command()
+def setup() -> None:
+    """Run or resume first-time local setup."""
+    from triage_cli.setup import main as setup_main
+
+    raise typer.Exit(setup_main())
+
+
 @app.command("build-map")
 def build_map() -> None:
     """Rebuild data/cnc-map.json and data/cnc-map-gaps.md from apex-cnc-inventory.md."""

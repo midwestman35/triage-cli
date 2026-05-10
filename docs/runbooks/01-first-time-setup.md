@@ -4,7 +4,7 @@
 
 ## Steps
 
-Run the interactive setup script from the repo root:
+Run the interactive bootstrap script from the repo root:
 
 ```bash
 python3.11 scripts/setup.py
@@ -15,17 +15,23 @@ dev dependencies, prompts for `.env`, builds the site map, and smoke-tests the
 installed CLI. It writes `.setup-state.json` after each completed phase, so
 rerunning it resumes from the first incomplete phase.
 
+After the console command exists, rerun the same setup flow with:
+
+```bash
+triage-cli setup
+```
+
 Use the manual steps below only when you need to diagnose or perform a setup
 step yourself.
 
-1. **Verify prerequisites.** Both commands must exit cleanly:
+1. **Verify prerequisites.** Python must exit cleanly:
 
    ```bash
-   claude --version
    python3.11 --version
    ```
 
-   If `claude` is missing, install Claude Code first and run `claude` once interactively to complete OAuth. The Agent SDK piggybacks on that session — there is no separate API key.
+   Production LLM calls use Unleash API credentials from `.env`. Claude Code is
+   only needed if you choose the local fallback path with `LLM_PROVIDER=claude`.
 
 2. **Clone the repo (or `cd` into an existing checkout):**
 
@@ -63,6 +69,7 @@ step yourself.
 
    - `ZENDESK_SUBDOMAIN`, `ZENDESK_EMAIL`, `ZENDESK_API_TOKEN` — generate the API token in Zendesk Admin Center under Apps and integrations -> Zendesk API. Do **not** append `/token` to the email; the client does that.
    - `DD_API_KEY`, `DD_APP_KEY` — optional. Add these only if you plan to use Datadog enrichment in `triage`, `watch`, or `inbox`; Guided Investigation does not need them.
+   - `LLM_PROVIDER=unleash`, `UNLEASH_API_KEY`, `UNLEASH_ASSISTANT_ID` — required for production one-shot `triage` and watcher LLM reports.
 
 6. **Build the site map** if you will use one-shot triage or watcher site resolution (turns `apex-cnc-inventory.md` into `data/cnc-map.json`):
 
@@ -76,7 +83,7 @@ step yourself.
 
 ## Verification
 
-- `triage-cli --help` lists `investigate`, `triage`, `watch`, and `build-map` subcommands.
+- `triage-cli --help` lists `investigate`, `triage`, `inbox`, `watch`, `setup`, and `build-map` subcommands.
 - `data/cnc-map.json` has at least 30 entries:
 
   ```bash
@@ -90,5 +97,6 @@ step yourself.
 
 - **`zsh: command not found: pip`** — the venv does not expose a bare `pip` shim. Run `python -m ensurepip --upgrade`, then use `python -m pip install -e ".[dev]"`.
 - **`command not found: triage-cli`** — venv isn't active, or `python -m pip install -e .` didn't run. Re-activate (`source .venv/bin/activate`) and re-install.
-- **`ImportError: claude_agent_sdk`** — the SDK didn't install. Run `python -m pip install claude-agent-sdk` and confirm the `claude` CLI itself is installed (`claude --version`).
+- **Missing `UNLEASH_API_KEY` or `UNLEASH_ASSISTANT_ID`** — fill the Unleash keys in `.env` before using one-shot `triage`, `watch`, or `inbox` LLM generation.
+- **`ImportError: claude_agent_sdk`** — Claude fallback was selected but the optional extra is missing. Run `python -m pip install -e ".[claude]"` and confirm the `claude` CLI itself is installed (`claude --version`).
 - **Zendesk auth failed (401/403)** — the email already has `/token` appended in `.env` (remove it), or the API token was pasted with whitespace, or the token doesn't have ticket read scope.

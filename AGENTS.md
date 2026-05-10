@@ -6,7 +6,7 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 
 A Python 3.11+ CLI that triages Zendesk tickets for the Carbyne APEX NG911/E911 platform. Five subcommands:
 
-- `triage-cli triage <id-or-url>` — single-shot pipeline: fetch ticket → resolve site → query Datadog → call Codex → print markdown.
+- `triage-cli triage <id-or-url>` — single-shot pipeline: fetch ticket → resolve site → query Datadog → call the configured LLM provider → print markdown.
 - `triage-cli investigate <id-or-url>` — guided session that bundles the ticket with optional `--file` / `--paste LABEL=TEXT` evidence into a structured `TriageReport` (markdown + JSON).
 - `triage-cli inbox [--view ...]` — interactive Textual TUI over a polled Zendesk view (defaults to your assigned tickets); requires a TTY.
 - `triage-cli watch --view <id>` — long-running headless poll loop over a Zendesk view, calling the same pipeline per ticket.
@@ -64,11 +64,13 @@ The investigation flow was added to support read-only triage on tickets where Da
 
 Shared invariant with `watch`: state file is `data/watcher-state-<view-key>.json`, same shape for both. Don't fork the state schema between them.
 
-### LLM access — Codex Agent SDK, not the Anthropic SDK
+### LLM access — Unleash API by default, Claude Code optional
 
-`triage_cli/llm.py` uses `Codex-agent-sdk` (`query` + `ClaudeAgentOptions`). The Agent SDK spawns Codex under the hood and inherits the user's OAuth session — there is intentionally **no `ANTHROPIC_API_KEY`** in `.env.example` and the SDK does not read one. Prerequisite: the `Codex` CLI must be installed and authenticated.
+`triage_cli/llm.py` defaults to `LLM_PROVIDER=unleash` and calls the Unleash `/chats` API using `UNLEASH_API_KEY`, `UNLEASH_BASE_URL`, and `UNLEASH_ASSISTANT_ID`. This is the production path because it does not require each analyst to have a Claude Code or Codex seat.
 
-Do not "fix" this by switching to the `anthropic` HTTP SDK. The user has an enterprise OAuth seat with no provisioned API key; that path doesn't work for them. Model is read from `ANTHROPIC_MODEL` env (default `Codex-sonnet-4-6`) — staying model-agnostic via env is the only abstraction; do not add a provider layer.
+Claude Code remains an optional fallback when `LLM_PROVIDER=claude`. The fallback lazily imports `claude-agent-sdk`, so the core install must not require it. Install fallback support with `python -m pip install -e ".[claude]"`. `ANTHROPIC_MODEL` applies only to Claude fallback.
+
+Do not "fix" Claude fallback by switching to the `anthropic` HTTP SDK. The user has an enterprise OAuth seat with no provisioned Anthropic API key; that path doesn't work for them.
 
 Two single-turn async calls live in `llm.py`:
 - `triage(bundle)` — main markdown generation.
@@ -109,7 +111,7 @@ stdout is reserved for the rendered triage note so the output is pipeable. Every
 - Type hints everywhere; pydantic v2 for all data models in `triage_cli/models.py`.
 - No `print` outside `cli.py`, `render.py`, `pipeline.py`, and `watcher.py` (the latter two only for stderr status). Library modules return or raise.
 - Module size budget ~150 lines; if you're growing one past that, the split usually wants to live in a sibling module, not a sub-package. (`investigation.py` and `inbox/app.py` are deliberate exceptions.)
-- Internal Zendesk comments **are** sent to the LLM. v1 is terminal-only so this is acceptable; if anything ever posts back to Zendesk, this assumption must be revisited.
+- Internal Zendesk comments **are** sent to the configured LLM provider. v1 is terminal-only so this is acceptable; if anything ever posts back to Zendesk, this assumption must be revisited.
 - `ruff` ruleset: `E,F,W,I,B,UP,SIM`, line length 100, `target-version = py311`. Keep edits compatible.
 - TUI deps (`rich`, `textual`) are runtime-required; don't gate them behind extras.
 

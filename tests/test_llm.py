@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import builtins
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock
 
@@ -52,6 +53,67 @@ FENCED_JSON = "```json\n" + VALID_JSON + "\n```"
 MALFORMED = "I'm sorry, I cannot produce JSON."
 
 
+class _FakeUnleashResponse:
+    def __init__(
+        self,
+        status_code: int,
+        payload: object,
+        *,
+        headers: dict[str, str] | None = None,
+        text: str = "",
+    ) -> None:
+        self.status_code = status_code
+        self._payload = payload
+        self.headers = headers or {}
+        self.text = text or (payload if isinstance(payload, str) else "")
+
+    def json(self) -> object:
+        if isinstance(self._payload, Exception):
+            raise self._payload
+        return self._payload
+
+
+class _FakeAsyncClient:
+    response = _FakeUnleashResponse(
+        200,
+        {
+            "type": "Full",
+            "requestId": "req-ok",
+            "message": {
+                "role": "Assistant",
+                "parts": [
+                    {"type": "Text", "text": "hello"},
+                    {"type": "InlineReference", "text": "ignored"},
+                    {"type": "Text", "text": " world"},
+                ],
+            },
+        },
+    )
+    requests: list[dict[str, object]] = []
+
+    def __init__(self, *args, **kwargs) -> None:
+        self.args = args
+        self.kwargs = kwargs
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        return None
+
+    async def post(self, url: str, *, headers: dict[str, str], json: dict[str, object]):
+        self.requests.append({"url": url, "headers": headers, "json": json})
+        return self.response
+
+
+def _set_unleash_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LLM_PROVIDER", "unleash")
+    monkeypatch.setenv("UNLEASH_API_KEY", "test-key")
+    monkeypatch.setenv("UNLEASH_BASE_URL", "https://tenant.example/e-api/")
+    monkeypatch.setenv("UNLEASH_ASSISTANT_ID", "assistant-123")
+    monkeypatch.delenv("UNLEASH_ACCOUNT", raising=False)
+
+
 def test_triage_parses_valid_json(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(llm, "_collect_text", AsyncMock(return_value=VALID_JSON))
     out, _counts = asyncio.run(llm.triage(_bundle()))
@@ -89,6 +151,131 @@ def test_triage_verbose_logs_retry(
     with caplog.at_level("WARNING", logger="triage_cli.llm"):
         asyncio.run(llm.triage(_bundle(), verbose=True))
     assert any("retrying" in r.message for r in caplog.records)
+
+
+def test_unleash_request_shape_and_text_parsing(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_unleash_env(monkeypatch)
+    monkeypatch.setenv("UNLEASH_ACCOUNT", "analyst@example.com")
+    _FakeAsyncClient.requests = []
+    _FakeAsyncClient.response = _FakeUnleashResponse(
+        200,
+        {
+            "type": "Full",
+            "requestId": "req-ok",
+            "message": {
+                "role": "Assistant",
+                "parts": [
+                    {"type": "Text", "text": "hello"},
+                    {"type": "InlineReference", "text": "ignored"},
+                    {"type": "Text", "text": " world"},
+                ],
+            },
+        },
+    )
+    monkeypatch.setattr(llm.httpx, "AsyncClient", _FakeAsyncClient)
+
+    text = asyncio.run(llm._collect_text("user prompt", "system prompt", "ignored"))
+
+    assert text == "hello world"
+    assert len(_FakeAsyncClient.requests) == 1
+    request = _FakeAsyncClient.requests[0]
+    assert request["url"] == "https://tenant.example/e-api/chats"
+    assert request["headers"] == {
+        "Authorization": "Bearer test-key",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "unleash-account": "analyst@example.com",
+    }
+    assert request["json"] == {
+        "assistantId": "assistant-123",
+        "stream": False,
+        "messages": [
+            {"role": "System", "text": "system prompt"},
+            {"role": "User", "text": "user prompt"},
+        ],
+    }
+
+
+def test_unleash_missing_config_fails_before_network(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LLM_PROVIDER", "unleash")
+    monkeypatch.delenv("UNLEASH_API_KEY", raising=False)
+    monkeypatch.setenv("UNLEASH_ASSISTANT_ID", "assistant-123")
+
+    class ForbiddenClient:
+        def __init__(self, *args, **kwargs) -> None:
+            raise AssertionError("network client should not be constructed")
+
+    monkeypatch.setattr(llm.httpx, "AsyncClient", ForbiddenClient)
+
+    with pytest.raises(RuntimeError, match="UNLEASH_API_KEY"):
+        asyncio.run(llm._collect_text("user", "system", "ignored"))
+
+
+def test_unleash_http_error_includes_request_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_unleash_env(monkeypatch)
+    _FakeAsyncClient.requests = []
+    _FakeAsyncClient.response = _FakeUnleashResponse(
+        401,
+        {"detail": "assistant not available", "requestId": "req-401"},
+    )
+    monkeypatch.setattr(llm.httpx, "AsyncClient", _FakeAsyncClient)
+
+    with pytest.raises(RuntimeError, match="HTTP 401.*assistant not available.*req-401"):
+        asyncio.run(llm._collect_text("user", "system", "ignored"))
+
+
+def test_unleash_empty_text_parts_raise(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_unleash_env(monkeypatch)
+    _FakeAsyncClient.requests = []
+    _FakeAsyncClient.response = _FakeUnleashResponse(
+        200,
+        {
+            "requestId": "req-empty",
+            "message": {"role": "Assistant", "parts": [{"type": "InlineReference"}]},
+        },
+    )
+    monkeypatch.setattr(llm.httpx, "AsyncClient", _FakeAsyncClient)
+
+    with pytest.raises(RuntimeError, match="text parts.*req-empty"):
+        asyncio.run(llm._collect_text("user", "system", "ignored"))
+
+
+def test_unleash_provider_does_not_import_claude_sdk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_unleash_env(monkeypatch)
+    _FakeAsyncClient.requests = []
+    _FakeAsyncClient.response = _FakeUnleashResponse(
+        200,
+        {
+            "message": {
+                "role": "Assistant",
+                "parts": [{"type": "Text", "text": "hello world"}],
+            },
+        },
+    )
+    monkeypatch.setattr(llm.httpx, "AsyncClient", _FakeAsyncClient)
+    real_import = builtins.__import__
+
+    def fail_claude_import(name, *args, **kwargs):
+        if name == "claude_agent_sdk":
+            raise AssertionError("claude_agent_sdk should not be imported for Unleash")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fail_claude_import)
+
+    text = asyncio.run(llm._collect_text("user", "system", "ignored"))
+
+    assert text == "hello world"
+
+
+def test_unsupported_provider_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LLM_PROVIDER", "codex")
+
+    with pytest.raises(RuntimeError, match="Unsupported LLM_PROVIDER"):
+        asyncio.run(llm._collect_text("user", "system", "ignored"))
 
 
 def test_triage_redacts_phone_in_ticket_before_llm(monkeypatch) -> None:

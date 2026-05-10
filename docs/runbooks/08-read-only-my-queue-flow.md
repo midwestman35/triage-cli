@@ -8,7 +8,7 @@
 - Do not run any Zendesk write action. This runbook must not post, update, delete, comment, assign, tag, or otherwise mutate Zendesk data.
 - Do not pass `--save` during certification. The expected artifact is stdout only, with verbose progress on stderr.
 - `triage-cli investigate` fetches Zendesk ticket data, comments, and attachment metadata, then prints a local markdown draft. It does not post/update/delete/comment in Zendesk.
-- Datadog, CNC/site resolution, and Claude are not required for `investigate`.
+- Datadog, CNC/site resolution, and LLM access are not required for `investigate`.
 
 ## Steps
 
@@ -28,7 +28,7 @@
    The script below automates the read-only Zendesk environment check, assigned-queue
    discovery, ticket selection, ticket fetch, Guided Investigation draft rendering, and
    evidence count/status output. It does not use view APIs, search APIs, Datadog,
-   CNC/site resolution, Claude, Zendesk writes, or saved output files.
+   CNC/site resolution, LLM access, Zendesk writes, or saved output files.
 
    ```bash
    .venv/bin/python scripts/certify_readonly_my_queue.py
@@ -128,7 +128,7 @@
 
    - stdout contains the local markdown investigation draft.
    - stderr includes `Fetched ticket #...` and an `Investigation evidence:` line with comment, attachment metadata, local file, pasted evidence, and source counts.
-   - no Datadog credentials, CNC map, site lookup, or Claude auth are required.
+   - no Datadog credentials, CNC map, site lookup, or LLM access are required.
    - no Zendesk note, post, update, delete, comment, assignment, or tag change occurs.
 
 8. **Optionally test local/pasted evidence without saving.**

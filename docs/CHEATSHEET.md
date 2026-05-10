@@ -10,33 +10,17 @@ A CLI that investigates and triages Zendesk tickets for the Carbyne APEX NG911/E
 | `triage <id>` | One-shot: fetch ticket → optional site/Datadog enrichment → call Claude → print a paste-ready report. |
 | `inbox --view N` | Interactive Textual TUI: live list of view tickets on the left, selected report on the right. Use this at the keyboard. |
 | `watch --view N` | Headless poll loop: forever poll a Zendesk view, save each new triage to `./triage-notes/`, print status to stderr. Use this in tmux/cron/systemd. |
+| `setup` | Run or resume the interactive local setup flow after the console command is installed. |
 | `build-map` | Regenerate `data/cnc-map.json` from `apex-cnc-inventory.md`. Run after editing the inventory. |
 
 ## First-time setup
 
 ```bash
-# 1. Create and activate a Python 3.11+ virtualenv
-python3.11 -m venv .venv
-source .venv/bin/activate
+# Fresh clone: bootstrap the venv, editable install, .env, site map, and CLI smoke test.
+python3.11 scripts/setup.py
 
-# 2. Install pip into the venv if needed, then install editable with dev deps
-python -m ensurepip --upgrade
-python -m pip install --upgrade pip setuptools wheel
-python -m pip install -e ".[dev]"
-
-# 3. Create .env from the template
-cp .env.example .env
-
-# 4. Fill in:
-#    ZENDESK_SUBDOMAIN, ZENDESK_EMAIL, ZENDESK_API_TOKEN
-#    DD_API_KEY, DD_APP_KEY only if using Datadog enrichment
-#    (DD_SITE, DD_CALL_CENTER_TAG, ANTHROPIC_MODEL have working defaults)
-
-# 5. Authenticate Claude CLI once if using triage/watch reports
-claude   # type a message, confirm OAuth, exit
-
-# 6. Build the site map if using triage/watch site resolution
-triage-cli build-map
+# After triage-cli is installed: rerun or repair the same setup flow.
+triage-cli setup
 ```
 
 ## `investigate <id>` — guided investigation
@@ -144,10 +128,16 @@ DD_SITE                    # default datadoghq.com (eu = datadoghq.eu, us3, etc.
 DD_CALL_CENTER_TAG         # default @log.machineData.callCenterName
 DD_STATION_TAG             # reserved for v2 station-level filtering; unused today
 
-ANTHROPIC_MODEL            # default claude-sonnet-4-6 (used by triage/watch LLM calls)
+LLM_PROVIDER               # default unleash; set claude only for local fallback
+UNLEASH_API_KEY            # required for production triage/watch LLM calls
+UNLEASH_BASE_URL           # default https://e-api.unleash.so
+UNLEASH_ASSISTANT_ID       # required dedicated triage assistant ID
+UNLEASH_ACCOUNT            # optional; only for impersonated Unleash API keys
+
+ANTHROPIC_MODEL            # Claude fallback model when LLM_PROVIDER=claude
 ```
 
-The Agent SDK reuses Claude CLI's OAuth session — there is intentionally **no `ANTHROPIC_API_KEY`** here.
+Claude fallback reuses Claude CLI's OAuth session — there is intentionally **no `ANTHROPIC_API_KEY`** here.
 
 ## Common workflows
 
@@ -181,6 +171,10 @@ triage-cli triage 12345 --at 2026-05-07T14:03:00Z --window-minutes 30
 **`could not resolve site for ticket; use --site or --cnc`** — `requester_org` doesn't match any `friendly_name` in the site map. Pass `--site <site_name>` or `--cnc <uuid>` explicitly, or add the customer to `apex-cnc-inventory.md` and re-run `build-map`.
 
 **`LLM returned invalid TriageReport JSON after retry`** — the model produced malformed JSON twice. Re-run with `--verbose` to see the first-attempt failure logged. If persistent, the prompt may need a tweak in `triage_cli/llm.py:TRIAGE_SYSTEM_PROMPT`.
+
+**`UNLEASH_API_KEY must be set` / `UNLEASH_ASSISTANT_ID must be set`** — production LLM mode needs Unleash credentials in `.env`.
+
+**`Unleash API call failed with HTTP ...`** — check the Unleash API key scope, assistant ID, base URL, and optional impersonation account. Save the RequestId if one is printed.
 
 **`inbox requires an interactive terminal`** — `inbox` was launched without a TTY (cron, pipe, redirected stdin). Use `watch` for headless runs.
 

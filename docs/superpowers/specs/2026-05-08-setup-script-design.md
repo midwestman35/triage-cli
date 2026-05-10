@@ -3,6 +3,11 @@
 **Date:** 2026-05-08
 **Status:** Approved
 
+**2026-05-10 update:** the setup engine now lives in `triage_cli/setup.py`
+so the installed CLI can expose `triage-cli setup`. The bootstrap script remains
+available at `scripts/setup.py` for fresh clones before the console command
+exists.
+
 ## Goal
 
 Replace the manual `docs/runbooks/01-first-time-setup.md` steps with an interactive `scripts/setup.py` that guides both new team members and experienced teammates through first-time setup and re-runs safely.
@@ -12,17 +17,25 @@ Replace the manual `docs/runbooks/01-first-time-setup.md` steps with an interact
 | Question | Decision | Reason |
 |----------|----------|--------|
 | Audience | Both new and experienced users | New users need guidance; teammates need speed |
-| Form | `scripts/setup.py` (stdlib only) | Can't run `triage-cli` before install; single entry point |
+| Form | Shared stdlib-only engine plus bootstrap script | Fresh clones need `scripts/setup.py`; installed/rerun flows can use `triage-cli setup` |
 | Approach | Phase-based with resume | Clear progress, survives interruption, fast re-runs |
 | `.env` config | Interactive prompts with validation | Catches credential mistakes early |
 | Idempotency | Detect existing state, ask before overwriting | Safe re-runs without silent clobbering |
 
 ## Architecture
 
-Single file: `scripts/setup.py`. No imports from `triage_cli`. Runnable as:
+Shared engine: `triage_cli/setup.py`. It uses only the standard library so it
+can be imported before dependencies are installed. Fresh clone bootstrap remains
+runnable as:
 
 ```bash
 python3.11 scripts/setup.py
+```
+
+Once the console command exists, rerun the same flow as:
+
+```bash
+triage-cli setup
 ```
 
 ### Phases
@@ -35,7 +48,7 @@ PREREQS → ENVIRONMENT → CONFIG → VERIFY
 
 | Phase | Runbook steps | Description |
 |-------|--------------|-------------|
-| `PREREQS` | Step 1 | Verify `python3.11` and `claude` are on PATH |
+| `PREREQS` | Step 1 | Verify `python3.11` and the configured LLM provider prerequisites |
 | `ENVIRONMENT` | Steps 2–4 | Create `.venv`, `ensurepip`, install `.[dev]` editable |
 | `CONFIG` | Step 5 | Copy `.env.example` → `.env`, prompt each key with validation |
 | `VERIFY` | Steps 6–7 | Run `triage-cli build-map`, smoke-test `triage-cli --help` |
@@ -47,7 +60,7 @@ PREREQS → ENVIRONMENT → CONFIG → VERIFY
 ```json
 {
   "completed_phases": ["PREREQS", "ENVIRONMENT"],
-  "setup_version": "1"
+  "setup_version": "2"
 }
 ```
 
