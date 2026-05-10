@@ -25,3 +25,26 @@ class ContextSummary(BaseModel):
 def estimate_tokens(text: str) -> int:
     """Approximate tokens as ``len(text) // 4`` (no tokenizer dep, by design)."""
     return len(text) // 4
+
+
+import re
+
+_STOPWORDS = frozenset({
+    "the", "and", "for", "with", "from", "this", "that", "has", "have",
+    "was", "were", "are", "you", "your", "our", "their", "but", "not",
+    "all", "can", "any", "had", "her", "his", "she", "they", "ticket",
+    "issue", "problem", "report", "reported", "into", "onto", "over",
+    "under", "about", "after", "before", "while",
+})
+
+
+def extract_subject_tokens(subject: str) -> list[str]:
+    """Lowercase, dedupe, drop stopwords and tokens shorter than 4 chars."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for tok in re.findall(r"\b[a-zA-Z]{4,}\b", subject.lower()):
+        if tok in _STOPWORDS or tok in seen:
+            continue
+        seen.add(tok)
+        out.append(tok)
+    return out
