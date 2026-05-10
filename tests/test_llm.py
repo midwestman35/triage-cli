@@ -54,21 +54,21 @@ MALFORMED = "I'm sorry, I cannot produce JSON."
 
 def test_triage_parses_valid_json(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(llm, "_collect_text", AsyncMock(return_value=VALID_JSON))
-    out = asyncio.run(llm.triage(_bundle()))
+    out, _counts = asyncio.run(llm.triage(_bundle()))
     assert out.confidence == "medium"
     assert out.finding == "x"
 
 
 def test_triage_strips_code_fence(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(llm, "_collect_text", AsyncMock(return_value=FENCED_JSON))
-    out = asyncio.run(llm.triage(_bundle()))
+    out, _counts = asyncio.run(llm.triage(_bundle()))
     assert out.confidence == "medium"
 
 
 def test_triage_retries_once_on_malformed(monkeypatch: pytest.MonkeyPatch) -> None:
     mock = AsyncMock(side_effect=[MALFORMED, VALID_JSON])
     monkeypatch.setattr(llm, "_collect_text", mock)
-    out = asyncio.run(llm.triage(_bundle()))
+    out, _counts = asyncio.run(llm.triage(_bundle()))
     assert out.finding == "x"
     assert mock.await_count == 2
 

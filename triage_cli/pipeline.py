@@ -152,7 +152,9 @@ def triage_one(
     )
 
     with spinner("Generating triage note", show=show_spinner):
-        llm_out = asyncio.run(_llm_triage(bundle, verbose=verbose, redact_enabled=redact_enabled))
+        llm_out, redaction_counts = asyncio.run(
+            _llm_triage(bundle, verbose=verbose, redact_enabled=redact_enabled)
+        )
 
     sources = ["zendesk"] + (["datadog"] if dd_client is not None else [])
 
@@ -164,4 +166,5 @@ def triage_one(
         sources=sources,
         log_event_count=len(log_lines),
         generated_at=datetime.now(UTC),
+        redaction_summary=redaction_counts,
     )
