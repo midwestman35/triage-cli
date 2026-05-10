@@ -101,3 +101,7 @@ triage-cli build-map
 ### `--save` puts the note somewhere unexpected
 
 `./triage-notes/` is **cwd-relative**, not repo-relative. If you ran the command from `~/Desktop`, the note is at `~/Desktop/triage-notes/`. `cd` into the repo first if you want it under the repo tree.
+
+## Redactor
+
+If a triage note references `<PHONE>` or `<ADDR>` where the original ticket had operational data (e.g., a long station ID matched the phone regex), re-run with `--no-redact` to confirm. Open an issue with the offending input so the pattern can be tightened.

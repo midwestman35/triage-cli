@@ -109,7 +109,7 @@ stdout is reserved for the rendered triage note so the output is pipeable. Every
 - Type hints everywhere; pydantic v2 for all data models in `triage_cli/models.py`.
 - No `print` outside `cli.py`, `render.py`, `pipeline.py`, and `watcher.py` (the latter two only for stderr status). Library modules return or raise.
 - Module size budget ~150 lines; if you're growing one past that, the split usually wants to live in a sibling module, not a sub-package. (`investigation.py` and `inbox/app.py` are deliberate exceptions.)
-- Internal Zendesk comments **are** sent to the LLM. v1 is terminal-only so this is acceptable; if anything ever posts back to Zendesk, this assumption must be revisited.
+- Internal Zendesk comments **are** sent to the LLM (comment text itself, including employee notes). Caller PII (phone numbers, street-line addresses, GPS coords) is **redacted** at the LLM boundary by default — see `triage_cli/redact.py`. The post-back risk is reduced but not eliminated; if anything ever posts back to Zendesk, this assumption must be revisited.
 - `ruff` ruleset: `E,F,W,I,B,UP,SIM`, line length 100, `target-version = py311`. Keep edits compatible.
 - TUI deps (`rich`, `textual`) are runtime-required; don't gate them behind extras.
 
