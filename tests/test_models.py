@@ -509,3 +509,40 @@ def test_as_user_message_no_trailing_whitespace_only_lines():
     for line in out.split("\n"):
         if line:  # non-empty lines must have non-whitespace content
             assert line.strip(), f"whitespace-only line found: {line!r}"
+
+
+def test_triage_report_accepts_optional_redaction_summary() -> None:
+    from triage_cli.models import TriageReport, TimeWindow
+    from triage_cli.redact import RedactionCounts
+    from datetime import datetime, UTC
+
+    report = TriageReport(
+        finding="x",
+        confidence="medium",
+        evidence=[],
+        suggested_note="x",
+        ticket_id=1,
+        site_name="us-ga-roswell",
+        window=TimeWindow(start=datetime.now(UTC), end=datetime.now(UTC)),
+        sources=["zendesk"],
+        log_event_count=0,
+        generated_at=datetime.now(UTC),
+        redaction_summary=RedactionCounts(phones=2, addresses=1, coords=0, enabled=True),
+    )
+    assert report.redaction_summary is not None
+    assert report.redaction_summary.phones == 2
+
+    # Default to None for backwards compatibility
+    report2 = TriageReport(
+        finding="x",
+        confidence="medium",
+        evidence=[],
+        suggested_note="x",
+        ticket_id=1,
+        site_name="us-ga-roswell",
+        window=TimeWindow(start=datetime.now(UTC), end=datetime.now(UTC)),
+        sources=["zendesk"],
+        log_event_count=0,
+        generated_at=datetime.now(UTC),
+    )
+    assert report2.redaction_summary is None
