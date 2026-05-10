@@ -37,3 +37,44 @@ def test_extract_subject_tokens_drops_stopwords() -> None:
 def test_extract_subject_tokens_dedupes() -> None:
     tokens = extract_subject_tokens("network network issue with network")
     assert tokens.count("network") == 1
+
+
+from datetime import UTC, datetime, timedelta
+
+from triage_cli.context import score_log_line
+from triage_cli.models import LogLine
+
+
+def _line(level: str, msg: str, ts: datetime | None = None) -> LogLine:
+    return LogLine(timestamp=ts or datetime.now(UTC), level=level, message=msg)
+
+
+def test_score_severity_weights() -> None:
+    anchor = datetime(2026, 5, 10, 12, 0, 0, tzinfo=UTC)
+    assert score_log_line(_line("error", "x"), anchor, [], set()) == 5
+    assert score_log_line(_line("warn", "x"), anchor, [], set()) == 3
+    assert score_log_line(_line("info", "x"), anchor, [], set()) == 1
+    assert score_log_line(_line("debug", "x"), anchor, [], set()) == 0
+
+
+def test_score_subject_token_boost_capped() -> None:
+    anchor = datetime(2026, 5, 10, 12, 0, 0, tzinfo=UTC)
+    line = _line("info", "timeout in network on station with network")
+    # 'timeout', 'network', 'station' all in subject_tokens; cap at +6.
+    score = score_log_line(line, anchor, ["timeout", "network", "station", "extra"], set())
+    # info(+1) + 6 (cap) = 7; not 1 + 8.
+    assert score == 7
+
+
+def test_score_anchor_proximity() -> None:
+    anchor = datetime(2026, 5, 10, 12, 0, 0, tzinfo=UTC)
+    near = _line("info", "x", ts=anchor + timedelta(seconds=30))
+    far = _line("info", "x", ts=anchor + timedelta(minutes=10))
+    assert score_log_line(near, anchor, [], set()) == 3  # info + proximity
+    assert score_log_line(far, anchor, [], set()) == 1  # info only
+
+
+def test_score_dedupe_penalty() -> None:
+    anchor = datetime(2026, 5, 10, 12, 0, 0, tzinfo=UTC)
+    line = _line("error", "duplicate")
+    assert score_log_line(line, anchor, [], {"duplicate"}) == 2  # error(5) - dedupe(3)

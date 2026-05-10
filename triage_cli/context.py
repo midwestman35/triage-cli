@@ -48,3 +48,34 @@ def extract_subject_tokens(subject: str) -> list[str]:
         seen.add(tok)
         out.append(tok)
     return out
+
+
+from datetime import datetime
+
+from triage_cli.models import LogLine
+
+_SEVERITY_SCORES = {"error": 5, "warn": 3, "info": 1, "debug": 0}
+
+
+def score_log_line(
+    line: LogLine,
+    anchor: datetime | None,
+    subject_tokens: list[str],
+    already_kept_messages: set[str],
+) -> int:
+    """Score a log line by relevance for prompt inclusion."""
+    score = _SEVERITY_SCORES.get(line.level.lower(), 0)
+
+    msg_lower = line.message.lower()
+    matches = sum(1 for t in subject_tokens if t in msg_lower)
+    score += min(matches * 2, 6)
+
+    if anchor is not None:
+        delta = abs((line.timestamp - anchor).total_seconds())
+        if delta <= 60:
+            score += 2
+
+    if line.message in already_kept_messages:
+        score -= 3
+
+    return score
