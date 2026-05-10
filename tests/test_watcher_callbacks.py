@@ -92,7 +92,7 @@ def test_run_iteration_no_callbacks_preserves_state_update(
         lambda _report, tid: (tmp_path / f"{tid}.md", tmp_path / f"{tid}.json"),
     )
 
-    state: State = {"version": watcher.STATE_VERSION, "triaged": {}}
+    state: State = State(version=watcher.STATE_VERSION, triaged={})
     new_state = watcher.run_iteration(
         zd,
         [_make_site()],
@@ -102,7 +102,7 @@ def test_run_iteration_no_callbacks_preserves_state_update(
         dd_client=None,
     )
 
-    assert new_state["triaged"] == {
+    assert new_state.triaged == {
         "101": first.isoformat(),
         "102": second.isoformat(),
     }
@@ -136,7 +136,7 @@ def test_run_iteration_invokes_callbacks_in_order(
     )
 
     callbacks = MagicMock()
-    state: State = {"version": watcher.STATE_VERSION, "triaged": {}}
+    state: State = State(version=watcher.STATE_VERSION, triaged={})
     watcher.run_iteration(
         zd,
         [_make_site()],
@@ -174,7 +174,7 @@ def test_run_iteration_invokes_failure_callback(
     monkeypatch.setattr("triage_cli.pipeline.triage_one", fail_triage)
 
     callbacks = MagicMock()
-    state: State = {"version": watcher.STATE_VERSION, "triaged": {}}
+    state: State = State(version=watcher.STATE_VERSION, triaged={})
     new_state = watcher.run_iteration(
         zd,
         [_make_site()],
@@ -188,7 +188,7 @@ def test_run_iteration_invokes_failure_callback(
         on_failure=callbacks.on_failure,
     )
 
-    assert new_state["triaged"] == {}
+    assert new_state.triaged == {}
     assert callbacks.mock_calls == [
         call.on_view_listed([101]),
         call.on_progress(101, "triaging"),
@@ -206,7 +206,7 @@ def test_run_iteration_failure_callback_for_get_ticket_error(
     zd.get_ticket.side_effect = RuntimeError("Zendesk unavailable")
 
     callbacks = MagicMock()
-    state: State = {"version": watcher.STATE_VERSION, "triaged": {}}
+    state: State = State(version=watcher.STATE_VERSION, triaged={})
     watcher.run_iteration(
         zd,
         [_make_site()],
@@ -242,7 +242,7 @@ def test_run_iteration_failure_callback_for_unresolved_site(
     zd = _zd_with_tickets({101: ticket}, [101])
 
     callbacks = MagicMock()
-    state: State = {"version": watcher.STATE_VERSION, "triaged": {}}
+    state: State = State(version=watcher.STATE_VERSION, triaged={})
     watcher.run_iteration(
         zd,
         [_make_site()],
@@ -280,7 +280,7 @@ def test_run_iteration_failure_callback_for_save_error(
     monkeypatch.setattr("triage_cli.render.save_note", fail_save)
 
     callbacks = MagicMock()
-    state: State = {"version": watcher.STATE_VERSION, "triaged": {}}
+    state: State = State(version=watcher.STATE_VERSION, triaged={})
     watcher.run_iteration(
         zd,
         [_make_site()],

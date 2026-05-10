@@ -11,7 +11,7 @@ import triage_cli.inbox.app as app_module
 from triage_cli.inbox.app import InboxApp
 from triage_cli.inbox.widgets import ReportPaneWidget, TicketListWidget
 from triage_cli.models import TimeWindow, TriageReport
-from triage_cli.watcher import WatcherOptions
+from triage_cli.watcher import State, WatcherOptions
 
 
 def _opts(tmp_path: Path) -> WatcherOptions:
@@ -291,7 +291,7 @@ def test_poll_tick_assigns_state_on_event_loop(tmp_path: Path, monkeypatch) -> N
     def run_iteration_blocking(self: InboxApp, state):
         # Worker thread observes the state passed in; it must NOT mutate self._state itself.
         seen_state_ids.append(id(state))
-        return {"version": 1, "triaged": {"abc": "ts"}}
+        return State(version=2, triaged={"abc": "ts"})
 
     monkeypatch.setattr(InboxApp, "_run_iteration_blocking", run_iteration_blocking)
 
@@ -302,7 +302,7 @@ def test_poll_tick_assigns_state_on_event_loop(tmp_path: Path, monkeypatch) -> N
         # The worker saw the original state object…
         assert seen_state_ids == [original_state_id]
         # …and after _poll_tick returns, the event loop has installed the new one.
-        assert app._state == {"version": 1, "triaged": {"abc": "ts"}}
+        assert app._state == State(version=2, triaged={"abc": "ts"})
 
     asyncio.run(run())
 
@@ -361,7 +361,7 @@ def test_run_iteration_blocking_uses_watcher_dependencies(
             },
         )
         on_view_listed([])  # must call so _run_iteration_blocking doesn't raise
-        return {"version": 1, "triaged": {"123": "timestamp"}}
+        return State(version=2, triaged={"123": "timestamp"})
 
     def prune_state(state):
         captured["pruned_state"] = state
@@ -385,12 +385,13 @@ def test_run_iteration_blocking_uses_watcher_dependencies(
     assert captured["site_map_path"] == Path("data/cnc-map.json")
     assert captured["zd"] is zd
     assert captured["sites"] == sites
-    assert captured["state"] == {"version": 1, "triaged": {}}
+    assert captured["state"].version == 2
+    assert captured["state"].triaged == {}
     assert captured["opts"] is opts
     assert captured["dd_client"] is dd
     assert captured["backfill_cutoff"].tzinfo is UTC
     assert all(callable(callback) for callback in captured["callbacks"])
-    assert new_state == {"version": 1, "triaged": {"123": "timestamp"}}
+    assert new_state == State(version=2, triaged={"123": "timestamp"})
     assert saved == {"path": opts.state_file, "state": new_state}
     assert captured["backfill_cutoff"] == app._backfill_cutoff
 
@@ -421,7 +422,7 @@ def test_run_iteration_blocking_keeps_stable_backfill_cutoff(
     ):
         cutoffs.append(backfill_cutoff)
         on_view_listed([])  # must call so _run_iteration_blocking doesn't raise
-        return {"version": 1, "triaged": {}}
+        return State(version=2, triaged={})
 
     monkeypatch.setattr(app_module.extract, "load_site_map", lambda _path: [])
     monkeypatch.setattr(app_module.ZendeskClient, "from_env", lambda: Context())
@@ -463,7 +464,7 @@ def test_run_iteration_blocking_routes_watcher_stderr_to_log(
     def run_iteration(*_args, on_view_listed, **_kwargs):
         print("watcher status line", file=sys.stderr)
         on_view_listed([])  # must call so _run_iteration_blocking doesn't raise
-        return {"version": 1, "triaged": {}}
+        return State(version=2, triaged={})
 
     monkeypatch.setattr(app_module.extract, "load_site_map", lambda _path: [])
     monkeypatch.setattr(app_module.ZendeskClient, "from_env", lambda: Context())

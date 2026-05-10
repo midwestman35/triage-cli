@@ -21,16 +21,17 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+
+from pydantic import BaseModel
 
 from triage_cli import extract, pipeline, render
 from triage_cli.datadog import DatadogClient
-from triage_cli.models import SiteEntry, Ticket, TriageReport
+from triage_cli.models import SiteEntry, Ticket, TriageReport, WatcherUIState
 from triage_cli.zendesk import ZendeskClient
 
 logger = logging.getLogger(__name__)
 
-STATE_VERSION = 1
+STATE_VERSION = 2
 DEFAULT_PRUNE_CAP = 1000
 
 
@@ -48,17 +49,25 @@ class WatcherOptions:
     redact_enabled: bool = True
 
 
-State = dict[str, Any]
+class State(BaseModel):
+    """Watcher state persisted between runs."""
+
+    version: int = STATE_VERSION
+    triaged: dict[str, str] = {}
+    ui: WatcherUIState | None = None
+
+    model_config = {"arbitrary_types_allowed": True}
 
 
 def _empty_state() -> State:
-    return {"version": STATE_VERSION, "triaged": {}}
+    return State(version=STATE_VERSION, triaged={}, ui=WatcherUIState())
 
 
 def load_state(path: Path) -> State:
     """Load a watcher state file. Returns the empty default when missing.
 
     Raises RuntimeError on a version we don't understand.
+    Forward-migrates v1 → v2 by populating ui with defaults.
     """
     if not path.exists():
         return _empty_state()
@@ -68,23 +77,24 @@ def load_state(path: Path) -> State:
         raise RuntimeError(f"State file {path} contains invalid JSON: {e}") from e
     if not isinstance(raw, dict) or "version" not in raw or "triaged" not in raw:
         raise RuntimeError(f"State file {path} is not a valid watcher state object")
-    version = raw["version"]
-    if version != STATE_VERSION:
-        raise RuntimeError(
-            f"State file {path} has version {version}; this watcher supports "
-            f"version {STATE_VERSION}"
+    version = raw.get("version", 1)
+    if version == STATE_VERSION:
+        return State(**raw)
+    if version == 1:
+        # Forward-migrate: v1 had no ui block.
+        return State(
+            version=STATE_VERSION,
+            triaged=raw.get("triaged", {}),
+            ui=WatcherUIState(),
         )
-    triaged = raw["triaged"]
-    if not isinstance(triaged, dict):
-        raise RuntimeError(f"State file {path} 'triaged' must be an object")
-    return {"version": STATE_VERSION, "triaged": dict(triaged)}
+    raise RuntimeError(f"Unknown watcher state version: {version}")
 
 
 def save_state(path: Path, state: State) -> None:
     """Atomically write the state file (tempfile + os.replace)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.parent / (path.name + ".tmp")
-    tmp.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+    tmp.write_text(json.dumps(state.model_dump(), indent=2, sort_keys=True), encoding="utf-8")
     os.replace(tmp, path)
 
 
@@ -99,7 +109,7 @@ def should_triage(ticket: Ticket, state: State, backfill_cutoff: datetime) -> bo
       - If state has an older updated_at OR no entry at all (and we're past
         the cutoff check), triage.
     """
-    triaged = state.get("triaged") or {}
+    triaged = state.triaged or {}
     key = str(ticket.id)
     stored = triaged.get(key)
     if stored is None:
@@ -117,12 +127,12 @@ def should_triage(ticket: Ticket, state: State, backfill_cutoff: datetime) -> bo
 
 def prune_state(state: State, max_entries: int = DEFAULT_PRUNE_CAP) -> State:
     """Keep at most max_entries triaged entries, dropping the oldest by timestamp."""
-    triaged = state.get("triaged") or {}
+    triaged = state.triaged or {}
     if len(triaged) <= max_entries:
-        return {"version": STATE_VERSION, "triaged": dict(triaged)}
+        return State(version=STATE_VERSION, triaged=dict(triaged), ui=state.ui)
     items = sorted(triaged.items(), key=lambda kv: kv[1], reverse=True)
     kept = dict(items[:max_entries])
-    return {"version": STATE_VERSION, "triaged": kept}
+    return State(version=STATE_VERSION, triaged=kept, ui=state.ui)
 
 
 def _now_local_hms() -> str:
@@ -147,8 +157,8 @@ def run_iteration(
     on_failure: Callable[[int, str], None] | None = None,
 ) -> State:
     """Run one poll-and-triage pass over the view. Returns the updated state."""
-    triaged_map: dict[str, str] = dict(state.get("triaged") or {})
-    new_state: State = {"version": STATE_VERSION, "triaged": triaged_map}
+    triaged_map: dict[str, str] = dict(state.triaged or {})
+    ui = state.ui
 
     try:
         if opts.view_id is None:
@@ -161,7 +171,7 @@ def run_iteration(
         if opts.view_id is not None and str(e).startswith(f"View {opts.view_id} not found"):
             raise
         _emit(f"[{_now_local_hms()}] iteration aborted: {e}")
-        return new_state
+        return State(version=STATE_VERSION, triaged=triaged_map, ui=ui)
 
     if on_view_listed is not None:
         on_view_listed(view_ids)
@@ -177,7 +187,8 @@ def run_iteration(
             continue
 
         stored = triaged_map.get(key)
-        if not should_triage(ticket, new_state, backfill_cutoff):
+        _snap = State(version=STATE_VERSION, triaged=triaged_map, ui=ui)
+        if not should_triage(ticket, _snap, backfill_cutoff):
             if stored is None:
                 # First-run silent backfill: mark as seen, no note.
                 triaged_map[key] = ticket.updated_at.isoformat()
@@ -234,7 +245,7 @@ def run_iteration(
             print(render.to_markdown(report).rstrip() + "\n---", flush=True)
         triaged_map[key] = ticket.updated_at.isoformat()
 
-    return new_state
+    return State(version=STATE_VERSION, triaged=triaged_map, ui=ui)
 
 
 def run_watch(opts: WatcherOptions) -> None:

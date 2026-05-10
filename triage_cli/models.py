@@ -77,6 +77,12 @@ def _render_pasted(p: PastedEvidence) -> list[str]:
     return [f"- {p.label}", indent_continuations(f"  {truncated}")]
 
 
+class WatcherUIState(BaseModel):
+    """Per-view UI preferences persisted in the watcher state file."""
+
+    density: Literal["compact", "comfortable"] = "comfortable"
+
+
 class AnchorSource(StrEnum):
     """Where the anchor timestamp on a TriageBundle came from."""
 

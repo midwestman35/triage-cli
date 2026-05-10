@@ -10,6 +10,7 @@ import pytest
 
 from triage_cli.models import SiteEntry, Ticket, TimeWindow, TriageReport
 from triage_cli.watcher import (
+    State,
     WatcherOptions,
     load_state,
     prune_state,
@@ -63,19 +64,22 @@ def _report(ticket_id: int, generated_at: datetime) -> TriageReport:
 
 def test_load_state_returns_empty_default_when_missing(tmp_path: Path) -> None:
     state = load_state(tmp_path / "missing.json")
-    assert state == {"version": 1, "triaged": {}}
+    assert state.version == 2
+    assert state.triaged == {}
 
 
 def test_load_state_round_trips_save_state(tmp_path: Path) -> None:
     path = tmp_path / "state.json"
-    original = {"version": 1, "triaged": {"42": "2026-05-07T12:00:00+00:00"}}
+    original = State(version=2, triaged={"42": "2026-05-07T12:00:00+00:00"})
     save_state(path, original)
-    assert load_state(path) == original
+    loaded = load_state(path)
+    assert loaded.version == 2
+    assert loaded.triaged == {"42": "2026-05-07T12:00:00+00:00"}
 
 
 def test_save_state_atomic_no_temp_left_behind(tmp_path: Path) -> None:
     path = tmp_path / "state.json"
-    save_state(path, {"version": 1, "triaged": {}})
+    save_state(path, State(version=2, triaged={}))
     assert path.exists()
     assert not (path.parent / (path.name + ".tmp")).exists()
 
@@ -83,14 +87,14 @@ def test_save_state_atomic_no_temp_left_behind(tmp_path: Path) -> None:
 def test_load_state_rejects_unknown_version(tmp_path: Path) -> None:
     path = tmp_path / "state.json"
     path.write_text('{"version": 99, "triaged": {}}', encoding="utf-8")
-    with pytest.raises(RuntimeError, match="version 99"):
+    with pytest.raises(RuntimeError, match="99"):
         load_state(path)
 
 
 def test_should_triage_true_when_absent_and_within_cutoff() -> None:
     now = datetime(2026, 5, 7, 12, 0, 0, tzinfo=UTC)
     cutoff = now - timedelta(hours=24)
-    state = {"version": 1, "triaged": {}}
+    state = State(version=2, triaged={})
     assert should_triage(_ticket(42, now), state, cutoff) is True
 
 
@@ -98,14 +102,14 @@ def test_should_triage_false_when_absent_but_older_than_cutoff() -> None:
     now = datetime(2026, 5, 7, 12, 0, 0, tzinfo=UTC)
     cutoff = now - timedelta(hours=1)
     older = now - timedelta(hours=2)
-    state = {"version": 1, "triaged": {}}
+    state = State(version=2, triaged={})
     assert should_triage(_ticket(42, older), state, cutoff) is False
 
 
 def test_should_triage_false_when_state_matches_updated_at() -> None:
     when = datetime(2026, 5, 7, 12, 0, 0, tzinfo=UTC)
     cutoff = when - timedelta(hours=24)
-    state = {"version": 1, "triaged": {"42": when.isoformat()}}
+    state = State(version=2, triaged={"42": when.isoformat()})
     assert should_triage(_ticket(42, when), state, cutoff) is False
 
 
@@ -113,7 +117,7 @@ def test_should_triage_true_when_ticket_newer_than_state() -> None:
     earlier = datetime(2026, 5, 7, 12, 0, 0, tzinfo=UTC)
     later = earlier + timedelta(minutes=5)
     cutoff = earlier - timedelta(hours=24)
-    state = {"version": 1, "triaged": {"42": earlier.isoformat()}}
+    state = State(version=2, triaged={"42": earlier.isoformat()})
     assert should_triage(_ticket(42, later), state, cutoff) is True
 
 
@@ -124,9 +128,9 @@ def test_prune_state_keeps_n_most_recent() -> None:
         "3": "2026-05-03T12:00:00+00:00",
         "4": "2026-05-04T12:00:00+00:00",
     }
-    state = {"version": 1, "triaged": triaged}
+    state = State(version=2, triaged=triaged)
     pruned = prune_state(state, max_entries=2)
-    assert set(pruned["triaged"].keys()) == {"3", "4"}
+    assert set(pruned.triaged.keys()) == {"3", "4"}
 
 
 def test_should_triage_handles_naive_stored_timestamp() -> None:
@@ -134,7 +138,7 @@ def test_should_triage_handles_naive_stored_timestamp() -> None:
     when = datetime(2026, 5, 7, 12, 0, 0, tzinfo=UTC)
     cutoff = when - timedelta(hours=24)
     # Naive (no offset) — externally edited / older format.
-    state = {"version": 1, "triaged": {"42": "2026-05-07T12:00:00"}}
+    state = State(version=2, triaged={"42": "2026-05-07T12:00:00"})
     # Same wall time → not newer → should NOT triage.
     assert should_triage(_ticket(42, when), state, cutoff) is False
     # 5 minutes later → newer → SHOULD triage.
@@ -191,11 +195,11 @@ def test_run_iteration_marks_only_successfully_triaged(
         lambda report, tid: (tmp_path / f"{tid}.md", tmp_path / f"{tid}.json"),
     )
 
-    state = {"version": 1, "triaged": {}}
+    state = State(version=2, triaged={})
     opts = _opts(tmp_path / "state.json")
     new_state = run_iteration(zd, stub_sites, state, opts, cutoff, dd_client=None)
 
-    assert new_state["triaged"] == {"1": now.isoformat()}
+    assert new_state.triaged == {"1": now.isoformat()}
 
 
 def test_run_iteration_status_lines(
@@ -229,7 +233,7 @@ def test_run_iteration_status_lines(
         lambda report, tid: (tmp_path / f"{tid}.md", tmp_path / f"{tid}.json"),
     )
 
-    state = {"version": 1, "triaged": {"4": now.isoformat()}}
+    state = State(version=2, triaged={"4": now.isoformat()})
     opts = WatcherOptions(
         view_id=1,
         interval=300,
@@ -283,7 +287,7 @@ def test_run_iteration_print_notes_uses_rendered_markdown(
         raising=False,
     )
 
-    state = {"version": 1, "triaged": {}}
+    state = State(version=2, triaged={})
     opts = WatcherOptions(
         view_id=1,
         interval=300,
@@ -324,11 +328,11 @@ def test_run_iteration_silent_backfill_marks_old_tickets_no_status(
 
     monkeypatch.setattr("triage_cli.pipeline.triage_one", boom)
 
-    state = {"version": 1, "triaged": {}}
+    state = State(version=2, triaged={})
     opts = _opts(tmp_path / "state.json")
     new_state = run_iteration(zd, stub_sites, state, opts, cutoff, dd_client=None)
 
-    assert new_state["triaged"] == {"99": older.isoformat()}
+    assert new_state.triaged == {"99": older.isoformat()}
     err = capsys.readouterr().err
     # No status line for ticket 99 — silent backfill.
     assert "#99" not in err
@@ -342,9 +346,8 @@ def test_run_watch_saves_state_on_keyboard_interrupt(
     saved: list[Any] = []
 
     def fake_run_iteration(zd, sites, state, opts, cutoff, dd_client):  # noqa: ARG001
-        # Mutate state to simulate work done; then signal stop on next loop.
-        state["triaged"]["111"] = "2026-05-07T12:00:00+00:00"
-        # Raise on the second call by tracking iteration count via closure.
+        # Mutate state.triaged in place, then signal stop.
+        state.triaged["111"] = "2026-05-07T12:00:00+00:00"
         raise KeyboardInterrupt
 
     def fake_save_state(path: Path, state: Any) -> None:
@@ -384,7 +387,7 @@ def test_run_watch_saves_state_on_keyboard_interrupt(
 
     # save_state was called at least once and the saved state has the
     # mutation from fake_run_iteration.
-    assert any("111" in s["triaged"] for _, s in saved)
+    assert any("111" in s.triaged for _, s in saved)
 
 
 def test_run_iteration_silent_backfill_does_not_double_triage(
@@ -416,13 +419,13 @@ def test_run_iteration_silent_backfill_does_not_double_triage(
         lambda report, tid: (tmp_path / f"{tid}.md", tmp_path / f"{tid}.json"),
     )
 
-    state = {"version": 1, "triaged": {}}
+    state = State(version=2, triaged={})
     opts = _opts(tmp_path / "state.json")
 
     # First iteration: backfill-silent, no triage call.
     state = run_iteration(zd, stub_sites, state, opts, cutoff, dd_client=None)
     assert triage_calls == []
-    assert state["triaged"] == {"99": older.isoformat()}
+    assert state.triaged == {"99": older.isoformat()}
 
     # Second iteration: same ticket, same updated_at — should be unchanged, no triage.
     state = run_iteration(zd, stub_sites, state, opts, cutoff, dd_client=None)
@@ -430,6 +433,42 @@ def test_run_iteration_silent_backfill_does_not_double_triage(
     err = capsys.readouterr().err
     # Second iteration should now emit "unchanged" since prior entry exists.
     assert "#99 unchanged" in err
+
+
+def test_state_migrates_v1_to_v2_on_read(tmp_path) -> None:
+    """A v1 state file should be readable; the read should populate ui.density."""
+    import json
+
+    from triage_cli.watcher import load_state
+
+    v1_file = tmp_path / "watcher-state-test.json"
+    v1_file.write_text(json.dumps({
+        "version": 1,
+        "triaged": {"123": "2026-05-09T12:00:00+00:00"},
+    }))
+
+    state = load_state(v1_file)
+    assert state.version == 2
+    assert state.ui is not None
+    assert state.ui.density == "comfortable"
+    assert state.triaged == {"123": "2026-05-09T12:00:00+00:00"}
+
+
+def test_state_density_round_trip(tmp_path) -> None:
+    """Writing then reading a v2 state file preserves ui.density."""
+    from triage_cli.watcher import WatcherUIState, load_state, save_state
+
+    v2_state = State(
+        version=2,
+        triaged={"5": "2026-05-09T12:00:00+00:00"},
+        ui=WatcherUIState(density="compact"),
+    )
+    target = tmp_path / "watcher-state-test.json"
+    save_state(target, v2_state)
+
+    loaded = load_state(target)
+    assert loaded.ui is not None
+    assert loaded.ui.density == "compact"
 
 
 class _DummyCM:
