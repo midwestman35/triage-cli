@@ -104,3 +104,27 @@ def test_redacts_address_and_phone_together() -> None:
     assert "<PHONE>" in out
     assert counts.addresses == 1
     assert counts.phones == 1
+
+
+def test_redacts_decimal_coords_comma() -> None:
+    out, counts = redact("Caller at 33.7490, -84.3880 reported.")
+    assert "<COORDS>" in out
+    assert counts.coords == 1
+
+
+def test_redacts_decimal_coords_space() -> None:
+    out, counts = redact("Coords: 40.7128 -74.0060 confirmed.")
+    assert "<COORDS>" in out
+    assert counts.coords == 1
+
+
+def test_does_not_redact_low_precision_pairs() -> None:
+    # Version numbers, prices, etc. — require 4+ decimals.
+    out, counts = redact("Version 1.23, build 4.56 deployed.")
+    assert "<COORDS>" not in out
+    assert counts.coords == 0
+
+
+def test_redacts_multiple_coord_pairs() -> None:
+    _out, counts = redact("Pings: 33.7490, -84.3880 then 40.7128, -74.0060.")
+    assert counts.coords == 2
