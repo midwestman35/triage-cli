@@ -47,11 +47,10 @@ _STREET_SUFFIXES = (
 # Pattern: leading digit(s), at least one capitalized word, then a suffix.
 # City and beyond are intentionally excluded so site-lookup is unaffected.
 _ADDRESS_PATTERN = re.compile(
-    r"\b\d+\s+"                       # house number
-    r"(?:[A-Z][A-Za-z0-9]*\s+)+"      # ≥1 capitalized word(s) (street name)
-    r"(?:" + _STREET_SUFFIXES + r")"  # street type suffix
+    r"\b\d+\s+"                        # house number
+    r"(?:[A-Z][A-Za-z'-]*\s+)+"        # ≥1 capitalized word(s) (street name)
+    r"(?:" + _STREET_SUFFIXES + r")"   # street type suffix
     r"\b",
-    re.IGNORECASE,
 )
 
 
@@ -83,6 +82,8 @@ def redact(text: str) -> tuple[str, RedactionCounts]:
     text = _PHONE_PATTERN.sub(_sub_phone, text)
 
     def _sub_address(m: re.Match[str]) -> str:
+        if _is_pre_redacted(m.group(0)):
+            return m.group(0)
         counts.addresses += 1
         return "<ADDR>"
 
