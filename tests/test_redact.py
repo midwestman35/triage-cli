@@ -61,3 +61,46 @@ def test_bare_numeric_call_id_is_redacted_known_gap() -> None:
     out, counts = redact("Call-ID: 5551234567 initiated.")
     assert "<PHONE>" in out
     assert counts.phones == 1
+
+
+# ---------------------------------------------------------------------------
+# Address redaction tests (Task 1.2)
+# ---------------------------------------------------------------------------
+
+
+def test_redacts_simple_address() -> None:
+    out, counts = redact("Caller located at 123 Main St reported incident.")
+    assert "<ADDR>" in out
+    assert counts.addresses == 1
+
+
+def test_redacts_with_avenue_and_other_suffixes() -> None:
+    """Real-world addresses always have a street name before the suffix.
+    Bare ``<number> <suffix>`` shapes (e.g., "55 Highway", "9 Circle")
+    are not real addresses in 911 dispatch and are not handled by design.
+    """
+    for s in ("789 Oak Ave", "12 First Boulevard", "1 Court Place"):
+        out, counts = redact(f"Caller at {s} confirmed.")
+        assert "<ADDR>" in out, f"failed for {s!r}"
+        assert counts.addresses == 1
+
+
+def test_address_redaction_preserves_city() -> None:
+    out, counts = redact("Dispatch to 456 Elm Street, Springfield for backup.")
+    assert "<ADDR>" in out
+    assert "Springfield" in out
+    assert counts.addresses == 1
+
+
+def test_does_not_redact_bare_number_without_street() -> None:
+    out, counts = redact("Ticket #1234 opened at 09:00.")
+    assert "<ADDR>" not in out
+    assert counts.addresses == 0
+
+
+def test_redacts_address_and_phone_together() -> None:
+    out, counts = redact("Caller at 321 Pine Rd called from 555-867-5309.")
+    assert "<ADDR>" in out
+    assert "<PHONE>" in out
+    assert counts.addresses == 1
+    assert counts.phones == 1
