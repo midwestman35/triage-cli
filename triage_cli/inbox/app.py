@@ -21,7 +21,7 @@ from triage_cli import extract, pipeline, render, watcher
 from triage_cli.datadog import DatadogClient
 from triage_cli.inbox import clipboard, hydrate
 from triage_cli.inbox.widgets import ReportPaneWidget, RowEntry, Status, TicketListWidget
-from triage_cli.models import SiteEntry, Ticket, TriageReport
+from triage_cli.models import SiteEntry, Ticket, TriageReport, WatcherUIState
 from triage_cli.render import DEFAULT_OUTPUT_DIR
 from triage_cli.watcher import State, WatcherOptions
 from triage_cli.zendesk import ZendeskClient
@@ -74,6 +74,7 @@ class InboxApp(App):
         Binding("down,j", "cursor_down", "down", priority=True),
         Binding("enter", "focus_detail", "focus", priority=True),
         Binding("escape", "focus_list", "", priority=True),
+        Binding("d", "cycle_density", "density", priority=True),
         Binding("r", "refresh", "refresh", priority=True),
         Binding("y", "copy_note", "copy", priority=True),
         Binding("o", "open_zendesk", "open", priority=True),
@@ -351,6 +352,24 @@ class InboxApp(App):
 
     def action_focus_list(self) -> None:
         self.query_one("#list", TicketListWidget).focus()
+
+    def action_cycle_density(self) -> None:
+        """Toggle row density between compact/comfortable; persist to state file."""
+        new = "compact" if self._density == "comfortable" else "comfortable"
+        self._density = new
+
+        list_widget = self.query_one("#list", TicketListWidget)
+        list_widget.density = new
+        self._refresh_list()
+
+        state = watcher.load_state(self.opts.state_file)
+        if state.ui is None:
+            state.ui = WatcherUIState(density=new)
+        else:
+            state.ui.density = new
+        watcher.save_state(self.opts.state_file, state)
+
+        self.notify(f"density: {new}", timeout=2)
 
     async def _triage_ticket_async(self, ticket_id: int) -> None:
         try:

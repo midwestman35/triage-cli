@@ -455,6 +455,48 @@ def _build_app_with_one_row(tmp_path: Path, *, density: str = "comfortable") -> 
     return InboxApp(_opts(tmp_path), notes_dir=tmp_path, poll_on_mount=False, density=density)
 
 
+def load_state_for_test(tmp_path: Path):
+    """Load the watcher state file written by the test fixture.
+
+    _opts sets state_file=tmp_path / 'state.json'.
+    """
+    from triage_cli.watcher import load_state
+    state_file = tmp_path / "state.json"
+    return load_state(state_file)
+
+
+def test_pressing_d_toggles_density_and_persists(tmp_path: Path) -> None:
+    """The 'd' keybinding cycles density and writes the new value to state."""
+    async def run() -> None:
+        app = _build_app_with_one_row(tmp_path, density="comfortable")
+        async with app.run_test() as pilot:
+            await pilot.press("d")
+            await pilot.pause()
+            table = app.query_one("#list", TicketListWidget)
+            assert table.density == "compact"
+        # State persisted to disk — load and verify
+        state = load_state_for_test(tmp_path)
+        assert state.ui is not None
+        assert state.ui.density == "compact"
+
+    asyncio.run(run())
+
+
+def test_pressing_d_again_cycles_back(tmp_path: Path) -> None:
+    """Two presses of 'd' return to the starting density."""
+    async def run() -> None:
+        app = _build_app_with_one_row(tmp_path, density="comfortable")
+        async with app.run_test() as pilot:
+            await pilot.press("d")
+            await pilot.pause()
+            await pilot.press("d")
+            await pilot.pause()
+            table = app.query_one("#list", TicketListWidget)
+            assert table.density == "comfortable"
+
+    asyncio.run(run())
+
+
 def test_ticket_list_widget_density_compact(tmp_path: Path) -> None:
     """Compact density: TicketListWidget reports density == 'compact'."""
 
