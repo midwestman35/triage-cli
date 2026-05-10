@@ -77,6 +77,18 @@ def to_markdown(report: TriageReport) -> str:
         lines.append("")
 
     lines.extend(["## Suggested Internal Note", report.suggested_note])
+
+    if (
+        report.context_summary is not None
+        and report.context_summary.kept < report.context_summary.candidates
+    ):
+        elided = report.context_summary.candidates - report.context_summary.kept
+        total = report.context_summary.candidates
+        lines.append(
+            f"\n> Note: {elided} of {total} log lines elided by relevance scoring "
+            "(severity, subject match, anchor proximity).",
+        )
+
     return "\n".join(lines)
 
 
@@ -114,6 +126,21 @@ def rich_layout(report: TriageReport) -> ConsoleRenderable:
         )
 
     panels.append(_panel(report.suggested_note, "Suggested Internal Note", "green"))
+
+    if (
+        report.context_summary is not None
+        and report.context_summary.kept < report.context_summary.candidates
+    ):
+        elided = report.context_summary.candidates - report.context_summary.kept
+        total = report.context_summary.candidates
+        panels.append(
+            Text(
+                f"Note: {elided} of {total} log lines elided by relevance scoring "
+                "(severity, subject match, anchor proximity).",
+                style="dim",
+            )
+        )
+
     return Group(*panels)
 
 

@@ -136,6 +136,54 @@ def test_save_note_to_workspace_dir(tmp_path: Path) -> None:
     assert json_path.exists()
 
 
+def test_render_includes_elision_note_when_lines_dropped(capsys) -> None:
+    """If context_summary.kept < candidates, render appends a small footnote."""
+    from triage_cli.context import ContextSummary
+    from triage_cli.render import print_note
+
+    report = TriageReport(
+        finding="x", confidence="medium", evidence=[], suggested_note="x",
+        ticket_id=1, site_name="acme",
+        window=TimeWindow(start=datetime(2026, 5, 7, 14, 0, 0, tzinfo=UTC),
+                          end=datetime(2026, 5, 7, 14, 15, 0, tzinfo=UTC)),
+        sources=["zendesk"], log_event_count=200,
+        generated_at=datetime(2026, 5, 7, 14, 15, 0, tzinfo=UTC),
+        context_summary=ContextSummary(
+            candidates=200, kept=47, budget_tokens=6000, used_tokens=5800,
+        ),
+    )
+
+    # Force non-TTY path so capsys captures stdout cleanly.
+    buf = io.StringIO()
+    console = Console(file=buf, force_terminal=False, width=120)
+    print_note(report, console=console)
+    out = buf.getvalue()
+    assert "153 of 200 log lines elided" in out
+
+
+def test_render_omits_elision_note_when_no_lines_dropped(capsys) -> None:
+    from triage_cli.context import ContextSummary
+    from triage_cli.render import print_note
+
+    report = TriageReport(
+        finding="x", confidence="medium", evidence=[], suggested_note="x",
+        ticket_id=1, site_name="acme",
+        window=TimeWindow(start=datetime(2026, 5, 7, 14, 0, 0, tzinfo=UTC),
+                          end=datetime(2026, 5, 7, 14, 15, 0, tzinfo=UTC)),
+        sources=["zendesk"], log_event_count=12,
+        generated_at=datetime(2026, 5, 7, 14, 15, 0, tzinfo=UTC),
+        context_summary=ContextSummary(
+            candidates=12, kept=12, budget_tokens=6000, used_tokens=200,
+        ),
+    )
+
+    buf = io.StringIO()
+    console = Console(file=buf, force_terminal=False, width=120)
+    print_note(report, console=console)
+    out = buf.getvalue()
+    assert "elided" not in out
+
+
 def test_save_note_strips_content_url_from_json(tmp_path: Path) -> None:
     """No matter what's in the report, the saved JSON has no content_url field."""
     import json as _json  # noqa: PLC0415
