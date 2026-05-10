@@ -10,7 +10,12 @@ for the prompt.
 """
 from __future__ import annotations
 
+import re
+from datetime import datetime
+
 from pydantic import BaseModel
+
+from triage_cli.models import LogLine
 
 
 class ContextSummary(BaseModel):
@@ -26,8 +31,6 @@ def estimate_tokens(text: str) -> int:
     """Approximate tokens as ``len(text) // 4`` (no tokenizer dep, by design)."""
     return len(text) // 4
 
-
-import re
 
 _STOPWORDS = frozenset({
     "the", "and", "for", "with", "from", "this", "that", "has", "have",
@@ -49,10 +52,6 @@ def extract_subject_tokens(subject: str) -> list[str]:
         out.append(tok)
     return out
 
-
-from datetime import datetime
-
-from triage_cli.models import LogLine
 
 _SEVERITY_SCORES = {"error": 5, "warn": 3, "info": 1, "debug": 0}
 

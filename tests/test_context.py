@@ -1,6 +1,15 @@
 # tests/test_context.py
 """Tests for triage_cli.context (token-aware log selection)."""
-from triage_cli.context import ContextSummary, estimate_tokens
+from datetime import UTC, datetime, timedelta
+
+from triage_cli.context import (
+    ContextSummary,
+    build_log_section,
+    estimate_tokens,
+    extract_subject_tokens,
+    score_log_line,
+)
+from triage_cli.models import LogLine
 
 
 def test_estimate_tokens_is_chars_over_four() -> None:
@@ -13,9 +22,6 @@ def test_context_summary_fields() -> None:
     s = ContextSummary(candidates=200, kept=47, budget_tokens=6000, used_tokens=5921)
     assert s.candidates == 200
     assert s.kept == 47
-
-
-from triage_cli.context import extract_subject_tokens
 
 
 def test_extract_subject_tokens_lowercases() -> None:
@@ -37,12 +43,6 @@ def test_extract_subject_tokens_drops_stopwords() -> None:
 def test_extract_subject_tokens_dedupes() -> None:
     tokens = extract_subject_tokens("network network issue with network")
     assert tokens.count("network") == 1
-
-
-from datetime import UTC, datetime, timedelta
-
-from triage_cli.context import score_log_line
-from triage_cli.models import LogLine
 
 
 def _line(level: str, msg: str, ts: datetime | None = None) -> LogLine:
@@ -78,9 +78,6 @@ def test_score_dedupe_penalty() -> None:
     anchor = datetime(2026, 5, 10, 12, 0, 0, tzinfo=UTC)
     line = _line("error", "duplicate")
     assert score_log_line(line, anchor, [], {"duplicate"}) == 2  # error(5) - dedupe(3)
-
-
-from triage_cli.context import build_log_section
 
 
 def test_build_log_section_tiny_input_fast_path() -> None:

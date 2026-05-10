@@ -346,7 +346,7 @@ def test_investigate_datadog_error_then_pipeline_failure_dies_cleanly(
 # --no-redact flag propagation tests
 # ---------------------------------------------------------------------------
 
-def _make_fake_triage_one_capture(captured: list) -> "callable":
+def _make_fake_triage_one_capture(captured: list) -> callable:
     """Return a fake triage_one that records kwargs and returns a canned TriageReport."""
     from triage_cli.models import TimeWindow, TriageReport
 

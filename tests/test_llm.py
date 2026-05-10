@@ -99,12 +99,16 @@ def test_triage_redacts_phone_in_ticket_before_llm(monkeypatch) -> None:
         captured["prompt"] = prompt
         return '{"finding": "x", "confidence": "low", "evidence": [], "suggested_note": "x"}'
 
+    import asyncio
+    from datetime import UTC, datetime
+
     from triage_cli import llm
     from triage_cli.models import (
-        AnchorSource, SiteEntry, Ticket, TriageBundle,
+        AnchorSource,
+        SiteEntry,
+        Ticket,
+        TriageBundle,
     )
-    from datetime import datetime, UTC
-    import asyncio
 
     monkeypatch.setattr(llm, "_collect_text", fake_collect)
 
@@ -141,12 +145,16 @@ def test_triage_no_redact_kwarg_passes_raw(monkeypatch) -> None:
         captured["prompt"] = prompt
         return '{"finding": "x", "confidence": "low", "evidence": [], "suggested_note": "x"}'
 
+    import asyncio
+    from datetime import UTC, datetime
+
     from triage_cli import llm
     from triage_cli.models import (
-        AnchorSource, SiteEntry, Ticket, TriageBundle,
+        AnchorSource,
+        SiteEntry,
+        Ticket,
+        TriageBundle,
     )
-    from datetime import datetime, UTC
-    import asyncio
 
     monkeypatch.setattr(llm, "_collect_text", fake_collect)
 

@@ -512,9 +512,10 @@ def test_as_user_message_no_trailing_whitespace_only_lines():
 
 
 def test_triage_report_accepts_optional_redaction_summary() -> None:
-    from triage_cli.models import TriageReport, TimeWindow
+    from datetime import UTC, datetime
+
+    from triage_cli.models import TimeWindow, TriageReport
     from triage_cli.redact import RedactionCounts
-    from datetime import datetime, UTC
 
     report = TriageReport(
         finding="x",

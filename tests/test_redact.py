@@ -1,7 +1,7 @@
 """Tests for triage_cli.redact (PII redactor at the LLM boundary)."""
 from __future__ import annotations
 
-from triage_cli.redact import RedactionCounts, redact
+from triage_cli.redact import redact
 
 
 def test_redacts_simple_phone() -> None:
