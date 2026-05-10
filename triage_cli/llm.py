@@ -125,12 +125,12 @@ def _maybe_redact(text: str, *, enabled: bool) -> tuple[str, RedactionCounts]:
 
 async def triage(
     bundle: TriageBundle,
-    model: str | None = None,
     *,
+    model: str | None = None,
     verbose: bool = False,
     redact_enabled: bool = True,
-) -> LLMTriageOutput:
-    """Run the main triage call. Returns a parsed `LLMTriageOutput`.
+) -> tuple[LLMTriageOutput, RedactionCounts]:
+    """Run the main triage call. Returns a parsed `LLMTriageOutput` and redaction counts.
 
     On malformed JSON, retries once with a stricter nudge appended to the
     user prompt. Verbose mode logs the first-attempt failure. Second failure
@@ -155,7 +155,8 @@ async def triage(
         model=resolved,
     )).strip()
     try:
-        return LLMTriageOutput.model_validate_json(_strip_code_fence(raw))
+        llm_output = LLMTriageOutput.model_validate_json(_strip_code_fence(raw))
+        return llm_output, counts
     except (json.JSONDecodeError, ValidationError) as e:
         if verbose:
             logger.warning(
@@ -173,7 +174,8 @@ async def triage(
             model=resolved,
         )).strip()
         try:
-            return LLMTriageOutput.model_validate_json(_strip_code_fence(raw2))
+            llm_output = LLMTriageOutput.model_validate_json(_strip_code_fence(raw2))
+            return llm_output, counts
         except (json.JSONDecodeError, ValidationError) as e2:
             raise RuntimeError(
                 f"LLM returned invalid TriageReport JSON after retry: {e2}"
