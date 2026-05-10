@@ -339,8 +339,18 @@ class TriageReport(LLMTriageOutput):
     log_event_count: int
     generated_at: datetime
     redaction_summary: RedactionCounts | None = None
+    context_summary: ContextSummary | None = None
 
     @field_validator("generated_at")
     @classmethod
     def _generated_at_as_utc(cls, value: datetime) -> datetime:
         return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
+
+
+# Deferred import to break the circular dependency:
+# context.py imports LogLine from this module; this import must come after all
+# class definitions are complete. model_rebuild() resolves the forward reference.
+from triage_cli.context import ContextSummary  # noqa: E402
+
+TriageReport.model_rebuild()
+InvestigationSession.model_rebuild()

@@ -195,3 +195,68 @@ def test_triage_report_includes_redaction_summary(monkeypatch) -> None:
     assert report.redaction_summary is not None
     assert report.redaction_summary.phones == 2
     assert report.redaction_summary.addresses == 1
+
+
+def test_triage_one_context_summary_attached_to_report(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With >25 log lines, the scoring path fires and context_summary is attached."""
+    from datetime import UTC, datetime, timedelta
+
+    from triage_cli import pipeline
+    from triage_cli.models import LLMTriageOutput, LogLine, TriageReport
+    from triage_cli.redact import RedactionCounts
+
+    ts = datetime(2026, 5, 7, 12, 0, 0, tzinfo=UTC)
+    original_count = 30  # >25 forces scoring path
+
+    canned = LLMTriageOutput(
+        finding="context test finding",
+        confidence="medium",
+        evidence=[],
+        suggested_note="context test note",
+    )
+
+    captured_bundles: list = []
+
+    async def fake_triage(bundle, *, model=None, verbose=False, redact_enabled=True):  # noqa: ARG001
+        captured_bundles.append(bundle)
+        return canned, RedactionCounts(enabled=True)
+
+    async def fake_extract_anchor(ticket, *, model=None, redact_enabled=True, verbose=False):  # noqa: ARG001
+        return None
+
+    class FakeDD:
+        def get_logs(self, _site, _levels, _start, _end):
+            lines = [
+                LogLine(
+                    timestamp=ts + timedelta(seconds=i),
+                    level="error" if i % 3 == 0 else ("warn" if i % 3 == 1 else "info"),
+                    message=f"log message {i}",
+                )
+                for i in range(original_count)
+            ]
+            return (lines, False)
+
+    monkeypatch.setattr(pipeline, "_llm_triage", fake_triage)
+    monkeypatch.setattr(pipeline, "_llm_extract_anchor", fake_extract_anchor)
+
+    report = pipeline.triage_one(
+        _ticket(),
+        _site(),
+        dd_client=FakeDD(),  # type: ignore[arg-type]
+        window_minutes=30,
+        levels=["error", "warn", "info"],
+        at=None,
+        verbose=False,
+        show_spinner=False,
+    )
+
+    assert isinstance(report, TriageReport)
+    assert report.context_summary is not None
+    assert report.context_summary.candidates == original_count
+    assert report.context_summary.kept <= report.context_summary.candidates
+    # log_event_count must reflect original candidate count, not trimmed count
+    assert report.log_event_count == original_count
+
+    # The bundle passed to the LLM has the trimmed log_lines (≤ kept)
+    assert len(captured_bundles) == 1
+    assert len(captured_bundles[0].log_lines) == report.context_summary.kept

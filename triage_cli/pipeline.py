@@ -17,6 +17,7 @@ from datetime import UTC, datetime
 from unicode_animations import live_spinner as _live_spinner
 
 from triage_cli import extract
+from triage_cli.context import build_log_section
 from triage_cli.datadog import DatadogClient
 from triage_cli.llm import extract_anchor as _llm_extract_anchor
 from triage_cli.llm import extract_site as _llm_extract_site
@@ -137,6 +138,19 @@ def triage_one(
             )
         _vecho(verbose, f"Pulled {len(log_lines)} log lines (truncated={log_truncated})")
 
+    context_summary = None
+    original_log_count = len(log_lines)
+    if log_lines:
+        log_lines, context_summary = build_log_section(
+            log_lines, anchor_dt, ticket.subject,
+        )
+        _vecho(
+            verbose,
+            f"context: {context_summary.candidates} candidates, "
+            f"kept {context_summary.kept} ({context_summary.used_tokens} of "
+            f"{context_summary.budget_tokens}-token budget)",
+        )
+
     bundle = TriageBundle(
         ticket=ticket,
         site_entry=site_entry,
@@ -164,7 +178,8 @@ def triage_one(
         site_name=site_entry.site_name,
         window=TimeWindow(start=start, end=end),
         sources=sources,
-        log_event_count=len(log_lines),
+        log_event_count=context_summary.candidates if context_summary else original_log_count,
         generated_at=datetime.now(UTC),
         redaction_summary=redaction_counts,
+        context_summary=context_summary,
     )
