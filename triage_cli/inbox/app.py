@@ -208,9 +208,10 @@ class InboxApp(App):
             )
         except RuntimeError as e:
             msg = str(e)
-            self.notify(msg, severity="error", timeout=10)
-            # "not found" errors are permanent config mistakes — exit instead of looping.
-            if "not found" in msg.lower():
+            self.notify(msg, severity="error", timeout=30)
+            # "View X not found" is a permanent config mistake — exit instead of looping.
+            # Guard narrowly: generic 404s (ticket, user) should not kill the app.
+            if "view" in msg.lower() and "not found" in msg.lower():
                 self.exit(1)
         finally:
             self._polling = False
@@ -225,6 +226,10 @@ class InboxApp(App):
 
         Touches no ``self.*`` attributes for state mutation — the caller in
         ``_poll_tick`` reassigns ``self._state`` on the event-loop thread.
+
+        Raises RuntimeError when the iteration aborts before listing the view
+        (e.g. Zendesk auth failure, network error). ``_poll_tick`` converts
+        that into a visible TUI notification.
         """
         if self._shutdown_event.is_set():
             return state
@@ -235,6 +240,13 @@ class InboxApp(App):
             raise RuntimeError(str(e)) from e
 
         stderr_buffer = io.StringIO()
+        view_listed = False
+
+        def _guarded_on_view_listed(ids: list[int]) -> None:
+            nonlocal view_listed
+            view_listed = True
+            self._on_view_listed(ids)
+
         with contextlib.redirect_stderr(stderr_buffer), ZendeskClient.from_env() as zd:
             if self.opts.no_logs:
                 new_state = watcher.run_iteration(
@@ -244,7 +256,7 @@ class InboxApp(App):
                     self.opts,
                     self._backfill_cutoff,
                     dd_client=None,
-                    on_view_listed=self._on_view_listed,
+                    on_view_listed=_guarded_on_view_listed,
                     on_progress=self._on_progress,
                     on_complete=self._on_complete,
                     on_failure=self._on_failure,
@@ -258,23 +270,28 @@ class InboxApp(App):
                         self.opts,
                         self._backfill_cutoff,
                         dd_client=dd,
-                        on_view_listed=self._on_view_listed,
+                        on_view_listed=_guarded_on_view_listed,
                         on_progress=self._on_progress,
                         on_complete=self._on_complete,
                         on_failure=self._on_failure,
                     )
 
-        for line in stderr_buffer.getvalue().splitlines():
-            if "iteration aborted" in line:
-                logger.warning(line)
-            else:
-                logger.debug(line)
+        log_output = stderr_buffer.getvalue()
+        for line in log_output.splitlines():
+            logger.warning(line)
+
+        if not view_listed:
+            # run_iteration aborted before it could list the view — surface the
+            # reason so _poll_tick can show it as a TUI notification.
+            last_line = log_output.strip().rsplit("\n", 1)[-1] if log_output.strip() else ""
+            raise RuntimeError(last_line or "Poll aborted — check inbox log for details")
 
         watcher.save_state(self.opts.state_file, watcher.prune_state(new_state))
         return new_state
 
     def _on_view_listed(self, view_ids: list[int]) -> None:
-        self.call_from_thread(self._reconcile_pending, set(view_ids))
+        if self.is_running:
+            self.call_from_thread(self._reconcile_pending, set(view_ids))
 
     def _on_progress(self, ticket_id: int, _status: str) -> None:
         self.call_from_thread(self._set_status, ticket_id, "triaging")

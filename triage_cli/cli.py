@@ -478,6 +478,7 @@ def inbox(
     levels: str = typer.Option(
         "error,warn", "--levels", help="Datadog log levels: comma-separated"
     ),
+    no_logs: bool = typer.Option(False, "--no-logs", help="Skip Datadog; use ticket content only"),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
     """Launch the interactive inbox TUI. Defaults to your assigned tickets."""
@@ -502,7 +503,7 @@ def inbox(
         backfill_hours=backfill_hours,
         window_minutes=window_minutes,
         levels=level_list,
-        no_logs=False,
+        no_logs=no_logs,
         print_notes=False,
         verbose=verbose,
         site_map_path=_SITE_MAP_PATH,
