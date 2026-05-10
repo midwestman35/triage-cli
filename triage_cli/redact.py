@@ -19,6 +19,41 @@ _PHONE_PATTERN = re.compile(
     r"(?![A-Za-z0-9])"
 )
 
+# Street-line address redaction.
+# Suffixes from USPS abbreviation list (common subset sufficient for 911 dispatch).
+# Only the street number + name + suffix are consumed; city/state are preserved
+# so site-lookup logic in extract.py can still match against the site map.
+_STREET_SUFFIXES = (
+    r"Ave(?:nue)?"
+    r"|Blvd|Boulevard"
+    r"|Cir(?:cle)?"
+    r"|Ct|Court"
+    r"|Dr(?:ive)?"
+    r"|Expy|Expressway"
+    r"|Fwy|Freeway"
+    r"|Hwy|Highway"
+    r"|Ln|Lane"
+    r"|Loop"
+    r"|Pkwy|Parkway"
+    r"|Pl(?:ace)?"
+    r"|Rd|Road"
+    r"|Route|Rte"
+    r"|Sq|Square"
+    r"|St(?:reet)?"
+    r"|Ter(?:race)?"
+    r"|Trl|Trail"
+    r"|Way"
+)
+# Pattern: leading digit(s), at least one capitalized word, then a suffix.
+# City and beyond are intentionally excluded so site-lookup is unaffected.
+_ADDRESS_PATTERN = re.compile(
+    r"\b\d+\s+"                       # house number
+    r"(?:[A-Z][A-Za-z0-9]*\s+)+"      # ≥1 capitalized word(s) (street name)
+    r"(?:" + _STREET_SUFFIXES + r")"  # street type suffix
+    r"\b",
+    re.IGNORECASE,
+)
+
 
 class RedactionCounts(BaseModel):
     """Per-call redaction tally surfaced via verbose stderr and saved JSON."""
@@ -46,4 +81,10 @@ def redact(text: str) -> tuple[str, RedactionCounts]:
         return "<PHONE>"
 
     text = _PHONE_PATTERN.sub(_sub_phone, text)
+
+    def _sub_address(m: re.Match[str]) -> str:
+        counts.addresses += 1
+        return "<ADDR>"
+
+    text = _ADDRESS_PATTERN.sub(_sub_address, text)
     return text, counts
