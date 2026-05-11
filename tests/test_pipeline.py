@@ -163,9 +163,12 @@ def test_triage_one_headless_bundle_has_empty_evidence_fields(
 def test_triage_report_includes_redaction_summary(monkeypatch) -> None:
     """When redaction is enabled, the report's redaction_summary must reflect counts."""
     from datetime import UTC, datetime
+
     from triage_cli import pipeline
     from triage_cli.models import (
-        AnchorSource, LLMTriageOutput, SiteEntry, Ticket, TriageBundle,
+        LLMTriageOutput,
+        SiteEntry,
+        Ticket,
     )
     from triage_cli.redact import RedactionCounts
 

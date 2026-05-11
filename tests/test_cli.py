@@ -306,6 +306,8 @@ def test_investigate_datadog_error_then_pipeline_failure_dies_cleanly(
 
     monkeypatch.setattr("triage_cli.cli.ZendeskClient.from_env", lambda: _ZD())
     monkeypatch.setattr("triage_cli.cli._is_interactive", lambda: True)
+    monkeypatch.setenv("DD_API_KEY", "test")
+    monkeypatch.setenv("DD_APP_KEY", "test")
     monkeypatch.setattr("builtins.input", lambda _p="": "skip")
     monkeypatch.setattr("typer.confirm", lambda *a, **k: True)  # accept fallback
     monkeypatch.setattr(
@@ -346,7 +348,7 @@ def test_investigate_datadog_error_then_pipeline_failure_dies_cleanly(
 # --no-redact flag propagation tests
 # ---------------------------------------------------------------------------
 
-def _make_fake_triage_one_capture(captured: list) -> "callable":
+def _make_fake_triage_one_capture(captured: list) -> callable:
     """Return a fake triage_one that records kwargs and returns a canned TriageReport."""
     from triage_cli.models import TimeWindow, TriageReport
 
