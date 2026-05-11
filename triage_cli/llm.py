@@ -1,8 +1,7 @@
-"""Claude Agent SDK wrappers: ``triage(bundle)`` and ``extract_anchor(ticket)``.
+"""LLM dispatch layer: factory + three top-level functions.
 
-Both are async, single-turn, no tools. Model resolves from the explicit arg,
-then ``ANTHROPIC_MODEL`` env, then ``claude-sonnet-4-6``. The Agent SDK
-inherits Claude Code's auth, so no API key is read here.
+Provider is selected by LLM_PROVIDER env var (default: unleash).
+Valid values: unleash, claude, openai.
 """
 from __future__ import annotations
 
@@ -22,24 +21,12 @@ from triage_cli.models import (
     fmt_ts,
     indent_continuations,
 )
-
-try:
-    from claude_agent_sdk import (
-        AssistantMessage,
-        ClaudeAgentOptions,
-        TextBlock,
-        query,
-    )
-except ImportError as e:  # pragma: no cover - import-time guard
-    raise RuntimeError(
-        "claude-agent-sdk is not installed. Install with `pip install claude-agent-sdk` "
-        "and ensure Claude Code is installed and authenticated."
-    ) from e
-
+from triage_cli.providers.base import LLMProvider
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL = "claude-sonnet-4-6"
+DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6"
+DEFAULT_OPENAI_MODEL = "gpt-5.5"
 
 TRIAGE_SYSTEM_PROMPT = """You are a triage assistant for a Network Engineer
 working on the Carbyne APEX NG911/E911 platform at Axon. You receive a Zendesk
@@ -92,26 +79,35 @@ generic "this morning" with no date is null. An explicit "2026-05-06 14:32 PT"
 is a timestamp. When in doubt, return null."""
 
 
-def _resolve_model(model: str | None) -> str:
-    """Pick the model: explicit arg > ANTHROPIC_MODEL env > default."""
-    return model or os.getenv("ANTHROPIC_MODEL") or DEFAULT_MODEL
+def get_provider() -> LLMProvider:
+    """Return the configured LLM provider."""
+    from triage_cli.providers.claude import ClaudeAgentProvider
+    from triage_cli.providers.openai import OpenAIResponsesProvider
+    from triage_cli.providers.unleash import UnleashProvider
+
+    match os.getenv("LLM_PROVIDER", "unleash").lower():
+        case "unleash":
+            return UnleashProvider()
+        case "claude":
+            return ClaudeAgentProvider()
+        case "openai":
+            return OpenAIResponsesProvider()
+        case p:
+            raise ValueError(f"Unknown LLM_PROVIDER: {p!r}. Valid: unleash, claude, openai")
+
+
+def _model_for_provider(provider: LLMProvider) -> str:
+    match provider.name:
+        case "openai":
+            return os.getenv("OPENAI_MODEL", DEFAULT_OPENAI_MODEL)
+        case _:
+            return os.getenv("ANTHROPIC_MODEL", DEFAULT_CLAUDE_MODEL)
 
 
 async def _collect_text(prompt: str, system_prompt: str, model: str) -> str:
-    """Stream a single-turn query and concatenate AssistantMessage text blocks."""
-    options = ClaudeAgentOptions(system_prompt=system_prompt, model=model)
-    chunks: list[str] = []
-    try:
-        async for message in query(prompt=prompt, options=options):
-            if isinstance(message, AssistantMessage):
-                for block in message.content:
-                    if isinstance(block, TextBlock):
-                        chunks.append(block.text)
-    # Catch transport-level failures only; let programming errors (AttributeError,
-    # TypeError) propagate during development so they're not masked.
-    except (RuntimeError, OSError) as e:
-        raise RuntimeError(f"Claude Agent SDK call failed: {e}") from e
-    return "".join(chunks)
+    """Run a single-turn query through the configured provider."""
+    provider = get_provider()
+    return await provider.complete(prompt=prompt, system_prompt=system_prompt, model=model)
 
 
 async def triage(
@@ -126,7 +122,8 @@ async def triage(
     user prompt. Verbose mode logs the first-attempt failure. Second failure
     raises RuntimeError into the caller's failure path.
     """
-    resolved = _resolve_model(model)
+    provider = get_provider()
+    resolved = model or _model_for_provider(provider)
     base_prompt = bundle.as_user_message()
 
     raw = (await _collect_text(
@@ -140,7 +137,7 @@ async def triage(
         if verbose:
             logger.warning(
                 "triage: first attempt returned invalid JSON from %s; retrying. %s",
-                resolved, e,
+                provider.name, e,
             )
         retry_prompt = (
             base_prompt
@@ -195,9 +192,10 @@ async def extract_site(
 
     Returns a site_name string that exists in the provided list, or None on no
     confident match, missing/invalid JSON, hallucinated name, or any failure mode.
-    Only Agent SDK transport errors raise RuntimeError.
+    Only provider transport errors raise RuntimeError.
     """
-    resolved = _resolve_model(model)
+    provider = get_provider()
+    resolved = model or _model_for_provider(provider)
     known_names = {e.site_name.lower(): e.site_name for e in sites if e.site_name}
     if not known_names:
         return None
@@ -223,7 +221,7 @@ async def extract_site(
     try:
         data = json.loads(payload)
     except json.JSONDecodeError:
-        logger.debug("extract_site: invalid JSON from %s: %r", resolved, raw)
+        logger.debug("extract_site: invalid JSON from %s: %r", provider.name, raw)
         return None
     if not isinstance(data, dict) or "site_name" not in data:
         logger.debug("extract_site: missing 'site_name' key in %r", data)
@@ -247,10 +245,11 @@ async def extract_anchor(ticket: Ticket, model: str | None = None) -> datetime |
     Returns a timezone-aware UTC datetime when the model returns a clear
     timestamp; returns None if the model returns null, the response is not
     valid JSON, the 'timestamp' key is missing, or the value cannot be
-    parsed as ISO 8601. Raises RuntimeError only on Agent SDK transport
+    parsed as ISO 8601. Raises RuntimeError only on provider transport
     failures (caller should not retry automatically).
     """
-    resolved = _resolve_model(model)
+    provider = get_provider()
+    resolved = model or _model_for_provider(provider)
     raw = await _collect_text(
         prompt=_ticket_for_anchor(ticket),
         system_prompt=ANCHOR_EXTRACTION_PROMPT,
@@ -260,22 +259,21 @@ async def extract_anchor(ticket: Ticket, model: str | None = None) -> datetime |
     try:
         data = json.loads(payload)
     except json.JSONDecodeError:
-        logger.debug("extract_anchor: invalid JSON from %s: %r", resolved, raw)
+        logger.debug("extract_anchor: invalid JSON from %s: %r", provider.name, raw)
         return None
     if not isinstance(data, dict) or "timestamp" not in data:
-        logger.debug("extract_anchor: missing 'timestamp' key from %s in %r", resolved, data)
+        logger.debug("extract_anchor: missing 'timestamp' key from %s in %r", provider.name, data)
         return None
     ts = data["timestamp"]
     if ts is None:
         return None
     if not isinstance(ts, str):
-        logger.debug("extract_anchor: 'timestamp' was not a string from %s: %r", resolved, ts)
+        logger.debug("extract_anchor: 'timestamp' was not a string from %s: %r", provider.name, ts)
         return None
     try:
-        # fromisoformat handles offset suffixes; swap trailing Z for +00:00 for 3.10 compat.
         dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
     except ValueError:
-        logger.debug("extract_anchor: could not parse timestamp from %s: %r", resolved, ts)
+        logger.debug("extract_anchor: could not parse timestamp from %s: %r", provider.name, ts)
         return None
     dt = dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt.astimezone(UTC)
     return dt
