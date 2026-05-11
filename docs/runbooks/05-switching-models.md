@@ -1,12 +1,19 @@
-# Switch the Claude model
+# Switch the LLM provider or model
 
-> **When to use this:** you want to try a different Claude model (cost, latency, or capability tradeoff), or pin to an older version for reproducibility.
+> **When to use this:** you want to move `triage`/watcher LLM calls between Unleash, Claude Code, and OpenAI/Codex HTTP, or pin a different provider model.
 
-The model identifier is read from `ANTHROPIC_MODEL` in `.env` and passed to `ClaudeAgentOptions(model=...)` in `triage_cli/llm.py`. There is no provider abstraction — only Claude models work.
+`triage_cli/llm.py` reads `LLM_PROVIDER` and dispatches through a small provider protocol. Supported values:
+
+| Provider | Env value | Required configuration |
+| --- | --- | --- |
+| Unleash | `unleash` | `UNLEASH_API_KEY`, `UNLEASH_ASSISTANT_ID`, optional `UNLEASH_BASE_URL`, optional `UNLEASH_ACCOUNT` |
+| Claude Code | `claude` | optional `ANTHROPIC_MODEL`; install `python -m pip install -e ".[claude]"` |
+| OpenAI Responses API | `openai` | `OPENAI_API_KEY`, optional `OPENAI_BASE_URL`, optional `OPENAI_MODEL` |
+| Codex HTTP alias | `codex` | same as `openai` |
 
 ## Steps
 
-1. **Edit `.env`** and change `ANTHROPIC_MODEL` to the desired model ID:
+1. **Edit `.env`** and set the provider:
 
    ```bash
    $EDITOR .env
@@ -14,42 +21,42 @@ The model identifier is read from `ANTHROPIC_MODEL` in `.env` and passed to `Cla
 
    Examples:
 
-   ```
+   ```dotenv
+   LLM_PROVIDER=unleash
+   UNLEASH_API_KEY=...
+   UNLEASH_ASSISTANT_ID=...
+
+   LLM_PROVIDER=claude
    ANTHROPIC_MODEL=claude-sonnet-4-6
-   ANTHROPIC_MODEL=claude-opus-4-7
-   ANTHROPIC_MODEL=claude-haiku-4-5-20251001
+
+   LLM_PROVIDER=openai
+   OPENAI_API_KEY=...
+   OPENAI_MODEL=gpt-5.5
    ```
 
-2. **(Optional) Verify the model is available** on your Claude Code seat:
-
-   ```bash
-   claude --print "ping" --model claude-opus-4-7
-   ```
-
-   If this returns a response, the model is callable. If it errors with "model not found" or similar, your seat doesn't have access — pick a different ID.
-
-3. **Run a triage with the new model:**
+2. **Run a cheap triage smoke:**
 
    ```bash
    triage-cli triage <ticket-id> --no-logs
    ```
 
-   `--no-logs` is a cheap way to confirm the LLM call succeeds without burning Datadog quota.
+   `--no-logs` confirms the provider call without spending Datadog quota.
+
+3. **If using Claude fallback, verify the local seat:**
+
+   ```bash
+   claude --print "ping" --model claude-sonnet-4-6
+   ```
 
 ## Verification
 
 - The triage command exits `0` and prints a four-section markdown note.
-- Output style and length should match expectations for the model family. If you switched from Sonnet to Haiku, expect terser output; from Sonnet to Opus, expect more deliberate reasoning in the inference section.
-- `--verbose` does **not** currently log the resolved model name. If you want to confirm at runtime, temporarily edit `triage_cli/llm.py` to log `MODEL` at module import or inside `triage()`. Otherwise, trust the env var.
+- Provider-specific missing-env errors mention the missing variable before any network request is attempted.
+- Output style and length should match expectations for the selected provider/model.
 
 ## Troubleshooting
 
-- **"Model not found" or 404 from the SDK** — typo in the model ID, or the model isn't available on your Claude Code seat. Cross-check with `claude --print "ping" --model <id>`.
-- **Triage note structure looks wildly different** — expected when switching across model families (e.g. Sonnet -> Haiku). The system prompt fixes the four section headers, but tone and depth vary by model. The project's tested model is `claude-sonnet-4-6`; output on other models is best-effort.
-- **`.env` change not picked up** — `python-dotenv` is loaded at CLI import. Make sure you're not pointing at a stale `.env` (e.g. if you have one in `~/` and one in the repo, the repo's wins because that's `cwd`). Confirm with:
-
-  ```bash
-  grep ANTHROPIC_MODEL .env
-  ```
-
-> **Note:** the project's tested model is `claude-sonnet-4-6`. Other models will run, but the four-section markdown output may vary slightly in structure or tone.
+- **`UNLEASH_API_KEY must be set` / `UNLEASH_ASSISTANT_ID must be set`** — fill in Unleash credentials or choose another provider.
+- **`OPENAI_API_KEY must be set`** — fill in an OpenAI key for `LLM_PROVIDER=openai` or `LLM_PROVIDER=codex`.
+- **`claude-agent-sdk is not installed`** — install the optional Claude fallback extra with `python -m pip install -e ".[claude]"`.
+- **"Model not found" or 404** — typo in the provider model ID, or that model is unavailable for the account. Cross-check provider access before changing prompts.
