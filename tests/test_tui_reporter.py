@@ -3,8 +3,6 @@ from __future__ import annotations
 
 import asyncio
 
-import pytest
-
 
 def test_tui_reporter_phase_started_puts_event_on_queue():
     from triage_cli.tui.reporter import PhaseStarted, TUIReporter

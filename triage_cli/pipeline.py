@@ -42,7 +42,7 @@ class Reporter(Protocol):
     def phase_done(self, phase: str, detail: str = "") -> None: ...
     def phase_failed(self, phase: str, err: Exception) -> None: ...
     def evidence_added(self, item: Any) -> None: ...
-    def done(self, report: "TriageReport") -> None: ...
+    def done(self, report: TriageReport) -> None: ...
 
 
 class StderrReporter:
@@ -66,7 +66,7 @@ class StderrReporter:
     def evidence_added(self, item: Any) -> None:
         pass
 
-    def done(self, report: "TriageReport") -> None:
+    def done(self, report: TriageReport) -> None:
         pass
 
 
@@ -85,7 +85,7 @@ class SilentReporter:
     def evidence_added(self, item: Any) -> None:
         pass
 
-    def done(self, report: "TriageReport") -> None:
+    def done(self, report: TriageReport) -> None:
         pass
 
 
@@ -224,7 +224,7 @@ def triage_one(
     )
 
 
-def _stub_assess(ticket: Ticket, session: "InvestigationSession") -> TriageReport:
+def _stub_assess(ticket: Ticket, session: InvestigationSession) -> TriageReport:
     """Deterministic assessment without an LLM call. Used with --no-llm."""
     count = len(session.timeline)
     if count > 10:
@@ -249,11 +249,11 @@ def _stub_assess(ticket: Ticket, session: "InvestigationSession") -> TriageRepor
 async def investigate_one(
     ticket: Ticket,
     *,
-    session: "InvestigationSession",
+    session: InvestigationSession,
     dd_client: DatadogClient | None = None,
     reporter: Reporter,
     interactive: bool = True,
-    workspace: "Path | None" = None,
+    workspace: Path | None = None,
     cnc_override: str | None = None,
     site_override: str | None = None,
     anchor_override: datetime | None = None,
@@ -276,7 +276,6 @@ async def investigate_one(
     from triage_cli.models import (
         AnchorSource,
         CustomerHistoryEvidence,
-        InvestigationSession,
         MemoryContext,
         TriageBundle,
     )
@@ -343,6 +342,7 @@ async def investigate_one(
             sites_path = _Path("data/cnc-map.json")
             if sites_path.exists():
                 import json as _json
+
                 from triage_cli.models import SiteEntry
                 raw_sites = _json.loads(sites_path.read_text())
                 sites = [SiteEntry(**s) for s in raw_sites]
@@ -355,10 +355,8 @@ async def investigate_one(
                 if site_entry:
                     extracted_dt: datetime | None = None
                     if anchor_override is None:
-                        try:
+                        with contextlib.suppress(Exception):
                             extracted_dt = await _llm_extract_anchor(ticket)
-                        except Exception:
-                            pass
                     anchor_dt, _ = extract.resolve_anchor(
                         ticket, at_flag=anchor_override, extracted=extracted_dt,
                     )

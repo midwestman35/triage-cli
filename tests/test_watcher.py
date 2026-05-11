@@ -185,7 +185,9 @@ def test_run_iteration_marks_only_successfully_triaged(
             raise RuntimeError("simulated Datadog timeout")
         return _report(ticket.id, now)
 
-    monkeypatch.setattr("triage_cli.pipeline.investigate_one", AsyncMock(side_effect=fake_investigate))
+    monkeypatch.setattr(
+        "triage_cli.pipeline.investigate_one", AsyncMock(side_effect=fake_investigate),
+    )
 
     state = {"version": 1, "triaged": {}}
     opts = _opts(tmp_path / "state.json")
@@ -220,7 +222,9 @@ def test_run_iteration_status_lines(
             raise RuntimeError("Datadog timeout")
         return _report(ticket.id, now)
 
-    monkeypatch.setattr("triage_cli.pipeline.investigate_one", AsyncMock(side_effect=fake_investigate))
+    monkeypatch.setattr(
+        "triage_cli.pipeline.investigate_one", AsyncMock(side_effect=fake_investigate),
+    )
 
     state = {"version": 1, "triaged": {"4": now.isoformat()}}
     opts = WatcherOptions(

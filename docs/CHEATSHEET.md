@@ -6,10 +6,11 @@ A CLI that investigates and triages Zendesk tickets for the Carbyne APEX NG911/E
 
 | Command | Purpose |
 | --- | --- |
-| `investigate <id>` | Guided investigation: fetch ticket/comments/attachment metadata, add local/pasted evidence, print or save a local handoff draft. |
-| `triage <id>` | One-shot: fetch ticket → optional site/Datadog enrichment → call Claude → print a paste-ready report. |
-| `inbox --view N` | Interactive Textual TUI: live list of view tickets on the left, selected report on the right. Use this at the keyboard. |
-| `watch --view N` | Headless poll loop: forever poll a Zendesk view, save each new triage to `./triage-notes/`, print status to stderr. Use this in tmux/cron/systemd. |
+| `investigate <id>` | Guided investigation: fetch ticket → customer history → memory lookup → evidence intake → LLM assessment. Default entry point. |
+| `triage <id>` | Headless single-shot (same pipeline, no evidence prompts). Use in scripts or with `watch`. |
+| `doctor` | Check env vars, credentials, and `triage-notes/` writability. Exits 0/1. Run this first. |
+| `inbox --view N` | Interactive Textual TUI report viewer. Use this at the keyboard. |
+| `watch --view N` | Headless poll loop: forever poll a Zendesk view, run `investigate` per ticket, print status to stderr. |
 | `build-map` | Regenerate `data/cnc-map.json` from `apex-cnc-inventory.md`. Run after editing the inventory. |
 
 ## First-time setup
@@ -39,6 +40,14 @@ claude   # type a message, confirm OAuth, exit
 triage-cli build-map
 ```
 
+## `doctor` — environment check
+
+```bash
+triage-cli doctor
+```
+
+Exits 0 when all critical checks pass (Zendesk creds, LLM provider key, `triage-notes/` writable). Datadog is a warning only.
+
 ## `investigate <id>` — guided investigation
 
 ```bash
@@ -47,10 +56,12 @@ triage-cli investigate 'https://acme.zendesk.com/agent/tickets/12345'
 triage-cli investigate 12345 --file ./station.log
 triage-cli investigate 12345 --paste 'console=WARN audio dropped'
 triage-cli investigate 12345 --file ./station.log --paste 'dispatch=PTT failures' --save
+triage-cli investigate 12345 --no-llm        # skip LLM; deterministic report
+triage-cli investigate 12345 --tui           # three-pane progress TUI (requires TTY)
 triage-cli investigate 12345 --verbose
 ```
 
-This path needs Zendesk only. It does not resolve CNC/site metadata, query Datadog, call Claude, or post notes back to Zendesk. Output is a local markdown handoff draft; `--save` writes paired `.md` and `.json` artifacts to `triage-notes/`.
+Fetches the ticket, pulls customer history, looks up similar prior investigations (memory layer), then runs the LLM assessment. Output is a local markdown handoff draft; `--save` writes paired `.md` and `.json` artifacts to `triage-notes/`.
 
 ## `triage <id>` — one-shot
 
@@ -136,16 +147,20 @@ ZENDESK_SUBDOMAIN          # required — the part before .zendesk.com
 ZENDESK_EMAIL              # required — the agent email used as Basic-auth user
 ZENDESK_API_TOKEN          # required — Zendesk API token (NOT a password)
 
+LLM_PROVIDER               # default unleash — options: unleash, claude, openai
+UNLEASH_API_KEY            # required when LLM_PROVIDER=unleash
+UNLEASH_ASSISTANT_ID       # required when LLM_PROVIDER=unleash
+OPENAI_API_KEY             # required when LLM_PROVIDER=openai
+ANTHROPIC_MODEL            # default claude-sonnet-4-6 (used when LLM_PROVIDER=claude)
+
 DD_API_KEY                 # optional — Datadog API key for triage/watch enrichment
 DD_APP_KEY                 # optional — Datadog application key for triage/watch enrichment
 DD_SITE                    # default datadoghq.com (eu = datadoghq.eu, us3, etc.)
 DD_CALL_CENTER_TAG         # default @log.machineData.callCenterName
 DD_STATION_TAG             # reserved for v2 station-level filtering; unused today
-
-ANTHROPIC_MODEL            # default claude-sonnet-4-6 (used by triage/watch LLM calls)
 ```
 
-The Agent SDK reuses Claude CLI's OAuth session — there is intentionally **no `ANTHROPIC_API_KEY`** here.
+When `LLM_PROVIDER=claude`, the Agent SDK reuses Claude CLI's OAuth session — no `ANTHROPIC_API_KEY` needed.
 
 ## Common workflows
 

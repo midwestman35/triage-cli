@@ -1,10 +1,6 @@
 """Tests for the durable investigation memory layer."""
 from __future__ import annotations
 
-import sqlite3
-from datetime import UTC, datetime
-from pathlib import Path
-
 import pytest
 
 
@@ -43,7 +39,9 @@ def test_retrieve_returns_empty_when_no_match(tmp_memory):
 def test_find_duplicate_exact_match(tmp_memory):
     from triage_cli.memory import append_investigation, find_duplicate
 
-    append_investigation("ZD-200", "Corp B", "No audio", "one-way audio on outbound", "codec mismatch")
+    append_investigation(
+        "ZD-200", "Corp B", "No audio", "one-way audio on outbound", "codec mismatch",
+    )
     dup = find_duplicate("ZD-200")
     assert dup is not None
     assert dup.ticket_id == "ZD-200"
@@ -81,8 +79,9 @@ def test_rebuild_from_memory_md(tmp_memory):
 def test_mtime_triggers_rebuild(tmp_memory, monkeypatch):
     """After MEMORY.md is modified, next retrieve_similar should auto-rebuild."""
     import time
-    from triage_cli.memory import append_investigation, retrieve_similar
+
     import triage_cli.memory as mem
+    from triage_cli.memory import append_investigation, retrieve_similar
 
     append_investigation("ZD-500", "E Corp", "call drops", "drops at 30s", "routing fix")
     results1 = retrieve_similar("call drops", "drops")
@@ -97,8 +96,8 @@ def test_mtime_triggers_rebuild(tmp_memory, monkeypatch):
 
 
 def test_memory_md_created_if_absent(tmp_memory):
-    from triage_cli.memory import append_investigation
     import triage_cli.memory as mem
+    from triage_cli.memory import append_investigation
     assert not mem.MEMORY_MD.exists()
     append_investigation("ZD-600", "F Corp", "subject", "symptom", "assessment")
     assert mem.MEMORY_MD.exists()

@@ -255,8 +255,8 @@ class TriageBundle(BaseModel):
     downloaded_attachments: list[AttachmentEvidence] = Field(default_factory=list)
     local_files: list[LocalFileEvidence] = Field(default_factory=list)
     pasted_logs: list[PastedEvidence] = Field(default_factory=list)
-    customer_history: "CustomerHistoryEvidence | None" = None
-    memory_context: "MemoryContext | None" = None
+    customer_history: CustomerHistoryEvidence | None = None
+    memory_context: MemoryContext | None = None
 
     def as_user_message(self) -> str:
         t = self.ticket
@@ -282,7 +282,8 @@ class TriageBundle(BaseModel):
             lines.append("## Customer ticket history (recent)")
             for tk in self.customer_history.tickets:
                 lines.append(
-                    f"{tk.id} | {tk.status:<8} | {tk.updated_at.strftime('%Y-%m-%d')} | {tk.subject}"
+                    f"{tk.id} | {tk.status:<8} | "
+                    f"{tk.updated_at.strftime('%Y-%m-%d')} | {tk.subject}"
                 )
             lines.append("")
 

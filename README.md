@@ -41,7 +41,7 @@ uv pip install -e .
 ```
 
 After install, `triage-cli --help` should list the `investigate`, `triage`, `inbox`,
-`watch`, and `build-map` subcommands.
+`watch`, `doctor`, and `build-map` subcommands.
 
 ## Configuration
 
@@ -61,9 +61,13 @@ cp .env.example .env
 | `DD_SITE` | Datadog site host. Leave at default `datadoghq.com` unless you are on a non-US tenant. |
 | `DD_CALL_CENTER_TAG` | Datadog tag key for the call-center filter. Leave at default `@log.machineData.callCenterName`. |
 | `DD_STATION_TAG` | Reserved for v2 station-level filtering. Leave at default; v1 does not use it. |
-| `ANTHROPIC_MODEL` | Model identifier passed to the Agent SDK. Default `claude-sonnet-4-6`. |
+| `LLM_PROVIDER` | LLM backend: `unleash` (default), `claude`, or `openai`. |
+| `UNLEASH_API_KEY` | Required when `LLM_PROVIDER=unleash`. |
+| `UNLEASH_ASSISTANT_ID` | Required when `LLM_PROVIDER=unleash`. |
+| `OPENAI_API_KEY` | Required when `LLM_PROVIDER=openai`. |
+| `ANTHROPIC_MODEL` | Model identifier for the Claude provider. Default `claude-sonnet-4-6`. |
 
-`ANTHROPIC_API_KEY` is intentionally absent. The Claude Agent SDK inherits Claude Code's auth.
+When `LLM_PROVIDER=claude`, the Claude Agent SDK inherits Claude Code's OAuth session — no `ANTHROPIC_API_KEY` required.
 
 ## Building the site map
 
@@ -79,6 +83,14 @@ This rewrites `data/cnc-map.json` and `data/cnc-map-gaps.md` (the latter records
 
 ## Usage
 
+### Check your setup first
+
+```bash
+triage-cli doctor
+```
+
+Prints green/red checks for Zendesk credentials, the selected LLM provider key, and `triage-notes/` writability. Exits 0 when all critical checks pass.
+
 ### Guided investigation
 
 ```bash
@@ -86,27 +98,28 @@ triage-cli investigate 12345
 triage-cli investigate https://<sub>.zendesk.com/agent/tickets/12345
 ```
 
-This is the primary daily-use path. It reads Zendesk ticket content, comments, and attachment metadata, then creates a local handoff draft with an evidence-first assessment. Attachment contents are not downloaded yet; metadata is recorded so the gap is visible.
+This is the primary daily-use path. It fetches the ticket, pulls customer history, looks up similar prior investigations from the memory layer, and creates a local handoff draft with an evidence-first LLM assessment.
 
-Add local or pasted evidence in a testable, non-interactive way:
+Add local or pasted evidence before the LLM call:
 
 ```bash
 triage-cli investigate 12345 --file ./station.log --paste 'console=WARN audio dropped'
-triage-cli investigate 12345 --save
+triage-cli investigate 12345 --save       # write .md + .json to triage-notes/
+triage-cli investigate 12345 --no-llm     # skip the LLM; useful for testing
+triage-cli investigate 12345 --tui        # three-pane progress TUI (requires TTY)
 triage-cli investigate 12345 --verbose
 ```
 
-`--file` and `--paste LABEL=TEXT` may be repeated. `--save` writes paired markdown and JSON files under `./triage-notes/`. The generated note is local and paste-ready; the CLI does not write to Zendesk.
+`--file` and `--paste LABEL=TEXT` may be repeated. The generated note is local and paste-ready; the CLI does not write to Zendesk.
 
-Evidence sources currently supported by Guided Investigation:
+Evidence sources:
 
 - Zendesk ticket body and metadata
-- Zendesk comments
+- Zendesk comments and customer ticket history
 - Zendesk attachment metadata
-- Local files
-- Pasted logs or console excerpts
-
-Datadog remains optional enrichment for `triage` and watcher mode; it is not used by `investigate`. Site map lookup, CNC resolution, and Claude are not required for `investigate`.
+- Memory layer (top-3 similar prior investigations via BM25)
+- Local files (`--file`)
+- Pasted logs or console excerpts (`--paste LABEL=TEXT`)
 
 ### Fast one-shot triage
 
