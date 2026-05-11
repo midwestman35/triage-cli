@@ -306,6 +306,8 @@ def test_investigate_datadog_error_then_pipeline_failure_dies_cleanly(
 
     monkeypatch.setattr("triage_cli.cli.ZendeskClient.from_env", lambda: _ZD())
     monkeypatch.setattr("triage_cli.cli._is_interactive", lambda: True)
+    monkeypatch.setenv("DD_API_KEY", "test")
+    monkeypatch.setenv("DD_APP_KEY", "test")
     monkeypatch.setattr("builtins.input", lambda _p="": "skip")
     monkeypatch.setattr("typer.confirm", lambda *a, **k: True)  # accept fallback
     monkeypatch.setattr(

@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A Python 3.11+ CLI that triages Zendesk tickets for the Carbyne APEX NG911/E911 platform. Five subcommands:
 
-- `triage-cli triage <id-or-url>` — single-shot pipeline: fetch ticket → resolve site → query Datadog → call Claude → print markdown.
+- `triage-cli triage <id-or-url>` — single-shot pipeline: fetch ticket → resolve site → query Datadog → call the configured LLM provider → print markdown.
 - `triage-cli investigate <id-or-url>` — guided session that bundles the ticket with optional `--file` / `--paste LABEL=TEXT` evidence into a structured `TriageReport` (markdown + JSON).
 - `triage-cli inbox [--view ...]` — interactive Textual TUI over a polled Zendesk view (defaults to your assigned tickets); requires a TTY.
 - `triage-cli watch --view <id>` — long-running headless poll loop over a Zendesk view, calling the same pipeline per ticket.
@@ -64,11 +64,11 @@ The investigation flow was added to support read-only triage on tickets where Da
 
 Shared invariant with `watch`: state file is `data/watcher-state-<view-key>.json`, same shape for both. Don't fork the state schema between them.
 
-### LLM access — Claude Agent SDK, not the Anthropic SDK
+### LLM access — provider protocol, not the Anthropic SDK
 
-`triage_cli/llm.py` uses `claude-agent-sdk` (`query` + `ClaudeAgentOptions`). The Agent SDK spawns Claude Code under the hood and inherits the user's OAuth session — there is intentionally **no `ANTHROPIC_API_KEY`** in `.env.example` and the SDK does not read one. Prerequisite: the `claude` CLI must be installed and authenticated.
+`triage_cli/llm.py` selects a provider with `LLM_PROVIDER`. Production defaults to `unleash`; `claude` uses the Claude Agent SDK lazily as an optional fallback; `openai` and `codex` use the OpenAI Responses API over HTTP.
 
-Do not "fix" this by switching to the `anthropic` HTTP SDK. The user has an enterprise OAuth seat with no provisioned API key; that path doesn't work for them. Model is read from `ANTHROPIC_MODEL` env (default `claude-sonnet-4-6`) — staying model-agnostic via env is the only abstraction; do not add a provider layer.
+Do not "fix" Claude fallback by switching to the `anthropic` HTTP SDK. The user has an enterprise OAuth seat with no provisioned Anthropic API key; that path doesn't work for them. Claude fallback reads `ANTHROPIC_MODEL`; OpenAI/Codex reads `OPENAI_MODEL`; Unleash uses a configured assistant ID.
 
 Two single-turn async calls live in `llm.py`:
 - `triage(bundle)` — main markdown generation.

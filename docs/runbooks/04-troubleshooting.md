@@ -24,14 +24,18 @@ ApiException: 401 Unauthorized
 - The APP key must belong to a user with `logs_read_data` permission.
 - If you're on a non-US Datadog tenant, set `DD_SITE` (e.g. `datadoghq.eu`).
 
-### Claude Agent SDK auth
+### LLM provider auth/config
 
 ```
+UNLEASH_API_KEY must be set when LLM_PROVIDER=unleash.
+OPENAI_API_KEY must be set when LLM_PROVIDER=openai.
 Claude Agent SDK call failed: ...
 ```
 
-- The SDK inherits Claude Code's OAuth session. Run `claude` once interactively in the same shell to verify auth state. If it prompts you to log in, complete that and re-run the triage command.
-- The SDK does **not** read `ANTHROPIC_API_KEY`. Setting one will not help.
+- `LLM_PROVIDER=unleash` requires `UNLEASH_API_KEY` and `UNLEASH_ASSISTANT_ID`.
+- `LLM_PROVIDER=openai` or `LLM_PROVIDER=codex` requires `OPENAI_API_KEY`.
+- `LLM_PROVIDER=claude` requires `python -m pip install -e ".[claude]"` and a local Claude Code OAuth session. Run `claude` once interactively in the same shell to verify auth state.
+- Claude fallback does **not** read `ANTHROPIC_API_KEY`. Setting one will not help.
 
 ## Site resolution
 
