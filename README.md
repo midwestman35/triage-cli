@@ -183,6 +183,14 @@ triage-cli triage 12345 --no-interactive
 
 If site resolution fails, the CLI normally prompts for a `site_name`. With `--no-interactive` it aborts instead — use this in any shell pipeline or scheduled context.
 
+### Redaction
+
+By default, caller PII (phone numbers, street addresses, GPS coords) is replaced with `<PHONE>` / `<ADDR>` / `<COORDS>` placeholders before any text is sent to Claude. Use `--no-redact` to disable for debugging.
+
+```bash
+triage-cli triage 12345 --no-redact
+```
+
 ### Rebuild the site map
 
 ```bash
@@ -244,7 +252,7 @@ These are the v1 boundary; do not assume any of them have been addressed:
 
 - Site map is manually curated; refreshing the underlying Confluence inventory is an out-of-band step.
 - No station-level log filtering. Only call-center level via `@log.machineData.callCenterName`. The `DD_STATION_TAG` env var is reserved for v2.
-- Internal Zendesk comments are sent to Claude. Output is terminal-only for v1, but be aware before adding any "post back to Zendesk" feature — internal comments would leak into anything posted publicly.
+- Internal Zendesk comments are sent to Claude. Caller PII is redacted by default (`--no-redact` disables this), but output is terminal-only for v1 — be aware before adding any "post back to Zendesk" feature.
 - No retries on transient API failures; if Datadog or Zendesk hiccups, re-run the command.
 - Single-user, local execution. No scheduling, no shared state. (`watch` mode provides local single-user polling without external scheduling.)
 
