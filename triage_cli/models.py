@@ -8,6 +8,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
+from triage_cli.redact import RedactionCounts
+
 
 def fmt_ts(dt: datetime) -> str:
     """Render a datetime as ISO 8601 in UTC with Z suffix, no microseconds."""
@@ -336,6 +338,7 @@ class TriageReport(LLMTriageOutput):
     sources: list[str]
     log_event_count: int
     generated_at: datetime
+    redaction_summary: RedactionCounts | None = None
 
     @field_validator("generated_at")
     @classmethod

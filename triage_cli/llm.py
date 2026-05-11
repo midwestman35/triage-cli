@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import re
+import sys
 from datetime import UTC, datetime
 
 from pydantic import ValidationError
@@ -22,6 +23,7 @@ from triage_cli.models import (
     fmt_ts,
     indent_continuations,
 )
+from triage_cli.redact import RedactionCounts, redact
 
 try:
     from claude_agent_sdk import (
@@ -114,20 +116,38 @@ async def _collect_text(prompt: str, system_prompt: str, model: str) -> str:
     return "".join(chunks)
 
 
+def _maybe_redact(text: str, *, enabled: bool) -> tuple[str, RedactionCounts]:
+    """Redact when enabled; pass-through with disabled counts when not."""
+    if not enabled:
+        return text, RedactionCounts(enabled=False)
+    return redact(text)
+
+
 async def triage(
     bundle: TriageBundle,
-    model: str | None = None,
     *,
+    model: str | None = None,
     verbose: bool = False,
-) -> LLMTriageOutput:
-    """Run the main triage call. Returns a parsed `LLMTriageOutput`.
+    redact_enabled: bool = True,
+) -> tuple[LLMTriageOutput, RedactionCounts]:
+    """Run the main triage call. Returns a parsed `LLMTriageOutput` and redaction counts.
 
     On malformed JSON, retries once with a stricter nudge appended to the
     user prompt. Verbose mode logs the first-attempt failure. Second failure
     raises RuntimeError into the caller's failure path.
     """
     resolved = _resolve_model(model)
-    base_prompt = bundle.as_user_message()
+    raw_prompt = bundle.as_user_message()
+    base_prompt, counts = _maybe_redact(raw_prompt, enabled=redact_enabled)
+    if counts.enabled:
+        if verbose:
+            print(
+                f"redacted: {counts.phones} phones, {counts.addresses} addresses, "
+                f"{counts.coords} coords",
+                file=sys.stderr,
+            )
+    else:
+        print("redaction: disabled", file=sys.stderr)
 
     raw = (await _collect_text(
         prompt=base_prompt,
@@ -135,7 +155,8 @@ async def triage(
         model=resolved,
     )).strip()
     try:
-        return LLMTriageOutput.model_validate_json(_strip_code_fence(raw))
+        llm_output = LLMTriageOutput.model_validate_json(_strip_code_fence(raw))
+        return llm_output, counts
     except (json.JSONDecodeError, ValidationError) as e:
         if verbose:
             logger.warning(
@@ -153,7 +174,8 @@ async def triage(
             model=resolved,
         )).strip()
         try:
-            return LLMTriageOutput.model_validate_json(_strip_code_fence(raw2))
+            llm_output = LLMTriageOutput.model_validate_json(_strip_code_fence(raw2))
+            return llm_output, counts
         except (json.JSONDecodeError, ValidationError) as e2:
             raise RuntimeError(
                 f"LLM returned invalid TriageReport JSON after retry: {e2}"
@@ -190,6 +212,9 @@ async def extract_site(
     ticket: Ticket,
     sites: list[SiteEntry],
     model: str | None = None,
+    *,
+    redact_enabled: bool = True,
+    verbose: bool = False,
 ) -> str | None:
     """Best-effort site identification from the ticket against the known site list.
 
@@ -207,12 +232,22 @@ async def extract_site(
         for e in sites
         if e.site_name
     )
-    prompt = (
-        f"Known sites:\n{site_list}\n\n"
+    ticket_text = (
         f"Ticket subject: {ticket.subject}\n"
         f"Org: {ticket.requester_org or '(none)'}\n"
         f"Description (first 500 chars): {ticket.description[:500]}"
     )
+    redacted_ticket_text, counts = _maybe_redact(ticket_text, enabled=redact_enabled)
+    if counts.enabled:
+        if verbose:
+            print(
+                f"redacted: {counts.phones} phones, {counts.addresses} addresses, "
+                f"{counts.coords} coords",
+                file=sys.stderr,
+            )
+    else:
+        print("redaction: disabled", file=sys.stderr)
+    prompt = f"Known sites:\n{site_list}\n\n{redacted_ticket_text}"
 
     raw = await _collect_text(
         prompt=prompt,
@@ -241,7 +276,13 @@ async def extract_site(
     return canonical
 
 
-async def extract_anchor(ticket: Ticket, model: str | None = None) -> datetime | None:
+async def extract_anchor(
+    ticket: Ticket,
+    model: str | None = None,
+    *,
+    redact_enabled: bool = True,
+    verbose: bool = False,
+) -> datetime | None:
     """Best-effort timestamp extraction from the ticket body.
 
     Returns a timezone-aware UTC datetime when the model returns a clear
@@ -251,8 +292,19 @@ async def extract_anchor(ticket: Ticket, model: str | None = None) -> datetime |
     failures (caller should not retry automatically).
     """
     resolved = _resolve_model(model)
+    raw_prompt = _ticket_for_anchor(ticket)
+    prompt, counts = _maybe_redact(raw_prompt, enabled=redact_enabled)
+    if counts.enabled:
+        if verbose:
+            print(
+                f"redacted: {counts.phones} phones, {counts.addresses} addresses, "
+                f"{counts.coords} coords",
+                file=sys.stderr,
+            )
+    else:
+        print("redaction: disabled", file=sys.stderr)
     raw = await _collect_text(
-        prompt=_ticket_for_anchor(ticket),
+        prompt=prompt,
         system_prompt=ANCHOR_EXTRACTION_PROMPT,
         model=resolved,
     )
