@@ -93,11 +93,16 @@ class ZendeskClient:
         org = orgs_by_id.get(org_id) if org_id is not None else None
         requester_org = org.get("name") if org else None
 
+        requester_id = ticket_obj.get("requester_id")
+        requester_user = users_by_id.get(requester_id) if requester_id else None
+        requester_email = requester_user.get("email") if requester_user else None
+
         return Ticket(
             id=int(ticket_obj["id"]),
             subject=ticket_obj.get("subject") or "",
             description=ticket_obj.get("description") or "",
             requester_org=requester_org,
+            requester_email=requester_email,
             tags=list(ticket_obj.get("tags") or []),
             created_at=_parse_iso(ticket_obj["created_at"]),
             updated_at=_parse_iso(ticket_obj["updated_at"]),

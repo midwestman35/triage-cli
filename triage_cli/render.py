@@ -40,12 +40,15 @@ def _panel(body: str, title: str, border_style: str | None = None) -> Panel:
 
 
 def to_markdown(report: TriageReport) -> str:
-    window_start = _utc(report.window.start)
-    window_end = _utc(report.window.end)
-    window = f"{window_start:%Y-%m-%d %H:%M}–{window_end:%H:%M} UTC"
+    if report.window is not None:
+        window_start = _utc(report.window.start)
+        window_end = _utc(report.window.end)
+        window_str = f"{window_start:%Y-%m-%d %H:%M}–{window_end:%H:%M} UTC"
+    else:
+        window_str = "n/a"
     meta = (
         f"**Confidence:** {report.confidence} · **Sources:** {_sources(report)} · "
-        f"**Window:** {window} · **Site:** {report.site_name}"
+        f"**Window:** {window_str} · **Site:** {report.site_name or 'n/a'}"
     )
     lines = [
         f"# Triage Report — ZD-{report.ticket_id}",

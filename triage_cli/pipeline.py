@@ -13,7 +13,11 @@ import logging
 import sys
 from collections.abc import Iterator
 from datetime import UTC, datetime
-from typing import Any, Protocol, runtime_checkable
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+
+if TYPE_CHECKING:
+    from triage_cli.models import InvestigationSession
 
 from unicode_animations import live_spinner as _live_spinner
 
@@ -218,3 +222,201 @@ def triage_one(
         log_event_count=len(log_lines),
         generated_at=datetime.now(UTC),
     )
+
+
+def _stub_assess(ticket: Ticket, session: "InvestigationSession") -> TriageReport:
+    """Deterministic assessment without an LLM call. Used with --no-llm."""
+    count = len(session.timeline)
+    if count > 10:
+        confidence = "high"
+    elif count < 3:
+        confidence = "low"
+    else:
+        confidence = "medium"
+    return TriageReport(
+        ticket_id=ticket.id,
+        finding=f"[stub] No LLM call. {count} timeline event(s).",
+        confidence=confidence,
+        evidence=[],
+        suggested_note="[stub] Rerun without --no-llm for a real assessment.",
+        next_checks=["Rerun without --no-llm"],
+        unknowns=["LLM assessment not performed"],
+        sources=["stub"],
+        generated_at=datetime.now(UTC),
+    )
+
+
+async def investigate_one(
+    ticket: Ticket,
+    *,
+    session: "InvestigationSession",
+    dd_client: DatadogClient | None = None,
+    reporter: Reporter,
+    interactive: bool = True,
+    workspace: "Path | None" = None,
+    cnc_override: str | None = None,
+    site_override: str | None = None,
+    anchor_override: datetime | None = None,
+    window_minutes: int = 30,
+    levels: list[str] | None = None,
+    verbose: bool = False,
+    redact_enabled: bool = True,
+    no_llm: bool = False,
+) -> TriageReport:
+    """Shared investigation core used by investigate, triage, and watch.
+
+    Enriches session with customer history + memory context, runs optional
+    site/Datadog enrichment, calls the configured LLM provider (or stub),
+    writes artifacts, and appends to the memory layer.
+    """
+    from pathlib import Path as _Path
+
+    from triage_cli import memory as mem
+    from triage_cli import render
+    from triage_cli.models import (
+        AnchorSource,
+        CustomerHistoryEvidence,
+        InvestigationSession,
+        MemoryContext,
+        TriageBundle,
+    )
+    from triage_cli.zendesk import ZendeskClient
+
+    effective_levels = levels or ["error", "warn", "info"]
+
+    # Phase: customer_history
+    reporter.phase_started("customer_history", "fetching requester history")
+    try:
+        zd_client = ZendeskClient.from_env()
+        history_tickets = zd_client.fetch_customer_history(
+            ticket.requester_email or "", limit=10,
+        )
+        if history_tickets:
+            session.evidence.customer_history = CustomerHistoryEvidence(
+                requester_email=ticket.requester_email or "",
+                tickets=history_tickets,
+                limit=10,
+            )
+        reporter.phase_done(
+            "customer_history",
+            f"{len(history_tickets)} prior ticket(s) found",
+        )
+    except Exception as e:
+        reporter.phase_failed("customer_history", e)
+
+    # Phase: memory_lookup
+    reporter.phase_started("memory_lookup", "querying prior investigations")
+    prior = mem.retrieve_similar(
+        ticket.subject,
+        (ticket.description or "")[:500],
+        limit=3,
+    )
+    duplicate = mem.find_duplicate(str(ticket.id))
+    if duplicate:
+        print(
+            f"⚠ ZD-{ticket.id} was previously investigated",
+            file=sys.stderr,
+            flush=True,
+        )
+    session.memory_context = MemoryContext(
+        entries=prior,
+        query_tokens=ticket.subject.lower().split(),
+    )
+    reporter.phase_done("memory_lookup", f"{len(prior)} prior investigation(s) found")
+
+    # Phase: evidence_intake (interactive only — CLI handles this before calling us)
+    if interactive:
+        reporter.phase_started("evidence_intake")
+        reporter.phase_done("evidence_intake")
+
+    # Phase: build_timeline
+    reporter.phase_started("build_timeline")
+    reporter.phase_done("build_timeline", f"{len(session.timeline)} event(s)")
+
+    # Phase: enrichment (optional Datadog)
+    reporter.phase_started("enrichment")
+    site_entry = None
+    log_lines: list = []
+    log_truncated = False
+    if dd_client is not None:
+        try:
+            sites_path = _Path("data/cnc-map.json")
+            if sites_path.exists():
+                import json as _json
+                from triage_cli.models import SiteEntry
+                raw_sites = _json.loads(sites_path.read_text())
+                sites = [SiteEntry(**s) for s in raw_sites]
+                site_entry, _ = resolve_site(
+                    ticket, sites,
+                    cnc_override=cnc_override,
+                    site_override=site_override,
+                    verbose=verbose,
+                )
+                if site_entry:
+                    extracted_dt: datetime | None = None
+                    if anchor_override is None:
+                        try:
+                            extracted_dt = await _llm_extract_anchor(ticket)
+                        except Exception:
+                            pass
+                    anchor_dt, _ = extract.resolve_anchor(
+                        ticket, at_flag=anchor_override, extracted=extracted_dt,
+                    )
+                    start, end = extract.build_window(anchor_dt, window_minutes)
+                    log_lines, log_truncated = dd_client.get_logs(
+                        site_entry.site_name, effective_levels, start, end,
+                    )
+            reporter.phase_done("enrichment", f"{len(log_lines)} log line(s)")
+        except Exception as e:
+            reporter.phase_failed("enrichment", e)
+    else:
+        reporter.phase_done("enrichment", "skipped (no Datadog client)")
+
+    # Phase: llm_call
+    reporter.phase_started("llm_call", "generating assessment")
+    if no_llm:
+        report = _stub_assess(ticket, session)
+        reporter.phase_done("llm_call", "stub (--no-llm)")
+    else:
+        from triage_cli import llm as _llm_mod
+        bundle = TriageBundle(
+            ticket=ticket,
+            site_entry=site_entry,
+            log_lines=log_lines,
+            log_truncated=log_truncated,
+            anchor=anchor_override or ticket.created_at,
+            anchor_source=AnchorSource.FLAG if anchor_override else AnchorSource.CREATED_AT,
+            window_start=None,
+            window_end=None,
+            downloaded_attachments=list(session.evidence.attachments),
+            local_files=list(session.evidence.local_files),
+            pasted_logs=list(session.evidence.pasted_logs),
+            customer_history=session.evidence.customer_history,
+            memory_context=session.memory_context,
+        )
+        llm_out = await _llm_mod.triage(bundle, verbose=verbose)
+        report = TriageReport(
+            **llm_out.model_dump(),
+            ticket_id=ticket.id,
+            site_name=site_entry.site_name if site_entry else None,
+            sources=["zendesk"] + (["datadog"] if dd_client and log_lines else []),
+            log_event_count=len(log_lines),
+            generated_at=datetime.now(UTC),
+        )
+        reporter.phase_done("llm_call", f"confidence={report.confidence}")
+
+    # Phase: save
+    reporter.phase_started("save")
+    notes_dir = _Path("triage-notes")
+    notes_dir.mkdir(exist_ok=True)
+    render.save_note(report, ticket.id, notes_dir)
+    mem.append_investigation(
+        ticket_id=str(ticket.id),
+        customer=ticket.requester_email or "unknown",
+        subject=ticket.subject,
+        symptom=(ticket.description or "")[:500],
+        assessment=report.finding,
+    )
+    reporter.phase_done("save")
+    reporter.done(report)
+    return report

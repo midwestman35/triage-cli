@@ -112,6 +112,7 @@ class Ticket(BaseModel):
     subject: str
     description: str
     requester_org: str | None = None
+    requester_email: str | None = None
     tags: list[str] = Field(default_factory=list)
     created_at: datetime
     updated_at: datetime | None = None
@@ -244,16 +245,18 @@ class TriageBundle(BaseModel):
     """Inputs to the LLM triage call: ticket, customer context, and log window."""
 
     ticket: Ticket
-    site_entry: SiteEntry
+    site_entry: SiteEntry | None = None
     log_lines: list[LogLine] = Field(default_factory=list)
     log_truncated: bool = False
-    anchor: datetime
-    anchor_source: AnchorSource
-    window_start: datetime
-    window_end: datetime
+    anchor: datetime | None = None
+    anchor_source: AnchorSource | None = None
+    window_start: datetime | None = None
+    window_end: datetime | None = None
     downloaded_attachments: list[AttachmentEvidence] = Field(default_factory=list)
     local_files: list[LocalFileEvidence] = Field(default_factory=list)
     pasted_logs: list[PastedEvidence] = Field(default_factory=list)
+    customer_history: "CustomerHistoryEvidence | None" = None
+    memory_context: "MemoryContext | None" = None
 
     def as_user_message(self) -> str:
         t = self.ticket
@@ -263,11 +266,32 @@ class TriageBundle(BaseModel):
         org_str = t.requester_org if t.requester_org else "(unset)"
 
         lines: list[str] = []
-        lines.append("# Customer")
-        lines.append(f"- Friendly name: {s.friendly_name}")
-        lines.append(f"- Site: {s.site_name}")
-        lines.append(f"- CNC: {s.cnc}")
-        lines.append("")
+
+        # Memory context — inject prior investigations before ticket body.
+        if self.memory_context and self.memory_context.entries:
+            lines.append("## Prior investigations (top similar)")
+            for e in self.memory_context.entries:
+                lines.append(f"{e.ticket_id} | {e.customer} | {e.subject}")
+                lines.append(f"  Assessment: {e.assessment}")
+                if e.resolution and e.resolution != "[unknown]":
+                    lines.append(f"  Resolution: {e.resolution}")
+            lines.append("")
+
+        # Customer ticket history.
+        if self.customer_history and self.customer_history.tickets:
+            lines.append("## Customer ticket history (recent)")
+            for tk in self.customer_history.tickets:
+                lines.append(
+                    f"{tk.id} | {tk.status:<8} | {tk.updated_at.strftime('%Y-%m-%d')} | {tk.subject}"
+                )
+            lines.append("")
+
+        if s is not None:
+            lines.append("# Customer")
+            lines.append(f"- Friendly name: {s.friendly_name}")
+            lines.append(f"- Site: {s.site_name}")
+            lines.append(f"- CNC: {s.cnc}")
+            lines.append("")
         lines.append(f"# Ticket #{t.id}")
         lines.append(f"Subject: {t.subject}")
         lines.append(f"Created: {fmt_ts(t.created_at)}")
@@ -288,13 +312,16 @@ class TriageBundle(BaseModel):
         lines.append("")
 
         n = len(self.log_lines)
-        truncated_str = ", truncated" if self.log_truncated else ""
-        header = (
-            f"# Logs (anchor: {fmt_ts(self.anchor)} from {self.anchor_source.value}; "
-            f"window: {fmt_ts(self.window_start)} to {fmt_ts(self.window_end)}; "
-            f"{n} lines{truncated_str})"
-        )
-        lines.append(header)
+        if self.anchor and self.anchor_source and self.window_start and self.window_end:
+            truncated_str = ", truncated" if self.log_truncated else ""
+            header = (
+                f"# Logs (anchor: {fmt_ts(self.anchor)} from {self.anchor_source.value}; "
+                f"window: {fmt_ts(self.window_start)} to {fmt_ts(self.window_end)}; "
+                f"{n} lines{truncated_str})"
+            )
+            lines.append(header)
+        else:
+            lines.append(f"# Logs ({n} lines; no Datadog window)")
         if self.log_lines:
             for log in self.log_lines:
                 msg = indent_continuations(log.message)
