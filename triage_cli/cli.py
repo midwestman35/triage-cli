@@ -23,8 +23,9 @@ from triage_cli.zendesk import ZendeskClient
 load_dotenv()
 
 _VALID_LEVELS = {"error", "warn", "info", "debug"}
-_SITE_MAP_PATH = Path("data/cnc-map.json")
-_VIEWS_PATH = Path("data/views.json")
+_DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+_SITE_MAP_PATH = _DATA_DIR / "cnc-map.json"
+_VIEWS_PATH = _DATA_DIR / "views.json"
 
 app = typer.Typer(no_args_is_help=True, add_completion=False)
 
@@ -490,7 +491,7 @@ def inbox(
     view_id, view_key = _resolve_view(view)
     backfill_hours = _parse_backfill(backfill)
     level_list = _parse_levels(levels)
-    state_file = Path("data") / f"watcher-state-{view_key}.json"
+    state_file = _DATA_DIR / f"watcher-state-{view_key}.json"
     state_file.parent.mkdir(parents=True, exist_ok=True)
 
     log_path = _configure_inbox_logging(view_key, verbose)
@@ -505,6 +506,7 @@ def inbox(
         no_logs=no_logs,
         print_notes=False,
         verbose=verbose,
+        site_map_path=_SITE_MAP_PATH,
     )
     typer.echo(f"Logging to {log_path}", err=True)
     InboxApp(opts).run()
@@ -551,7 +553,7 @@ def watch(
     resolved_state = (
         state_file
         if state_file is not None
-        else Path(f"data/watcher-state-{view}.json")
+        else _DATA_DIR / f"watcher-state-{view}.json"
     )
 
     opts = WatcherOptions(
@@ -564,6 +566,7 @@ def watch(
         no_logs=no_logs,
         print_notes=print_notes,
         verbose=verbose,
+        site_map_path=_SITE_MAP_PATH,
     )
     try:
         run_watch(opts)

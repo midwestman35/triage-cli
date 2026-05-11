@@ -155,3 +155,76 @@ def test_triage_one_headless_bundle_has_empty_evidence_fields(
 
     # Confirm fake was used, not the real LLM (defense against import drift).
     assert _real_triage is not fake_triage
+
+
+def test_triage_one_on_phase_fires_lm_only_when_no_logs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With dd_client=None, only step 4 (Asking Claude) fires."""
+    from triage_cli.models import LLMTriageOutput
+
+    async def fake_triage(_bundle, model=None, *, verbose=False):  # noqa: ARG001
+        return LLMTriageOutput(finding="x", confidence="low", evidence=[], suggested_note="y")
+
+    monkeypatch.setattr(pipeline, "_llm_triage", fake_triage)
+
+    calls: list[tuple[str, int]] = []
+    pipeline.triage_one(
+        _ticket(), _site(),
+        dd_client=None,
+        window_minutes=30, levels=["error"], at=None,
+        verbose=False, show_spinner=False,
+        on_phase=lambda label, step: calls.append((label, step)),
+    )
+    assert calls == [("Asking Claude", 4)]
+
+
+def test_triage_one_on_phase_fires_all_steps_with_logs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With dd_client and at=None, steps 2, 3, 4 all fire."""
+    from triage_cli.models import LLMTriageOutput, LogLine
+
+    async def fake_triage(_bundle, model=None, *, verbose=False):  # noqa: ARG001
+        return LLMTriageOutput(finding="x", confidence="low", evidence=[], suggested_note="y")
+
+    async def fake_anchor(_ticket, model=None):  # noqa: ARG001
+        return None
+
+    class FakeDD:
+        def get_logs(self, _site, _levels, _start, _end):
+            ts = datetime(2026, 5, 7, 12, 0, 0, tzinfo=UTC)
+            return ([LogLine(timestamp=ts, level="error", message="boom")], False)
+
+    monkeypatch.setattr(pipeline, "_llm_triage", fake_triage)
+    monkeypatch.setattr(pipeline, "_llm_extract_anchor", fake_anchor)
+
+    calls: list[tuple[str, int]] = []
+    pipeline.triage_one(
+        _ticket(), _site(),
+        dd_client=FakeDD(),  # type: ignore[arg-type]
+        window_minutes=30, levels=["error"], at=None,
+        verbose=False, show_spinner=False,
+        on_phase=lambda label, step: calls.append((label, step)),
+    )
+    assert calls == [
+        ("Extracting anchor timestamp", 2),
+        ("Querying Datadog", 3),
+        ("Asking Claude", 4),
+    ]
+
+
+def test_triage_one_on_phase_none_is_safe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """on_phase=None (the default) does not raise."""
+    from triage_cli.models import LLMTriageOutput
+
+    async def fake_triage(_bundle, model=None, *, verbose=False):  # noqa: ARG001
+        return LLMTriageOutput(finding="x", confidence="low", evidence=[], suggested_note="y")
+
+    monkeypatch.setattr(pipeline, "_llm_triage", fake_triage)
+    pipeline.triage_one(
+        _ticket(), _site(),
+        dd_client=None,
+        window_minutes=30, levels=["error"], at=None,
+        verbose=False, show_spinner=False,
+    )  # no on_phase — must not raise

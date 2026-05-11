@@ -18,7 +18,7 @@ import os
 import sys
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -45,6 +45,7 @@ class WatcherOptions:
     no_logs: bool
     print_notes: bool
     verbose: bool
+    site_map_path: Path = field(default_factory=lambda: Path("data/cnc-map.json"))
 
 
 State = dict[str, Any]
@@ -242,7 +243,7 @@ def run_watch(opts: WatcherOptions) -> None:
     (cannot load site map, missing Zendesk env), raises RuntimeError so
     the CLI can print and exit.
     """
-    sites = extract.load_site_map(Path("data/cnc-map.json"))
+    sites = extract.load_site_map(opts.site_map_path)
     state = load_state(opts.state_file)
     cutoff = (
         datetime.now(UTC) - timedelta(hours=opts.backfill_hours)

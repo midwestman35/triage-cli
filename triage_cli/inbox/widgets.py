@@ -5,7 +5,10 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Literal
 
-from textual.widgets import DataTable, Static
+from textual.app import ComposeResult
+from textual.containers import Vertical
+from textual.widget import Widget
+from textual.widgets import DataTable, Label, ProgressBar, Static
 
 from triage_cli.models import TriageReport
 from triage_cli.render import rich_layout
@@ -33,7 +36,35 @@ _STATUS_LABELS: dict[Status, str] = {
     "failed": "failed",
 }
 
+_CONFIDENCE_STYLE: dict[str, str] = {
+    "high":   "[bold green]high[/]",
+    "medium": "[yellow]med[/]",
+    "low":    "[red]low[/]",
+}
+
+_ROW_STYLE: dict[Status, str | None] = {
+    "failed":   "on dark_red",
+    "triaging": "on dark_goldenrod",
+    "triaged":  None,
+    "queued":   None,
+}
+
 _SELECTED_ICON = "◉"
+
+
+def _relative_time(dt: datetime, *, now: datetime | None = None) -> str:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    _now = now or datetime.now(UTC)
+    minutes = int((_now - dt).total_seconds() / 60)
+    if minutes < 2:
+        return "just now"
+    if minutes < 60:
+        return f"{minutes}m ago"
+    hours = minutes // 60
+    if hours < 24:
+        return f"{hours}h ago"
+    return f"{(_now - dt).days}d ago"
 
 
 @dataclass
@@ -45,6 +76,8 @@ class RowEntry:
     report: TriageReport | None
     site_hint: str | None = None
     failure_reason: str | None = None
+    phase_label: str | None = None
+    phase_step: int = 0
 
 
 def sort_rows(rows: list[RowEntry]) -> list[RowEntry]:
@@ -103,16 +136,28 @@ class TicketListWidget(DataTable):
             status_icon = _STATUS_ICONS[row.status]
             icon = f"{_SELECTED_ICON} {status_icon}" if is_selected else f"  {status_icon}"
             site = report.site_name if report is not None else row.site_hint or "—"
-            when = report.generated_at.strftime("%H:%M") if report is not None else "—"
-            confidence = report.confidence if report is not None else "—"
+            when = _relative_time(report.generated_at) if report is not None else "—"
+            confidence = (
+                _CONFIDENCE_STYLE.get(report.confidence, report.confidence)
+                if report is not None
+                else "—"
+            )
             summary = (
                 report.finding[:60]
                 if report is not None
                 else row.failure_reason or _STATUS_LABELS[row.status]
             )
+            style = _ROW_STYLE[row.status]
+            if style:
+                icon, ticket_col, site, when, confidence, summary = (
+                    f"[{style}]{v}[/]"
+                    for v in (icon, f"#{row.ticket_id}", site, when, confidence, summary)
+                )
+            else:
+                ticket_col = f"#{row.ticket_id}"
             self.add_row(
                 icon,
-                f"#{row.ticket_id}",
+                ticket_col,
                 site,
                 when,
                 confidence,
@@ -126,21 +171,48 @@ class TicketListWidget(DataTable):
             self.move_cursor(row=selected_row)
 
 
-class ReportPaneWidget(Static):
-    """Inbox right pane: renders the selected TriageReport via Rich layout."""
+class ReportPaneWidget(Widget):
+    """Inbox right pane: report view or triage progress bar."""
 
     can_focus = True
 
     DEFAULT_CSS = """
     ReportPaneWidget { padding: 1 2; overflow-y: auto; }
+    #progress-region { align: center middle; height: 1fr; }
+    #phase-label { margin-bottom: 1; }
     """
 
     current_report: TriageReport | None = None
 
-    def show(self, report: TriageReport | None, *, placeholder: str | None = None) -> None:
-        self.current_report = report
-        if report is None:
-            self.update(placeholder or "[dim]Select a ticket to view its report.[/]")
-            return
+    def compose(self) -> ComposeResult:
+        yield Static(
+            "[dim]Select a ticket to view its report.[/]",
+            id="report-body",
+        )
+        with Vertical(id="progress-region"):
+            yield Label("", id="phase-label")
+            yield ProgressBar(total=4, show_eta=False, id="phase-bar")
 
-        self.update(rich_layout(report))
+    def on_mount(self) -> None:
+        self.query_one("#progress-region").display = False
+
+    def show_report(self, report: TriageReport) -> None:
+        self.current_report = report
+        self.query_one("#progress-region").display = False
+        body = self.query_one("#report-body", Static)
+        body.display = True
+        body.update(rich_layout(report))
+
+    def show_progress(self, label: str, step: int) -> None:
+        self.current_report = None
+        self.query_one("#report-body", Static).display = False
+        self.query_one("#progress-region").display = True
+        self.query_one("#phase-label", Label).update(label)
+        self.query_one("#phase-bar", ProgressBar).update(progress=step)
+
+    def show_placeholder(self, text: str | None = None) -> None:
+        self.current_report = None
+        self.query_one("#progress-region").display = False
+        body = self.query_one("#report-body", Static)
+        body.display = True
+        body.update(text or "[dim]Select a ticket to view its report.[/]")

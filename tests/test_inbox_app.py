@@ -7,6 +7,8 @@ import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from textual.widgets import Static
+
 import triage_cli.inbox.app as app_module
 from triage_cli.inbox.app import InboxApp
 from triage_cli.inbox.widgets import ReportPaneWidget, TicketListWidget
@@ -77,7 +79,8 @@ def test_inbox_app_empty_state_subtitle_and_detail_copy(tmp_path: Path) -> None:
 
             detail = app.query_one("#detail", ReportPaneWidget)
             assert detail.current_report is None
-            assert str(detail.render()) == "Select a ticket to view its report."
+            report_body = detail.query_one("#report-body", Static)
+            assert "Select a ticket" in str(report_body.content)
 
     asyncio.run(run())
 
@@ -484,8 +487,79 @@ def test_run_iteration_blocking_routes_watcher_stderr_to_log(
         ),
         notes_dir=tmp_path,
     )
-    with caplog.at_level("WARNING", logger="triage_cli.inbox.app"):
+    with caplog.at_level("DEBUG", logger="triage_cli.inbox.app"):
         app._run_iteration_blocking(app._state)
 
     assert "watcher status line" in caplog.text
     assert "watcher status line" not in capsys.readouterr().err
+
+
+def test_run_iteration_blocking_logs_iteration_aborted_at_warning(
+    tmp_path: Path,
+    monkeypatch,
+    caplog,
+) -> None:
+    """'iteration aborted' lines from watcher are logged at WARNING, not DEBUG."""
+
+    class Context:
+        def __enter__(self) -> object:
+            return object()
+
+        def __exit__(self, *_exc: object) -> None:
+            return None
+
+    def run_iteration(*_args, on_view_listed=None, **_kwargs):
+        if on_view_listed is not None:
+            on_view_listed([99])
+        print("[17:00:00] iteration aborted: Zendesk error 400", file=sys.stderr)
+        print("[17:00:00] #12345 unchanged", file=sys.stderr)
+        return {"version": 1, "triaged": {}}
+
+    monkeypatch.setattr(app_module.extract, "load_site_map", lambda _path: [])
+    monkeypatch.setattr(app_module.ZendeskClient, "from_env", lambda: Context())
+    monkeypatch.setattr(app_module.watcher, "run_iteration", run_iteration)
+    monkeypatch.setattr(app_module.watcher, "save_state", lambda *_args: None)
+
+    inbox = InboxApp(
+        WatcherOptions(
+            view_id=99,
+            interval=60,
+            state_file=tmp_path / "state.json",
+            backfill_hours=0.0,
+            window_minutes=15,
+            levels=["error", "warn"],
+            no_logs=True,
+            print_notes=False,
+            verbose=False,
+        ),
+        notes_dir=tmp_path,
+    )
+    with caplog.at_level("DEBUG", logger="triage_cli.inbox.app"):
+        inbox._run_iteration_blocking(inbox._state)
+
+    warning_lines = [r.message for r in caplog.records if r.levelname == "WARNING"]
+
+    assert any("iteration aborted" in m for m in warning_lines), (
+        "'iteration aborted' must be logged at WARNING so it appears in the default log"
+    )
+    assert any("#12345 unchanged" in m for m in warning_lines), (
+        "all watcher output lines must be logged at WARNING"
+    )
+
+
+def test_set_phase_updates_row_entry(tmp_path: Path) -> None:
+    """_set_phase stores phase label and step on the RowEntry."""
+    from triage_cli.inbox.widgets import RowEntry
+
+    async def run() -> None:
+        app = InboxApp(_opts(tmp_path), notes_dir=tmp_path, poll_on_mount=False)
+        async with app.run_test():
+            app._rows[999] = RowEntry(ticket_id=999, status="triaging", report=None)
+            app._set_phase(999, "Asking Claude", 4)
+            await asyncio.sleep(0)
+
+            entry = app._rows[999]
+            assert entry.phase_label == "Asking Claude"
+            assert entry.phase_step == 4
+
+    asyncio.run(run())

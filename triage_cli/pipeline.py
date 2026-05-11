@@ -11,7 +11,7 @@ import asyncio
 import contextlib
 import logging
 import sys
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
 
 from unicode_animations import live_spinner as _live_spinner
@@ -97,6 +97,7 @@ def triage_one(
     downloaded_attachments: list | None = None,
     local_files: list | None = None,
     pasted_logs: list | None = None,
+    on_phase: Callable[[str, int], None] | None = None,
 ) -> TriageReport:
     """Run the triage pipeline for a fetched ticket and resolved site.
 
@@ -109,6 +110,8 @@ def triage_one(
     extracted_dt: datetime | None = None
     if dd_client is not None and at is None:
         try:
+            if on_phase is not None:
+                on_phase("Extracting anchor timestamp", 2)
             with spinner("Asking Claude to extract incident timestamp", show=show_spinner):
                 extracted_dt = asyncio.run(_llm_extract_anchor(ticket))
         except Exception as e:
@@ -125,6 +128,8 @@ def triage_one(
     if dd_client is None:
         _vecho(verbose, "Skipping Datadog (--no-logs)")
     else:
+        if on_phase is not None:
+            on_phase("Querying Datadog", 3)
         with spinner(f"Querying Datadog for {site_entry.site_name}", show=show_spinner):
             log_lines, log_truncated = dd_client.get_logs(
                 site_entry.site_name, levels, start, end,
@@ -145,6 +150,8 @@ def triage_one(
         pasted_logs=pasted_logs or [],
     )
 
+    if on_phase is not None:
+        on_phase("Asking Claude", 4)
     with spinner("Generating triage note", show=show_spinner):
         llm_out = asyncio.run(_llm_triage(bundle, verbose=verbose))
 

@@ -7,6 +7,7 @@ import io
 import logging
 import math
 import os
+import threading
 import webbrowser
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -16,6 +17,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, Footer, Header, Input, Label
+from textual.worker import Worker
 
 from triage_cli import extract, pipeline, render, watcher
 from triage_cli.datadog import DatadogClient
@@ -90,7 +92,8 @@ class InboxApp(App):
         Binding("up,k", "cursor_up", "up", priority=True),
         Binding("down,j", "cursor_down", "down", priority=True),
         Binding("enter", "focus_detail", "focus", priority=True),
-        Binding("escape", "focus_list", "", priority=True),
+        Binding("escape", "focus_list", "list", priority=True),
+        Binding("ctrl+p", "focus_list", "back to list", priority=True),
         Binding("r", "refresh", "refresh", priority=True),
         Binding("y", "copy_note", "copy", priority=True),
         Binding("o", "open_zendesk", "open", priority=True),
@@ -126,6 +129,8 @@ class InboxApp(App):
             if math.isfinite(self.opts.backfill_hours)
             else datetime.min.replace(tzinfo=UTC)
         )
+        self._shutdown_event = threading.Event()
+        self._pending_workers: set[Worker] = set()
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -134,14 +139,28 @@ class InboxApp(App):
             yield ReportPaneWidget(id="detail")
         yield Footer()
 
+    async def on_unmount(self) -> None:
+        self._shutdown_event.set()
+        for worker in list(self._pending_workers):
+            if worker.is_running:
+                worker.cancel()
+        self._pending_workers.clear()
+        watcher.save_state(self.opts.state_file, watcher.prune_state(self._state))
+
+    def _tracked_worker(self, coro, **kwargs) -> Worker:
+        self._pending_workers = {w for w in self._pending_workers if w.is_running}
+        worker = self.run_worker(coro, **kwargs)
+        self._pending_workers.add(worker)
+        return worker
+
     async def on_mount(self) -> None:
         self._hydrate_recent_reports()
         self._refresh_list()
-        self.query_one("#detail", ReportPaneWidget).show(None)
+        self.query_one("#detail", ReportPaneWidget).show_placeholder()
         self.query_one("#list", TicketListWidget).focus()
         if self.poll_on_mount:
             self.set_interval(self.opts.interval, self._poll_tick)
-            self.run_worker(self._poll_tick(), exclusive=False)
+            self._tracked_worker(self._poll_tick(), exclusive=False)
 
     def _hydrate_recent_reports(self) -> int:
         hydrated_count = 0
@@ -212,7 +231,13 @@ class InboxApp(App):
         (e.g. Zendesk auth failure, network error). ``_poll_tick`` converts
         that into a visible TUI notification.
         """
-        sites = extract.load_site_map(Path("data/cnc-map.json"))
+        if self._shutdown_event.is_set():
+            return state
+
+        try:
+            sites = extract.load_site_map(self.opts.site_map_path)
+        except FileNotFoundError as e:
+            raise RuntimeError(str(e)) from e
 
         stderr_buffer = io.StringIO()
         view_listed = False
@@ -328,6 +353,15 @@ class InboxApp(App):
             entry.failure_reason = error
         self._refresh_list()
 
+    def _set_phase(self, ticket_id: int, label: str, step: int) -> None:
+        entry = self._rows.get(ticket_id)
+        if entry is None:
+            return
+        entry.phase_label = label
+        entry.phase_step = step
+        if self._selected_ticket_id() == ticket_id:
+            self.query_one("#detail", ReportPaneWidget).show_progress(label, step)
+
     def _selected_ticket_id(self) -> int | None:
         list_widget = self.query_one("#list", TicketListWidget)
         if list_widget.row_count and list_widget.is_valid_coordinate(
@@ -363,7 +397,7 @@ class InboxApp(App):
     async def action_focus_detail(self) -> None:
         entry = self._currently_selected()
         if entry is not None and entry.status == "queued":
-            self.run_worker(self._triage_ticket_async(entry.ticket_id), exclusive=False)
+            self._tracked_worker(self._triage_ticket_async(entry.ticket_id), exclusive=False)
             self.notify("Starting triage…", timeout=2)
             return
         self.query_one("#detail", ReportPaneWidget).focus()
@@ -384,9 +418,10 @@ class InboxApp(App):
         The modal's dismiss handler restarts triage with the user-provided site override.
         """
         self.call_from_thread(self._set_status, ticket_id, "triaging")
+        self.call_from_thread(self._set_phase, ticket_id, "Fetching ticket", 1)
 
         try:
-            sites = extract.load_site_map(Path("data/cnc-map.json"))
+            sites = extract.load_site_map(self.opts.site_map_path)
         except (FileNotFoundError, ValueError) as e:
             self._on_failure(ticket_id, f"Site map error: {e}")
             return
@@ -410,6 +445,9 @@ class InboxApp(App):
         self, ticket_id: int, ticket: Ticket, site_entry: SiteEntry
     ) -> None:
         """Run the triage pipeline for a resolved ticket+site (worker thread)."""
+        def _phase(label: str, step: int) -> None:
+            self.call_from_thread(self._set_phase, ticket_id, label, step)
+
         try:
             if self.opts.no_logs:
                 report = pipeline.triage_one(
@@ -417,6 +455,7 @@ class InboxApp(App):
                     window_minutes=self.opts.window_minutes,
                     levels=self.opts.levels, at=None,
                     verbose=self.opts.verbose, show_spinner=False,
+                    on_phase=_phase,
                 )
             else:
                 with DatadogClient.from_env() as dd:
@@ -425,6 +464,7 @@ class InboxApp(App):
                         window_minutes=self.opts.window_minutes,
                         levels=self.opts.levels, at=None,
                         verbose=self.opts.verbose, show_spinner=False,
+                        on_phase=_phase,
                     )
             render.save_note(report, ticket_id)
             self._on_complete(report)
@@ -438,7 +478,7 @@ class InboxApp(App):
                 self._set_failure(ticket.id, "Triage cancelled — no site provided")
                 return
             site_entry, _ = extract.lookup_site(ticket, sites, site_override=site_name)
-            self.run_worker(
+            self._tracked_worker(
                 asyncio.to_thread(self._run_pipeline_blocking, ticket.id, ticket, site_entry),
                 exclusive=False,
             )
@@ -450,7 +490,7 @@ class InboxApp(App):
 
     async def action_refresh(self) -> None:
         if self.poll_on_mount:
-            self.run_worker(self._poll_tick(), exclusive=False)
+            self._tracked_worker(self._poll_tick(), exclusive=False)
             self.notify("Refreshing...", timeout=1)
             return
 
@@ -502,13 +542,13 @@ class InboxApp(App):
         entry = self._rows.get(ticket_id)
         detail = self.query_one("#detail", ReportPaneWidget)
         if entry is None:
-            detail.show(None)
+            detail.show_placeholder()
         elif entry.status == "queued":
-            detail.show(None, placeholder="[dim]○ In queue — press [bold]Enter[/] to triage now[/]")
+            detail.show_placeholder("[dim]○ In queue — press [bold]Enter[/] to triage now[/]")
         elif entry.status == "triaging":
-            detail.show(None, placeholder="[dim]→ Triaging in progress…[/]")
+            detail.show_progress(entry.phase_label or "Triaging…", entry.phase_step)
         elif entry.status == "failed":
             reason = entry.failure_reason or "Unknown error"
-            detail.show(None, placeholder=f"[red]✗ Triage failed:[/red]\n\n{reason}")
+            detail.show_placeholder(f"[red]✗ Triage failed:[/red]\n\n{reason}")
         else:
-            detail.show(entry.report)
+            detail.show_report(entry.report)
