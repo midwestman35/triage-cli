@@ -16,8 +16,7 @@ import typer
 from dotenv import load_dotenv
 
 from triage_cli import extract, pipeline, render
-from triage_cli.datadog import DatadogClient, DatadogError
-from triage_cli.models import SiteEntry, TriageReport
+from triage_cli.datadog import DatadogClient
 from triage_cli.pipeline import spinner as _spinner
 from triage_cli.zendesk import ZendeskClient
 
@@ -168,7 +167,10 @@ def doctor() -> None:
         if os.environ.get(key_var):
             typer.echo(f"  ✓ {key_var}", err=True)
         else:
-            typer.secho(f"  ✗ {key_var} not set (required for LLM_PROVIDER={provider})", fg=typer.colors.RED, err=True)
+            typer.secho(
+                f"  ✗ {key_var} not set (required for LLM_PROVIDER={provider})",
+                fg=typer.colors.RED, err=True,
+            )
             ok = False
 
     # Output dir — critical
@@ -188,7 +190,10 @@ def doctor() -> None:
     if dd_ok:
         typer.echo("  ✓ Datadog configured (DD_API_KEY, DD_APP_KEY)", err=True)
     else:
-        typer.secho("  ⚠ Datadog not configured — --no-logs will be forced", fg=typer.colors.YELLOW, err=True)
+        typer.secho(
+            "  ⚠ Datadog not configured — --no-logs will be forced",
+            fg=typer.colors.YELLOW, err=True,
+        )
 
     if not ok:
         raise typer.Exit(code=1)
@@ -231,6 +236,7 @@ def investigate(
         "error,warn", "--levels", help="Datadog log levels: comma-separated",
     ),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
+    tui: bool = typer.Option(False, "--tui", help="Show three-pane progress TUI (requires TTY)."),
 ) -> None:
     """Run an interactive investigation on a Zendesk ticket."""
     if not _is_interactive():
@@ -291,7 +297,11 @@ def investigate(
 
     from triage_cli.investigation import (
         add_local_file as _add_local,
+    )
+    from triage_cli.investigation import (
         add_pasted_evidence as _add_pasted,
+    )
+    from triage_cli.investigation import (
         create_session as _create_session,
     )
 
@@ -323,6 +333,56 @@ def investigate(
             dd_client = DatadogClient.from_env()
         except Exception:
             _vecho(verbose, "Datadog not configured — skipping logs")
+
+    if tui:
+        if not sys.stderr.isatty():
+            _die("--tui requires a TTY; rerun without --tui to use the linear flow.")
+        from triage_cli.tui.app import InvestigationApp
+        from triage_cli.tui.reporter import TUIReporter
+
+        async def _run_investigate_tui() -> None:
+            queue: asyncio.Queue = asyncio.Queue()
+            reporter_obj = TUIReporter(queue)
+
+            async def _pipeline():
+                return await pipeline.investigate_one(
+                    ticket_obj,
+                    session=session,
+                    dd_client=dd_client,
+                    reporter=reporter_obj,
+                    interactive=True,
+                    workspace=workspace.root,
+                    cnc_override=cnc,
+                    site_override=site,
+                    anchor_override=at_dt,
+                    window_minutes=window_minutes,
+                    levels=level_list,
+                    verbose=verbose,
+                    no_llm=no_llm,
+                )
+
+            task = asyncio.create_task(_pipeline())
+            tui_app = InvestigationApp(
+                ticket_id=ticket_obj.id,
+                subject=ticket_obj.subject,
+                queue=queue,
+                pipeline_task=task,
+            )
+            await tui_app.run_async()
+            if not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+
+        try:
+            asyncio.run(_run_investigate_tui())
+        except (RuntimeError, ValueError) as e:
+            _die(str(e))
+        finally:
+            if dd_client is not None:
+                with contextlib.suppress(Exception):
+                    dd_client.close()
+        return
 
     try:
         report = asyncio.run(
@@ -365,6 +425,7 @@ def triage(
     levels: str = typer.Option(
         "error,warn", "--levels", help="Datadog log levels: comma-separated"
     ),
+    tui: bool = typer.Option(False, "--tui", help="Show three-pane progress TUI (requires TTY)."),
 ) -> None:
     """Triage a single Zendesk ticket end-to-end (headless)."""
     logging.basicConfig(
@@ -396,6 +457,55 @@ def triage(
             dd_client = DatadogClient.from_env()
         except Exception:
             _vecho(verbose, "Datadog not configured — skipping logs")
+
+    if tui:
+        if not sys.stderr.isatty():
+            _die("--tui requires a TTY; rerun without --tui to use the linear flow.")
+        from triage_cli.tui.app import InvestigationApp
+        from triage_cli.tui.reporter import TUIReporter
+
+        async def _run_triage_tui() -> None:
+            queue: asyncio.Queue = asyncio.Queue()
+            reporter_obj = TUIReporter(queue)
+
+            async def _pipeline():
+                return await pipeline.investigate_one(
+                    ticket_obj,
+                    session=session,
+                    dd_client=dd_client,
+                    reporter=reporter_obj,
+                    interactive=False,
+                    cnc_override=cnc,
+                    site_override=site,
+                    anchor_override=at_dt,
+                    window_minutes=window_minutes,
+                    levels=level_list,
+                    verbose=verbose,
+                    no_llm=no_llm,
+                )
+
+            task = asyncio.create_task(_pipeline())
+            tui_app = InvestigationApp(
+                ticket_id=ticket_obj.id,
+                subject=ticket_obj.subject,
+                queue=queue,
+                pipeline_task=task,
+            )
+            await tui_app.run_async()
+            if not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+
+        try:
+            asyncio.run(_run_triage_tui())
+        except (RuntimeError, ValueError) as e:
+            _die(str(e))
+        finally:
+            if dd_client is not None:
+                with contextlib.suppress(Exception):
+                    dd_client.close()
+        return
 
     try:
         report = asyncio.run(
