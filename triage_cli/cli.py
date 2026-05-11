@@ -133,6 +133,28 @@ def _configure_inbox_logging(view_key: str, verbose: bool) -> Path:
     return log_path
 
 
+@app.command("setup")
+def setup_command() -> None:
+    """Run or resume the interactive local setup flow."""
+    from triage_cli import setup as setup_module
+
+    raise typer.Exit(code=setup_module.main())
+
+
+@app.command("doctor")
+def doctor(
+    skip_zendesk_probe: bool = typer.Option(
+        False,
+        "--skip-zendesk-probe",
+        help="Skip the live Zendesk /users/me.json read-only probe.",
+    ),
+) -> None:
+    """Check local config, writable paths, and external credentials."""
+    from triage_cli import setup as setup_module
+
+    raise typer.Exit(code=setup_module.doctor_main(zendesk_probe=not skip_zendesk_probe))
+
+
 @app.command()
 def investigate(
     ticket: str = typer.Argument(..., help="Zendesk ticket ID or full URL"),

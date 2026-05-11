@@ -1,4 +1,4 @@
-"""Focused contract tests for the interactive setup script."""
+"""Focused contract tests for the interactive setup engine."""
 
 from __future__ import annotations
 
@@ -11,8 +11,8 @@ import pytest
 
 
 def _load_script():
-    sys.modules.pop("scripts.setup", None)
-    return importlib.import_module("scripts.setup")
+    sys.modules.pop("triage_cli.setup", None)
+    return importlib.import_module("triage_cli.setup")
 
 
 def test_env_example_parser_preserves_keys_and_defaults(tmp_path: Path) -> None:
@@ -26,6 +26,11 @@ def test_env_example_parser_preserves_keys_and_defaults(tmp_path: Path) -> None:
                 "ZENDESK_EMAIL=",
                 "DD_SITE=datadoghq.com",
                 "",
+                "LLM_PROVIDER=unleash",
+                "UNLEASH_API_KEY=",
+                "UNLEASH_BASE_URL=https://e-api.unleash.so",
+                "UNLEASH_ASSISTANT_ID=",
+                "UNLEASH_ACCOUNT=",
                 "ANTHROPIC_MODEL=claude-sonnet-4-6",
             ]
         ),
@@ -38,10 +43,17 @@ def test_env_example_parser_preserves_keys_and_defaults(tmp_path: Path) -> None:
         "ZENDESK_SUBDOMAIN",
         "ZENDESK_EMAIL",
         "DD_SITE",
+        "LLM_PROVIDER",
+        "UNLEASH_API_KEY",
+        "UNLEASH_BASE_URL",
+        "UNLEASH_ASSISTANT_ID",
+        "UNLEASH_ACCOUNT",
         "ANTHROPIC_MODEL",
     ]
     assert values["ZENDESK_SUBDOMAIN"] == ""
     assert values["DD_SITE"] == "datadoghq.com"
+    assert values["LLM_PROVIDER"] == "unleash"
+    assert values["UNLEASH_BASE_URL"] == "https://e-api.unleash.so"
     assert values["ANTHROPIC_MODEL"] == "claude-sonnet-4-6"
 
 
@@ -52,6 +64,8 @@ def test_validate_config_value_normalizes_and_rejects_invalid_inputs() -> None:
     assert script.validate_zendesk_email(" analyst@example.com ") == "analyst@example.com"
     assert script.validate_required_secret(" token-value ") == "token-value"
     assert script.validate_zendesk_subdomain("http://acme-support/") == "acme-support"
+    assert script.validate_llm_provider(" Unleash ") == "unleash"
+    assert script.validate_llm_provider("") == "unleash"
 
     with pytest.raises(ValueError, match="spaces"):
         script.validate_zendesk_subdomain("acme support")
@@ -59,6 +73,68 @@ def test_validate_config_value_normalizes_and_rejects_invalid_inputs() -> None:
         script.validate_zendesk_email("analyst.example.com")
     with pytest.raises(ValueError, match="required"):
         script.validate_required_secret(" ")
+    with pytest.raises(ValueError, match="unleash or claude"):
+        script.validate_llm_provider("codex")
+
+
+def test_prereqs_default_unleash_does_not_require_claude(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    script = _load_script()
+    checked: list[str] = []
+
+    def fake_which(command: str) -> str | None:
+        checked.append(command)
+        if command == "python3.11":
+            return f"/usr/bin/{command}"
+        return None
+
+    monkeypatch.delenv("LLM_PROVIDER", raising=False)
+    monkeypatch.setattr(script, "ENV_PATH", tmp_path / ".env")
+    monkeypatch.setattr(script.shutil, "which", fake_which)
+    monkeypatch.setattr(
+        script,
+        "run_capture",
+        lambda command: script.CommandResult(returncode=0, output="ok"),
+    )
+
+    script.run_prereqs()
+
+    captured = capsys.readouterr()
+    assert checked == ["python3.11"]
+    assert "Unleash does not require a local LLM CLI" in captured.out
+
+
+def test_prereqs_claude_provider_requires_claude(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    script = _load_script()
+    env_path = tmp_path / ".env"
+    env_path.write_text("LLM_PROVIDER=claude\n", encoding="utf-8")
+    checked: list[str] = []
+
+    def fake_which(command: str) -> str | None:
+        checked.append(command)
+        if command == "python3.11":
+            return f"/usr/bin/{command}"
+        return None
+
+    monkeypatch.delenv("LLM_PROVIDER", raising=False)
+    monkeypatch.setattr(script, "ENV_PATH", env_path)
+    monkeypatch.setattr(script.shutil, "which", fake_which)
+    monkeypatch.setattr(
+        script,
+        "run_capture",
+        lambda command: script.CommandResult(returncode=0, output="ok"),
+    )
+
+    with pytest.raises(script.SetupError, match="Claude is only required"):
+        script.run_prereqs()
+
+    assert checked == ["python3.11", "claude"]
 
 
 def test_prompt_config_value_retries_only_failed_field(
@@ -97,7 +173,10 @@ def test_checkpoint_state_resumes_from_first_incomplete_phase(
     state_path = tmp_path / ".setup-state.json"
     state_path.write_text(
         json.dumps(
-            {"setup_version": "1", "completed_phases": ["PREREQS", "ENVIRONMENT"]}
+            {
+                "setup_version": script.SETUP_VERSION,
+                "completed_phases": ["PREREQS", "ENVIRONMENT"],
+            }
         ),
         encoding="utf-8",
     )
@@ -110,7 +189,7 @@ def test_checkpoint_state_resumes_from_first_incomplete_phase(
     script.mark_phase_complete(state, script.Phase.CONFIG)
     updated = json.loads(state_path.read_text(encoding="utf-8"))
     assert updated == {
-        "setup_version": "1",
+        "setup_version": script.SETUP_VERSION,
         "completed_phases": ["PREREQS", "ENVIRONMENT", "CONFIG"],
     }
     assert script.first_incomplete_phase(updated) == script.Phase.VERIFY
@@ -185,7 +264,7 @@ def test_verify_phase_runs_build_map_counts_entries_and_smokes_help(
             returncode=0,
             output=(
                 "Usage: triage-cli [OPTIONS] COMMAND [ARGS]...\n"
-                "triage\ninvestigate\ninbox\nwatch\nbuild-map\n"
+                "triage\ninvestigate\ninbox\nwatch\nsetup\ndoctor\nbuild-map\n"
             ),
         )
 
@@ -252,7 +331,7 @@ def test_verify_phase_rejects_help_missing_inbox_subcommand(
             return script.CommandResult(returncode=0, output="")
         return script.CommandResult(
             returncode=0,
-            output="triage\ninvestigate\nwatch\nbuild-map\n",
+            output="triage\ninvestigate\nwatch\nsetup\ndoctor\nbuild-map\n",
         )
 
     monkeypatch.setattr(script, "VENV_PATH", tmp_path / ".venv")
