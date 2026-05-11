@@ -13,6 +13,7 @@ import logging
 import sys
 from collections.abc import Iterator
 from datetime import UTC, datetime
+from typing import Any, Protocol, runtime_checkable
 
 from unicode_animations import live_spinner as _live_spinner
 
@@ -24,6 +25,64 @@ from triage_cli.llm import triage as _llm_triage
 from triage_cli.models import SiteEntry, Ticket, TimeWindow, TriageBundle, TriageReport
 
 logger = logging.getLogger(__name__)
+
+
+@runtime_checkable
+class Reporter(Protocol):
+    """Decouples progress output from pipeline logic.
+
+    StderrReporter (default), TUIReporter (--tui), SilentReporter (tests).
+    """
+
+    def phase_started(self, phase: str, detail: str = "") -> None: ...
+    def phase_done(self, phase: str, detail: str = "") -> None: ...
+    def phase_failed(self, phase: str, err: Exception) -> None: ...
+    def evidence_added(self, item: Any) -> None: ...
+    def done(self, report: "TriageReport") -> None: ...
+
+
+class StderrReporter:
+    """Write pipeline progress to stderr. phase_started is gated by verbose."""
+
+    def __init__(self, verbose: bool = True) -> None:
+        self._verbose = verbose
+
+    def phase_started(self, phase: str, detail: str = "") -> None:
+        if self._verbose:
+            msg = f"→ {phase}" + (f": {detail}" if detail else "")
+            print(msg, file=sys.stderr, flush=True)
+
+    def phase_done(self, phase: str, detail: str = "") -> None:
+        msg = f"✓ {phase}" + (f": {detail}" if detail else "")
+        print(msg, file=sys.stderr, flush=True)
+
+    def phase_failed(self, phase: str, err: Exception) -> None:
+        print(f"✗ {phase}: {err}", file=sys.stderr, flush=True)
+
+    def evidence_added(self, item: Any) -> None:
+        pass
+
+    def done(self, report: "TriageReport") -> None:
+        pass
+
+
+class SilentReporter:
+    """No-op reporter for tests and CI."""
+
+    def phase_started(self, phase: str, detail: str = "") -> None:
+        pass
+
+    def phase_done(self, phase: str, detail: str = "") -> None:
+        pass
+
+    def phase_failed(self, phase: str, err: Exception) -> None:
+        pass
+
+    def evidence_added(self, item: Any) -> None:
+        pass
+
+    def done(self, report: "TriageReport") -> None:
+        pass
 
 
 @contextlib.contextmanager
