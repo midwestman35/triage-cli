@@ -169,6 +169,11 @@ def investigate(
     levels: str = typer.Option(
         "error,warn", "--levels", help="Datadog log levels: comma-separated",
     ),
+    no_redact: bool = typer.Option(
+        False, "--no-redact",
+        help="Disable PII redaction before sending content to the LLM. "
+             "Default is on; use this for debugging or certified test runs.",
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
     """Run an interactive investigation on a Zendesk ticket."""
@@ -285,6 +290,7 @@ def investigate(
             ticket_obj, sites,
             cnc_override=cnc, site_override=site,
             verbose=verbose, show_spinner=True,
+            redact_enabled=not no_redact,
         )
         if site_entry is None:
             manual = typer.prompt("Enter site_name to query", err=True).strip()
@@ -313,6 +319,7 @@ def investigate(
                     downloaded_attachments=downloaded,
                     local_files=local_files_evidence,
                     pasted_logs=pasted_logs,
+                    redact_enabled=not no_redact,
                 )
         try:
             report = _run_pipeline(use_dd=not no_logs)
@@ -353,6 +360,11 @@ def triage(
         "--no-interactive",
         help="Abort instead of prompting if site can't be resolved",
     ),
+    no_redact: bool = typer.Option(
+        False, "--no-redact",
+        help="Disable PII redaction before sending content to the LLM. "
+             "Default is on; use this for debugging or certified test runs.",
+    ),
 ) -> None:
     """Triage a single Zendesk ticket end-to-end."""
     logging.basicConfig(
@@ -392,6 +404,7 @@ def triage(
             ticket_obj, sites,
             cnc_override=cnc, site_override=site,
             verbose=verbose, show_spinner=True,
+            redact_enabled=not no_redact,
         )
     except ValueError as e:
         _die(str(e))
@@ -427,6 +440,7 @@ def triage(
                 at=at_dt,
                 verbose=verbose,
                 show_spinner=True,
+                redact_enabled=not no_redact,
             )
 
     try:
@@ -478,6 +492,11 @@ def inbox(
         "error,warn", "--levels", help="Datadog log levels: comma-separated"
     ),
     no_logs: bool = typer.Option(False, "--no-logs", help="Skip Datadog; use ticket content only"),
+    no_redact: bool = typer.Option(
+        False, "--no-redact",
+        help="Disable PII redaction before sending content to the LLM. "
+             "Default is on; use this for debugging or certified test runs.",
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
     """Launch the interactive inbox TUI. Defaults to your assigned tickets."""
@@ -504,6 +523,7 @@ def inbox(
         levels=level_list,
         no_logs=no_logs,
         print_notes=False,
+        redact_enabled=not no_redact,
         verbose=verbose,
     )
     typer.echo(f"Logging to {log_path}", err=True)
@@ -536,6 +556,11 @@ def watch(
     print_notes: bool = typer.Option(
         False, "--print-notes", help="Also print full markdown to stdout"
     ),
+    no_redact: bool = typer.Option(
+        False, "--no-redact",
+        help="Disable PII redaction before sending content to the LLM. "
+             "Default is on; use this for debugging or certified test runs.",
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
     """Poll a Zendesk view and triage new or updated tickets in a loop."""
@@ -563,6 +588,7 @@ def watch(
         levels=level_list,
         no_logs=no_logs,
         print_notes=print_notes,
+        redact_enabled=not no_redact,
         verbose=verbose,
     )
     try:

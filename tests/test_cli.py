@@ -306,6 +306,8 @@ def test_investigate_datadog_error_then_pipeline_failure_dies_cleanly(
 
     monkeypatch.setattr("triage_cli.cli.ZendeskClient.from_env", lambda: _ZD())
     monkeypatch.setattr("triage_cli.cli._is_interactive", lambda: True)
+    monkeypatch.setenv("DD_API_KEY", "test")
+    monkeypatch.setenv("DD_APP_KEY", "test")
     monkeypatch.setattr("builtins.input", lambda _p="": "skip")
     monkeypatch.setattr("typer.confirm", lambda *a, **k: True)  # accept fallback
     monkeypatch.setattr(
@@ -340,3 +342,82 @@ def test_investigate_datadog_error_then_pipeline_failure_dies_cleanly(
     # The exception did not escape: there should be no Python traceback in stderr.
     assert "Traceback" not in result.stderr
     assert call_count["n"] == 2  # both calls were attempted
+
+
+# ---------------------------------------------------------------------------
+# --no-redact flag propagation tests
+# ---------------------------------------------------------------------------
+
+def _make_fake_triage_one_capture(captured: list) -> callable:
+    """Return a fake triage_one that records kwargs and returns a canned TriageReport."""
+    from triage_cli.models import TimeWindow, TriageReport
+
+    ts = datetime(2026, 5, 7, 12, 0, 0, tzinfo=UTC)
+
+    def fake_triage_one(ticket, site, **kw):
+        captured.append(kw)
+        return TriageReport(
+            finding="x", confidence="low", evidence=[],
+            suggested_note="y", next_checks=[], unknowns=[],
+            ticket_id=ticket.id, site_name=site.site_name,
+            window=TimeWindow(start=ts, end=ts),
+            sources=["zendesk"], log_event_count=0, generated_at=ts,
+        )
+    return fake_triage_one
+
+
+def _patch_triage_command_deps(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Patch all external deps needed by the `triage` CLI command."""
+    from triage_cli.models import SiteEntry, Ticket
+
+    ts = datetime(2026, 5, 7, 12, 0, 0, tzinfo=UTC)
+    fake_ticket = Ticket(
+        id=12345, subject="x", description="y",
+        created_at=ts, updated_at=ts, comments=[],
+    )
+
+    class _ZD:
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+        def get_ticket(self, _id): return fake_ticket
+
+    monkeypatch.setattr("triage_cli.cli.ZendeskClient.from_env", lambda: _ZD())
+    monkeypatch.setattr("triage_cli.extract.load_site_map", lambda _p: [])
+    monkeypatch.setattr(
+        "triage_cli.pipeline.resolve_site",
+        lambda *a, **k: (
+            SiteEntry(friendly_name="Aurora", site_name="aur", cnc="abc"),
+            "substring",
+        ),
+    )
+    monkeypatch.chdir(tmp_path)
+
+
+def test_no_redact_flag_propagates_redact_enabled_false(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """--no-redact must reach triage_one as redact_enabled=False."""
+    _patch_triage_command_deps(monkeypatch, tmp_path)
+    captured: list = []
+    monkeypatch.setattr("triage_cli.pipeline.triage_one", _make_fake_triage_one_capture(captured))
+
+    runner = CliRunner()
+    result = runner.invoke(cli.app, ["triage", "12345", "--no-logs", "--no-redact"])
+    assert result.exit_code == 0, result.stderr
+    assert len(captured) == 1
+    assert captured[0].get("redact_enabled") is False
+
+
+def test_default_redact_enabled_is_true(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Omitting --no-redact (the default) must reach triage_one as redact_enabled=True."""
+    _patch_triage_command_deps(monkeypatch, tmp_path)
+    captured: list = []
+    monkeypatch.setattr("triage_cli.pipeline.triage_one", _make_fake_triage_one_capture(captured))
+
+    runner = CliRunner()
+    result = runner.invoke(cli.app, ["triage", "12345", "--no-logs"])
+    assert result.exit_code == 0, result.stderr
+    assert len(captured) == 1
+    assert captured[0].get("redact_enabled") is True

@@ -34,6 +34,7 @@ def _site() -> SiteEntry:
 def test_triage_one_no_logs_path(monkeypatch: pytest.MonkeyPatch) -> None:
     """With dd_client=None, pipeline skips Datadog and returns a TriageReport."""
     from triage_cli.models import LLMTriageOutput, TriageReport
+    from triage_cli.redact import RedactionCounts
 
     canned = LLMTriageOutput(
         finding="stub finding",
@@ -42,8 +43,8 @@ def test_triage_one_no_logs_path(monkeypatch: pytest.MonkeyPatch) -> None:
         suggested_note="stub note",
     )
 
-    async def fake_triage(_bundle, model=None, *, verbose=False):  # noqa: ARG001
-        return canned
+    async def fake_triage(_bundle, *, model=None, verbose=False, redact_enabled=True):  # noqa: ARG001
+        return canned, RedactionCounts(enabled=True)
 
     # _llm_extract_anchor is not patched: dd_client=None means the pipeline
     # skips anchor extraction entirely, so the real implementation is never called.
@@ -72,6 +73,7 @@ def test_triage_one_no_logs_path(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_triage_one_with_logs_populates_report(monkeypatch: pytest.MonkeyPatch) -> None:
     """With a dd_client returning logs, the pipeline-derived sources include 'datadog'."""
     from triage_cli.models import LLMTriageOutput, LogLine, TriageReport
+    from triage_cli.redact import RedactionCounts
 
     ts = datetime(2026, 5, 7, 12, 0, 0, tzinfo=UTC)
     canned = LLMTriageOutput(
@@ -81,10 +83,10 @@ def test_triage_one_with_logs_populates_report(monkeypatch: pytest.MonkeyPatch) 
         suggested_note="y",
     )
 
-    async def fake_triage(_bundle, model=None, *, verbose=False):  # noqa: ARG001
-        return canned
+    async def fake_triage(_bundle, *, model=None, verbose=False, redact_enabled=True):  # noqa: ARG001
+        return canned, RedactionCounts(enabled=True)
 
-    async def fake_extract(_ticket, model=None):  # noqa: ARG001
+    async def fake_extract(_ticket, model=None, *, redact_enabled=True, verbose=False):  # noqa: ARG001
         return None
 
     class FakeDD:
@@ -125,14 +127,15 @@ def test_triage_one_headless_bundle_has_empty_evidence_fields(
     """
     from triage_cli.llm import triage as _real_triage
     from triage_cli.models import LLMTriageOutput
+    from triage_cli.redact import RedactionCounts
 
     captured_bundles: list = []
 
-    async def fake_triage(bundle, model=None, *, verbose=False):  # noqa: ARG001
+    async def fake_triage(bundle, *, model=None, verbose=False, redact_enabled=True):  # noqa: ARG001
         captured_bundles.append(bundle)
         return LLMTriageOutput(
             finding="x", confidence="low", evidence=[], suggested_note="y",
-        )
+        ), RedactionCounts(enabled=True)
 
     monkeypatch.setattr(pipeline, "_llm_triage", fake_triage)
 
@@ -155,3 +158,43 @@ def test_triage_one_headless_bundle_has_empty_evidence_fields(
 
     # Confirm fake was used, not the real LLM (defense against import drift).
     assert _real_triage is not fake_triage
+
+
+def test_triage_report_includes_redaction_summary(monkeypatch) -> None:
+    """When redaction is enabled, the report's redaction_summary must reflect counts."""
+    from datetime import UTC, datetime
+
+    from triage_cli import pipeline
+    from triage_cli.models import (
+        LLMTriageOutput,
+        SiteEntry,
+        Ticket,
+    )
+    from triage_cli.redact import RedactionCounts
+
+    async def fake_triage(bundle, *, model=None, verbose=False, redact_enabled=True):
+        return (
+            LLMTriageOutput(finding="x", confidence="low", evidence=[], suggested_note="x"),
+            RedactionCounts(phones=2, addresses=1, coords=0, enabled=True),
+        )
+
+    async def fake_extract_anchor(ticket, *, model=None, redact_enabled=True):
+        return None
+
+    monkeypatch.setattr(pipeline, "_llm_triage", fake_triage)
+    monkeypatch.setattr(pipeline, "_llm_extract_anchor", fake_extract_anchor)
+
+    ticket = Ticket(
+        id=1, subject="x", description="x", requester_org="Acme",
+        created_at=datetime.now(UTC), updated_at=datetime.now(UTC), comments=[],
+    )
+    site = SiteEntry(friendly_name="Acme", site_name="acme", cnc="abc")
+
+    report = pipeline.triage_one(
+        ticket, site,
+        dd_client=None, window_minutes=15, levels=["error", "warn"],
+        at=None, verbose=False, show_spinner=False,
+    )
+    assert report.redaction_summary is not None
+    assert report.redaction_summary.phones == 2
+    assert report.redaction_summary.addresses == 1

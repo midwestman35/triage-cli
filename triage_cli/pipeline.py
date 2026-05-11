@@ -50,6 +50,7 @@ def resolve_site(
     site_override: str | None = None,
     verbose: bool = False,
     show_spinner: bool = False,
+    redact_enabled: bool = True,
 ) -> tuple[SiteEntry | None, str]:
     """Resolve which SiteEntry a ticket is about, with LLM fallback on no_match.
 
@@ -67,7 +68,9 @@ def resolve_site(
     _vecho(verbose, "Site lookup: no_match — asking Claude to identify site")
     try:
         with spinner("Asking Claude to identify site", show=show_spinner):
-            llm_name = asyncio.run(_llm_extract_site(ticket, sites))
+            llm_name = asyncio.run(
+                _llm_extract_site(ticket, sites, redact_enabled=redact_enabled, verbose=verbose)
+            )
     except Exception as e:
         _vecho(verbose, f"LLM site extraction failed: {e}")
         return None, "no_match"
@@ -97,6 +100,7 @@ def triage_one(
     downloaded_attachments: list | None = None,
     local_files: list | None = None,
     pasted_logs: list | None = None,
+    redact_enabled: bool = True,
 ) -> TriageReport:
     """Run the triage pipeline for a fetched ticket and resolved site.
 
@@ -110,7 +114,9 @@ def triage_one(
     if dd_client is not None and at is None:
         try:
             with spinner("Asking Claude to extract incident timestamp", show=show_spinner):
-                extracted_dt = asyncio.run(_llm_extract_anchor(ticket))
+                extracted_dt = asyncio.run(
+                    _llm_extract_anchor(ticket, redact_enabled=redact_enabled, verbose=verbose)
+                )
         except Exception as e:
             _vecho(verbose, f"Anchor extraction via Claude failed: {e}; falling back to created_at")
 
@@ -146,7 +152,9 @@ def triage_one(
     )
 
     with spinner("Generating triage note", show=show_spinner):
-        llm_out = asyncio.run(_llm_triage(bundle, verbose=verbose))
+        llm_out, redaction_counts = asyncio.run(
+            _llm_triage(bundle, verbose=verbose, redact_enabled=redact_enabled)
+        )
 
     sources = ["zendesk"] + (["datadog"] if dd_client is not None else [])
 
@@ -158,4 +166,5 @@ def triage_one(
         sources=sources,
         log_event_count=len(log_lines),
         generated_at=datetime.now(UTC),
+        redaction_summary=redaction_counts,
     )

@@ -67,6 +67,7 @@ triage-cli triage 12345 --cnc 921d7c53-e815-...     # use CNC UUID instead of na
 triage-cli triage 12345 --levels error,warn,info    # broaden log levels
 triage-cli triage 12345 | bat -l md              # pipe → raw markdown (TTY-only render is suppressed)
 triage-cli triage 12345 --no-interactive         # abort if site can't be resolved (no prompt)
+triage-cli triage 12345 --no-redact              # disable PII redaction (phone/addr/coords) for debugging
 ```
 
 ## `inbox --view N` — interactive TUI
