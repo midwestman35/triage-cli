@@ -49,6 +49,52 @@ class _FakeZendeskClient:
         return self.ticket
 
 
+def test_help_lists_setup_and_doctor_commands() -> None:
+    result = CliRunner().invoke(cli.app, ["--help"])
+
+    assert result.exit_code == 0
+    assert "setup" in result.stdout
+    assert "doctor" in result.stdout
+
+
+def test_setup_command_delegates_to_shared_setup_engine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from triage_cli import setup as setup_module
+
+    calls: list[str] = []
+
+    def fake_setup_main() -> int:
+        calls.append("setup")
+        return 37
+
+    monkeypatch.setattr(setup_module, "main", fake_setup_main)
+
+    result = CliRunner().invoke(cli.app, ["setup"])
+
+    assert result.exit_code == 37
+    assert calls == ["setup"]
+
+
+def test_doctor_command_delegates_to_shared_doctor_engine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from triage_cli import setup as setup_module
+
+    calls: list[bool] = []
+
+    def fake_doctor_main(*, zendesk_probe: bool = True) -> int:
+        calls.append(zendesk_probe)
+        return 23
+
+    monkeypatch.setattr(setup_module, "doctor_main", fake_doctor_main)
+
+    result = CliRunner().invoke(cli.app, ["doctor", "--skip-zendesk-probe"])
+
+    assert result.exit_code == 23
+    assert calls == [False]
+
+
 def test_investigate_fetches_ticket_and_renders_report_without_enrichment(
     monkeypatch,
 ) -> None:
@@ -306,6 +352,8 @@ def test_investigate_datadog_error_then_pipeline_failure_dies_cleanly(
 
     monkeypatch.setattr("triage_cli.cli.ZendeskClient.from_env", lambda: _ZD())
     monkeypatch.setattr("triage_cli.cli._is_interactive", lambda: True)
+    monkeypatch.setenv("DD_API_KEY", "test")
+    monkeypatch.setenv("DD_APP_KEY", "test")
     monkeypatch.setattr("builtins.input", lambda _p="": "skip")
     monkeypatch.setattr("typer.confirm", lambda *a, **k: True)  # accept fallback
     monkeypatch.setattr(

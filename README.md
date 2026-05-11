@@ -41,7 +41,11 @@ uv pip install -e .
 ```
 
 After install, `triage-cli --help` should list the `investigate`, `triage`, `inbox`,
-`watch`, and `build-map` subcommands.
+`watch`, `setup`, `doctor`, and `build-map` subcommands.
+
+Use `triage-cli setup` to rerun or resume local setup after the console command
+exists. Use `triage-cli doctor` to check local configuration, writable output
+paths, and provider prerequisites.
 
 ## Configuration
 
@@ -259,7 +263,8 @@ triage-cli/
 ├── apex-cnc-inventory.md       # source of truth for the CNC map
 ├── .env.example
 ├── triage_cli/
-│   ├── cli.py                  # typer app: investigate, triage, watch, and build-map subcommands
+│   ├── cli.py                  # typer app: investigate, triage, setup, doctor, watch, and build-map subcommands
+│   ├── setup.py                # shared setup and doctor checks
 │   ├── zendesk.py              # ticket + comment fetch (httpx)
 │   ├── datadog.py              # log query (datadog-api-client)
 │   ├── extract.py              # ticket ID parsing, site lookup, window/anchor
