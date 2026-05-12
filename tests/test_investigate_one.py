@@ -2,10 +2,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from pathlib import Path
 from unittest.mock import AsyncMock
-
-import pytest
 
 
 def _make_ticket(ticket_id: int = 1):
@@ -47,8 +44,9 @@ def test_investigate_one_returns_triage_report(tmp_path, monkeypatch):
     from triage_cli import llm
     monkeypatch.setattr(llm, "triage", AsyncMock(return_value=_make_llm_output()))
 
-    from triage_cli.pipeline import SilentReporter, investigate_one
     import asyncio
+
+    from triage_cli.pipeline import SilentReporter, investigate_one
     result = asyncio.run(
         investigate_one(
             ticket,
@@ -66,8 +64,9 @@ def test_investigate_one_no_llm_stub(tmp_path, monkeypatch):
     ticket = _make_ticket()
     session = _make_session(ticket)
 
-    from triage_cli.pipeline import SilentReporter, investigate_one
     import asyncio
+
+    from triage_cli.pipeline import SilentReporter, investigate_one
     result = asyncio.run(
         investigate_one(
             ticket,
@@ -89,8 +88,9 @@ def test_investigate_one_appends_to_memory(tmp_path, monkeypatch):
     from triage_cli import llm
     monkeypatch.setattr(llm, "triage", AsyncMock(return_value=_make_llm_output()))
 
-    from triage_cli.pipeline import SilentReporter, investigate_one
     import asyncio
+
+    from triage_cli.pipeline import SilentReporter, investigate_one
     asyncio.run(
         investigate_one(
             ticket,
@@ -124,8 +124,9 @@ def test_investigate_one_reporter_phases_called(tmp_path, monkeypatch):
         def evidence_added(self, item): pass
         def done(self, report): pass
 
-    from triage_cli.pipeline import investigate_one
     import asyncio
+
+    from triage_cli.pipeline import investigate_one
     asyncio.run(
         investigate_one(
             ticket,

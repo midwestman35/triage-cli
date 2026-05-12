@@ -1,8 +1,6 @@
 """Tests for ZendeskClient.fetch_customer_history."""
 from __future__ import annotations
 
-from datetime import UTC, datetime
-
 import pytest
 
 

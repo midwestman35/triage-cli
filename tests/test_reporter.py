@@ -1,9 +1,6 @@
 """Tests for the Reporter protocol implementations."""
 from __future__ import annotations
 
-import sys
-from io import StringIO
-
 
 def test_stderr_reporter_phase_started_prints_to_stderr(capsys):
     from triage_cli.pipeline import StderrReporter
