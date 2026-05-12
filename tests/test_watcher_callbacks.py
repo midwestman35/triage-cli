@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from unittest.mock import MagicMock, call
+from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 
@@ -84,12 +84,8 @@ def test_run_iteration_no_callbacks_preserves_state_update(
     zd = _zd_with_tickets(tickets, [101, 102])
 
     monkeypatch.setattr(
-        "triage_cli.pipeline.triage_one",
-        lambda ticket, _site_entry, **_kwargs: _report(ticket.id, ticket.updated_at),
-    )
-    monkeypatch.setattr(
-        "triage_cli.render.save_note",
-        lambda _report, tid: (tmp_path / f"{tid}.md", tmp_path / f"{tid}.json"),
+        "triage_cli.pipeline.investigate_one",
+        AsyncMock(side_effect=lambda ticket, **_kw: _report(ticket.id, ticket.updated_at)),
     )
 
     state: State = {"version": watcher.STATE_VERSION, "triaged": {}}
@@ -127,12 +123,8 @@ def test_run_iteration_invokes_callbacks_in_order(
     zd = _zd_with_tickets(tickets, [101, 102])
 
     monkeypatch.setattr(
-        "triage_cli.pipeline.triage_one",
-        lambda ticket, _site_entry, **_kwargs: reports[ticket.id],
-    )
-    monkeypatch.setattr(
-        "triage_cli.render.save_note",
-        lambda _report, tid: (tmp_path / f"{tid}.md", tmp_path / f"{tid}.json"),
+        "triage_cli.pipeline.investigate_one",
+        AsyncMock(side_effect=lambda ticket, **_kw: reports[ticket.id]),
     )
 
     callbacks = MagicMock()
@@ -168,10 +160,10 @@ def test_run_iteration_invokes_failure_callback(
     ticket = _make_ticket(101, now)
     zd = _zd_with_tickets({101: ticket}, [101])
 
-    def fail_triage(*_args, **_kwargs):
-        raise RuntimeError("Datadog timeout")
-
-    monkeypatch.setattr("triage_cli.pipeline.triage_one", fail_triage)
+    monkeypatch.setattr(
+        "triage_cli.pipeline.investigate_one",
+        AsyncMock(side_effect=RuntimeError("Datadog timeout")),
+    )
 
     callbacks = MagicMock()
     state: State = {"version": watcher.STATE_VERSION, "triaged": {}}
@@ -224,60 +216,20 @@ def test_run_iteration_failure_callback_for_get_ticket_error(
     ]
 
 
-def test_run_iteration_failure_callback_for_unresolved_site(
-    tmp_path: Path,
-) -> None:
-    now = datetime(2026, 5, 7, 14, 0, 0, tzinfo=UTC)
-    cutoff = now - timedelta(hours=1)
-    ticket = Ticket(
-        id=101,
-        subject="x",
-        description="no site match",
-        requester_org=None,
-        tags=[],
-        created_at=now,
-        updated_at=now,
-        comments=[],
-    )
-    zd = _zd_with_tickets({101: ticket}, [101])
-
-    callbacks = MagicMock()
-    state: State = {"version": watcher.STATE_VERSION, "triaged": {}}
-    watcher.run_iteration(
-        zd,
-        [_make_site()],
-        state,
-        _opts(tmp_path),
-        cutoff,
-        dd_client=None,
-        on_view_listed=callbacks.on_view_listed,
-        on_failure=callbacks.on_failure,
-    )
-
-    assert callbacks.mock_calls == [
-        call.on_view_listed([101]),
-        call.on_failure(101, "site unresolvable"),
-    ]
-
-
 def test_run_iteration_failure_callback_for_save_error(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    """investigate_one raising OSError is treated as a per-ticket failure."""
     now = datetime(2026, 5, 7, 14, 0, 0, tzinfo=UTC)
     cutoff = now - timedelta(hours=1)
     ticket = _make_ticket(101, now)
     zd = _zd_with_tickets({101: ticket}, [101])
 
     monkeypatch.setattr(
-        "triage_cli.pipeline.triage_one",
-        lambda ticket, _site_entry, **_kwargs: _report(ticket.id, ticket.updated_at),
+        "triage_cli.pipeline.investigate_one",
+        AsyncMock(side_effect=OSError("disk full")),
     )
-
-    def fail_save(*_args, **_kwargs):
-        raise OSError("disk full")
-
-    monkeypatch.setattr("triage_cli.render.save_note", fail_save)
 
     callbacks = MagicMock()
     state: State = {"version": watcher.STATE_VERSION, "triaged": {}}
@@ -296,5 +248,5 @@ def test_run_iteration_failure_callback_for_save_error(
     assert callbacks.mock_calls == [
         call.on_view_listed([101]),
         call.on_progress(101, "triaging"),
-        call.on_failure(101, "could not write note: disk full"),
+        call.on_failure(101, "disk full"),
     ]

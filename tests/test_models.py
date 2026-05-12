@@ -511,39 +511,87 @@ def test_as_user_message_no_trailing_whitespace_only_lines():
             assert line.strip(), f"whitespace-only line found: {line!r}"
 
 
-def test_triage_report_accepts_optional_redaction_summary() -> None:
+def test_ticket_summary_roundtrip():
     from datetime import UTC, datetime
 
-    from triage_cli.models import TimeWindow, TriageReport
-    from triage_cli.redact import RedactionCounts
-
-    report = TriageReport(
-        finding="x",
-        confidence="medium",
-        evidence=[],
-        suggested_note="x",
-        ticket_id=1,
-        site_name="us-ga-roswell",
-        window=TimeWindow(start=datetime.now(UTC), end=datetime.now(UTC)),
-        sources=["zendesk"],
-        log_event_count=0,
-        generated_at=datetime.now(UTC),
-        redaction_summary=RedactionCounts(phones=2, addresses=1, coords=0, enabled=True),
+    from triage_cli.models import TicketSummary
+    ts = TicketSummary(
+        id=12345,
+        subject="SBC jitter on PSAP-01",
+        status="open",
+        created_at=datetime(2026, 5, 10, tzinfo=UTC),
+        updated_at=datetime(2026, 5, 11, tzinfo=UTC),
     )
-    assert report.redaction_summary is not None
-    assert report.redaction_summary.phones == 2
+    assert ts.id == 12345
+    assert ts.status == "open"
 
-    # Default to None for backwards compatibility
-    report2 = TriageReport(
-        finding="x",
-        confidence="medium",
-        evidence=[],
-        suggested_note="x",
-        ticket_id=1,
-        site_name="us-ga-roswell",
-        window=TimeWindow(start=datetime.now(UTC), end=datetime.now(UTC)),
-        sources=["zendesk"],
-        log_event_count=0,
-        generated_at=datetime.now(UTC),
+
+def test_customer_history_evidence_defaults():
+    from triage_cli.models import CustomerHistoryEvidence
+    ev = CustomerHistoryEvidence(
+        requester_email="ops@acme.com",
+        tickets=[],
+        limit=10,
     )
-    assert report2.redaction_summary is None
+    assert ev.source == "zendesk_customer_history"
+    assert ev.tickets == []
+
+
+def test_memory_entry_default_resolution():
+    from triage_cli.models import MemoryEntry
+    me = MemoryEntry(
+        ticket_id="ZD-1",
+        customer="Acme",
+        subject="SBC jitter",
+        symptom="calls dropping",
+        assessment="buffer overflow",
+    )
+    assert me.resolution == "[unknown]"
+
+
+def test_memory_context_holds_entries():
+    from triage_cli.models import MemoryContext, MemoryEntry
+    ctx = MemoryContext(
+        entries=[
+            MemoryEntry(ticket_id="ZD-1", customer="X", subject="s",
+                        symptom="y", assessment="z"),
+        ],
+        query_tokens=["sbc", "jitter"],
+    )
+    assert len(ctx.entries) == 1
+    assert "sbc" in ctx.query_tokens
+
+
+def test_investigation_evidence_accepts_customer_history():
+    from triage_cli.models import CustomerHistoryEvidence, InvestigationEvidence
+    ev = InvestigationEvidence(ticket_id=1)
+    assert ev.customer_history is None
+    ev2 = InvestigationEvidence(
+        ticket_id=1,
+        customer_history=CustomerHistoryEvidence(
+            requester_email="a@b.com", tickets=[], limit=5,
+        ),
+    )
+    assert ev2.customer_history is not None
+
+
+def test_investigation_session_accepts_memory_context():
+    from datetime import UTC, datetime
+
+    from triage_cli.models import (
+        InvestigationEvidence,
+        InvestigationSession,
+        MemoryContext,
+        Ticket,
+    )
+    ticket = Ticket(
+        id=1, subject="test", description="desc",
+        created_at=datetime(2026, 1, 1, tzinfo=UTC),
+        requester_email="a@b.com", comments=[],
+    )
+    session = InvestigationSession(
+        ticket=ticket,
+        evidence=InvestigationEvidence(ticket_id=1),
+        memory_context=MemoryContext(entries=[], query_tokens=[]),
+    )
+    assert session.memory_context is not None

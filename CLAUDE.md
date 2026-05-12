@@ -4,15 +4,36 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A Python 3.11+ CLI that triages Zendesk tickets for the Carbyne APEX NG911/E911 platform. Five subcommands:
+A Python 3.11+ CLI that investigates Zendesk tickets for the Carbyne APEX NG911/E911 platform. Five subcommands:
 
-- `triage-cli triage <id-or-url>` — single-shot pipeline: fetch ticket → resolve site → query Datadog → call the configured LLM provider → print markdown.
-- `triage-cli investigate <id-or-url>` — guided session that bundles the ticket with optional `--file` / `--paste LABEL=TEXT` evidence into a structured `TriageReport` (markdown + JSON).
-- `triage-cli inbox [--view ...]` — interactive Textual TUI over a polled Zendesk view (defaults to your assigned tickets); requires a TTY.
-- `triage-cli watch --view <id>` — long-running headless poll loop over a Zendesk view, calling the same pipeline per ticket.
-- `triage-cli build-map` — regenerates `data/cnc-map.json` from `apex-cnc-inventory.md`.
+- `triage-cli investigate <id-or-url>` — guided investigation: fetch ticket → customer history → memory lookup → evidence intake → LLM assessment. Default entry point.
+- `triage-cli triage <id-or-url>` — headless single-shot (same pipeline, no evidence prompts). Use in scripts or with `watch`.
+- `triage-cli watch --view <id>` — long-running headless poll loop over a Zendesk view.
+- `triage-cli inbox [--view ...]` — interactive Textual TUI report viewer; requires TTY.
+- `triage-cli doctor` — checks env vars, credentials, and Zendesk connectivity; exits 0/1.
+- `triage-cli build-map` — regenerates `data/cnc-map.json`.
 
-`README.md` is the user-facing spec. `HANDOFF.md` is the original v1 build spec — authoritative for the v1 surface (triage / build-map). For features added since (watcher, inbox, investigation), the code and `docs/superpowers/specs/` are the source of truth.
+`README.md` is the user-facing reference.
+
+## LLM providers
+
+Controlled by `LLM_PROVIDER` env var (default: `unleash`).
+
+| Value | Provider | Required env vars |
+|---|---|---|
+| `unleash` | Unleash gateway | `UNLEASH_API_KEY`, `UNLEASH_ASSISTANT_ID` |
+| `claude` | Claude Agent SDK | Claude CLI on PATH |
+| `openai` | OpenAI Responses API | `OPENAI_API_KEY` |
+
+## Memory layer
+
+After every investigation, `MEMORY.md` and `data/memory.db` are updated with
+the ticket ID, customer, subject, symptom, assessment, and resolution (if known).
+Before the LLM call, the top-3 similar prior investigations are retrieved via
+BM25 and injected as context.
+
+To prune: edit `MEMORY.md` and delete entries. The FTS5 index rebuilds
+automatically on the next investigation run.
 
 ## Common commands
 
@@ -42,21 +63,16 @@ Tests never hit live APIs — Zendesk, Datadog, and the Agent SDK are all stubbe
 
 ### Pipeline ownership
 
-The triage flow is intentionally split so a single orchestration function is shared by both subcommands:
+`pipeline.investigate_one` is the shared async core called by all three entry points (`investigate`, `triage`, `watcher.run_iteration`). It drives: customer-history fetch → memory lookup → evidence intake → site resolution (optional) → Datadog enrichment (optional) → LLM call → save. **No I/O outside the injected clients.**
 
-- `cli.triage` (and `cli.watch`) — flag validation, env loading, ticket fetch, site map load, site resolution (including the interactive prompt), client lifetime management.
-- `pipeline.triage_one` — anchor resolution → Datadog query → LLM call → returns markdown. **No I/O outside the injected clients.** Both `cli.triage` and `watcher.run_iteration` call this; keep new logic here, not duplicated in either caller.
-- `render` — stdout printing and `--save` to `./triage-notes/<id>-<ts>.md` (and `.json` for investigation reports).
+- `cli.investigate` — interactive entry point; adds evidence prompts and the drop-and-wait loop before calling `investigate_one`.
+- `cli.triage` — headless entry point; calls `investigate_one` directly with no interaction.
+- `watcher.run_iteration` — background poll; calls `investigate_one` with `SilentReporter`.
+- `render` — stdout printing and saves to `./triage-notes/<id>-<ts>.md` + `.json`.
 
-When extending the pipeline (e.g., new bundle inputs, anchor sources, log filters), add it inside `triage_one` so `watch` and `inbox` inherit the change for free.
+The `Reporter` protocol (`pipeline.Reporter`) decouples progress output from pipeline logic. Three implementations: `StderrReporter` (default), `SilentReporter` (tests/watcher), `TUIReporter` (--tui).
 
-### Investigation flow (separate from the triage pipeline)
-
-`triage_cli/investigation.py` implements a different, evidence-first flow used by `cli.investigate` and the `certify_readonly_my_queue.py` validator. It does **not** call Datadog or the LLM. It builds an `InvestigationSession` from the Zendesk ticket, ingests `--file` (local files) and `--paste LABEL=TEXT` evidence, constructs a unified `timeline`, and emits a structured `TriageReport` (`models.TriageReport`) rendered as both markdown and JSON.
-
-Evidence model lives in `triage_cli/models.py`: `EvidenceItem`, `LocalFileEvidence`, `PastedEvidence`, `AttachmentEvidence`, `InvestigationEvidence`, `InvestigationSession`, `TimelineEvent`, `TriageReport`, `Assessment`, `TimeWindow`. Adding a new evidence type means: extend the union, teach `build_timeline` to fold it in, and update `session_to_report`.
-
-The investigation flow was added to support read-only triage on tickets where Datadog access is unavailable or the analyst is working from supplied artifacts. Keep it free of network calls beyond the initial Zendesk fetch.
+`triage_cli/investigation.py` builds `InvestigationSession` objects. Evidence models in `triage_cli/models.py`: `LocalFileEvidence`, `PastedEvidence`, `AttachmentEvidence`, `CustomerHistoryEvidence`, `InvestigationEvidence`, `InvestigationSession`, `MemoryEntry`, `MemoryContext`.
 
 ### Inbox TUI
 
@@ -64,17 +80,19 @@ The investigation flow was added to support read-only triage on tickets where Da
 
 Shared invariant with `watch`: state file is `data/watcher-state-<view-key>.json`, same shape for both. Don't fork the state schema between them.
 
-### LLM access — provider protocol, not the Anthropic SDK
+### LLM access — provider-abstracted
 
-`triage_cli/llm.py` selects a provider with `LLM_PROVIDER`. Production defaults to `unleash`; `claude` uses the Claude Agent SDK lazily as an optional fallback; `openai` and `codex` use the OpenAI Responses API over HTTP.
+`triage_cli/llm.py` dispatches to the provider selected by `LLM_PROVIDER` (default: `unleash`). Three provider implementations live in `triage_cli/providers/`:
 
-Do not "fix" Claude fallback by switching to the `anthropic` HTTP SDK. The user has an enterprise OAuth seat with no provisioned Anthropic API key; that path doesn't work for them. Claude fallback reads `ANTHROPIC_MODEL`; OpenAI/Codex reads `OPENAI_MODEL`; Unleash uses a configured assistant ID.
+- `unleash.py` — Unleash gateway (requires `UNLEASH_API_KEY` + `UNLEASH_ASSISTANT_ID`)
+- `claude.py` — Claude Agent SDK; spawns Claude Code under the hood using OAuth. Requires `claude` CLI installed and authenticated.
+- `openai.py` — OpenAI Responses API (requires `OPENAI_API_KEY`)
 
-Two single-turn async calls live in `llm.py`:
-- `triage(bundle)` — main markdown generation.
-- `extract_anchor(ticket)` — best-effort timestamp extraction; returns `None` on any failure mode (invalid JSON, missing key, unparseable timestamp). Only Agent SDK transport errors raise.
+Two single-turn async calls in `llm.py`:
+- `triage(bundle)` — main LLM assessment.
+- `extract_anchor(ticket)` — best-effort timestamp extraction; returns `None` on failure.
 
-Both are wrapped in `asyncio.run(...)` from `pipeline.triage_one`.
+Both are `await`ed from `pipeline.investigate_one`.
 
 ### Site map flow
 
@@ -109,7 +127,7 @@ stdout is reserved for the rendered triage note so the output is pipeable. Every
 - Type hints everywhere; pydantic v2 for all data models in `triage_cli/models.py`.
 - No `print` outside `cli.py`, `render.py`, `pipeline.py`, and `watcher.py` (the latter two only for stderr status). Library modules return or raise.
 - Module size budget ~150 lines; if you're growing one past that, the split usually wants to live in a sibling module, not a sub-package. (`investigation.py` and `inbox/app.py` are deliberate exceptions.)
-- Internal Zendesk comments **are** sent to the LLM (comment text itself, including employee notes). Caller PII (phone numbers, street-line addresses, GPS coords) is **redacted** at the LLM boundary by default — see `triage_cli/redact.py`. The post-back risk is reduced but not eliminated; if anything ever posts back to Zendesk, this assumption must be revisited.
+- Internal Zendesk comments **are** sent to the LLM. v1 is terminal-only so this is acceptable; if anything ever posts back to Zendesk, this assumption must be revisited.
 - `ruff` ruleset: `E,F,W,I,B,UP,SIM`, line length 100, `target-version = py311`. Keep edits compatible.
 - TUI deps (`rich`, `textual`) are runtime-required; don't gate them behind extras.
 
@@ -117,10 +135,14 @@ stdout is reserved for the rendered triage note so the output is pipeable. Every
 
 | What | Where |
 | --- | --- |
-| Triage system prompt | `triage_cli/llm.py` (`TRIAGE_SYSTEM_PROMPT`) |
+| LLM system prompt | `triage_cli/llm.py` (`TRIAGE_SYSTEM_PROMPT`) |
 | Anchor extraction prompt | `triage_cli/llm.py` (`ANCHOR_EXTRACTION_PROMPT`) |
-| Pipeline orchestration | `triage_cli/pipeline.py` (`triage_one`) |
-| Investigation session + report | `triage_cli/investigation.py` |
+| Pipeline orchestration | `triage_cli/pipeline.py` (`investigate_one`) |
+| Reporter protocol + implementations | `triage_cli/pipeline.py` (`Reporter`, `StderrReporter`, `SilentReporter`) |
+| Investigation-progress TUI | `triage_cli/tui/` (`app.py`, `widgets.py`, `reporter.py`) |
+| Investigation session + evidence | `triage_cli/investigation.py` |
+| Memory layer (MEMORY.md + SQLite FTS5) | `triage_cli/memory.py`, `MEMORY.md`, `data/memory.db` |
+| LLM provider abstraction | `triage_cli/providers/` (`base.py`, `unleash.py`, `claude.py`, `openai.py`) |
 | Inbox TUI | `triage_cli/inbox/` (`app.py`, `widgets.py`, `clipboard.py`, `hydrate.py`) |
 | Site lookup logic | `triage_cli/extract.py` (`lookup_site`) |
 | Anchor priority | `triage_cli/extract.py` (`resolve_anchor`) |

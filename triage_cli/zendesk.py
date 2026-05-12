@@ -11,7 +11,7 @@ from typing import Any
 
 import httpx
 
-from triage_cli.models import AttachmentEvidence, Comment, Ticket
+from triage_cli.models import AttachmentEvidence, Comment, Ticket, TicketSummary
 
 logger = logging.getLogger(__name__)
 
@@ -93,11 +93,16 @@ class ZendeskClient:
         org = orgs_by_id.get(org_id) if org_id is not None else None
         requester_org = org.get("name") if org else None
 
+        requester_id = ticket_obj.get("requester_id")
+        requester_user = users_by_id.get(requester_id) if requester_id else None
+        requester_email = requester_user.get("email") if requester_user else None
+
         return Ticket(
             id=int(ticket_obj["id"]),
             subject=ticket_obj.get("subject") or "",
             description=ticket_obj.get("description") or "",
             requester_org=requester_org,
+            requester_email=requester_email,
             tags=list(ticket_obj.get("tags") or []),
             created_at=_parse_iso(ticket_obj["created_at"]),
             updated_at=_parse_iso(ticket_obj["updated_at"]),
@@ -252,6 +257,48 @@ class ZendeskClient:
             retry_after = resp.headers.get("Retry-After", "unknown")
             raise RuntimeError(f"Zendesk rate-limited; retry after {retry_after} seconds")
         raise RuntimeError(f"Zendesk error {status}: {(resp.text or '')[:200]}")
+
+    def fetch_customer_history(
+        self,
+        requester_email: str,
+        *,
+        limit: int = 10,
+    ) -> list[TicketSummary]:
+        """Return the last `limit` tickets for a requester, newest first.
+
+        Never raises — customer history is enrichment, not a pipeline gate.
+        Returns an empty list if email is missing or any error occurs.
+        """
+        if not requester_email:
+            return []
+
+        try:
+            data = self._get(
+                "/search.json",
+                params={
+                    "query": f"requester:{requester_email} type:ticket",
+                    "sort_by": "updated_at",
+                    "sort_order": "desc",
+                    "per_page": limit,
+                },
+                ticket_id=0,
+            )
+            results = data.get("results", [])[:limit]
+            return [
+                TicketSummary(
+                    id=r["id"],
+                    subject=r.get("subject", "(no subject)"),
+                    status=r.get("status", "unknown"),
+                    created_at=_parse_iso(r["created_at"]),
+                    updated_at=_parse_iso(r["updated_at"]),
+                )
+                for r in results
+            ]
+        except Exception:
+            logger.warning(
+                "fetch_customer_history failed for %s", requester_email, exc_info=True
+            )
+            return []
 
     def download_attachment(
         self,

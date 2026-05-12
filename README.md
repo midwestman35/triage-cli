@@ -10,7 +10,7 @@ A local CLI for Axon network engineers working the Carbyne APEX NG911/E911 platf
 
 - **Python 3.11+** (the package is pinned to `>=3.11` in `pyproject.toml`).
 - **Zendesk credentials** with read scope on tickets: an agent email plus an API token.
-- **LLM provider access** for `triage` and watcher reports. Production defaults to Unleash; Claude Code and OpenAI/Codex HTTP are explicit fallbacks. The guided `investigate` command does not require an LLM.
+- **Claude Code CLI installed and authenticated** for `triage` and watcher reports. The guided `investigate` command does not require Claude.
 - **Datadog credentials** are optional enrichment for `triage` and watcher mode. `investigate` works without Datadog.
 
 ## Install
@@ -41,11 +41,7 @@ uv pip install -e .
 ```
 
 After install, `triage-cli --help` should list the `investigate`, `triage`, `inbox`,
-`watch`, `setup`, `doctor`, and `build-map` subcommands.
-
-Use `triage-cli setup` to rerun or resume local setup after the console command
-exists. Use `triage-cli doctor` to check local configuration, writable output
-paths, and provider prerequisites.
+`watch`, `doctor`, and `build-map` subcommands.
 
 ## Configuration
 
@@ -65,17 +61,13 @@ cp .env.example .env
 | `DD_SITE` | Datadog site host. Leave at default `datadoghq.com` unless you are on a non-US tenant. |
 | `DD_CALL_CENTER_TAG` | Datadog tag key for the call-center filter. Leave at default `@log.machineData.callCenterName`. |
 | `DD_STATION_TAG` | Reserved for v2 station-level filtering. Leave at default; v1 does not use it. |
-| `LLM_PROVIDER` | LLM backend for `triage`/watcher calls. Defaults to `unleash`; supported values are `unleash`, `claude`, `openai`, and `codex` (`codex` is an alias for OpenAI Responses API). |
-| `UNLEASH_API_KEY` | Unleash API key. Required when `LLM_PROVIDER=unleash`. |
-| `UNLEASH_BASE_URL` | Unleash API base URL. Default `https://e-api.unleash.so`; private tenants usually use `https://<tenant>/e-api`. |
-| `UNLEASH_ASSISTANT_ID` | Dedicated Unleash assistant ID for triage output. Required when `LLM_PROVIDER=unleash`. |
-| `UNLEASH_ACCOUNT` | Optional impersonation account for Unleash impersonated API keys. Leave blank for non-impersonated keys. |
-| `OPENAI_API_KEY` | OpenAI API key. Required when `LLM_PROVIDER=openai` or `LLM_PROVIDER=codex`. |
-| `OPENAI_BASE_URL` | OpenAI-compatible Responses API base URL. Default `https://api.openai.com/v1`. |
-| `OPENAI_MODEL` | Responses API model used by the OpenAI/Codex provider. Default `gpt-5.5`. |
-| `ANTHROPIC_MODEL` | Claude model identifier used only when `LLM_PROVIDER=claude`. Default `claude-sonnet-4-6`. |
+| `LLM_PROVIDER` | LLM backend: `unleash` (default), `claude`, or `openai`. |
+| `UNLEASH_API_KEY` | Required when `LLM_PROVIDER=unleash`. |
+| `UNLEASH_ASSISTANT_ID` | Required when `LLM_PROVIDER=unleash`. |
+| `OPENAI_API_KEY` | Required when `LLM_PROVIDER=openai`. |
+| `ANTHROPIC_MODEL` | Model identifier for the Claude provider. Default `claude-sonnet-4-6`. |
 
-`ANTHROPIC_API_KEY` is intentionally absent. Claude fallback uses the local Claude Code OAuth session and requires the optional `claude` extra: `python -m pip install -e ".[claude]"`.
+When `LLM_PROVIDER=claude`, the Claude Agent SDK inherits Claude Code's OAuth session — no `ANTHROPIC_API_KEY` required.
 
 ## Building the site map
 
@@ -91,6 +83,14 @@ This rewrites `data/cnc-map.json` and `data/cnc-map-gaps.md` (the latter records
 
 ## Usage
 
+### Check your setup first
+
+```bash
+triage-cli doctor
+```
+
+Prints green/red checks for Zendesk credentials, the selected LLM provider key, and `triage-notes/` writability. Exits 0 when all critical checks pass.
+
 ### Guided investigation
 
 ```bash
@@ -98,27 +98,28 @@ triage-cli investigate 12345
 triage-cli investigate https://<sub>.zendesk.com/agent/tickets/12345
 ```
 
-This is the primary daily-use path. It reads Zendesk ticket content, comments, and attachment metadata, then creates a local handoff draft with an evidence-first assessment. Attachment contents are not downloaded yet; metadata is recorded so the gap is visible.
+This is the primary daily-use path. It fetches the ticket, pulls customer history, looks up similar prior investigations from the memory layer, and creates a local handoff draft with an evidence-first LLM assessment.
 
-Add local or pasted evidence in a testable, non-interactive way:
+Add local or pasted evidence before the LLM call:
 
 ```bash
 triage-cli investigate 12345 --file ./station.log --paste 'console=WARN audio dropped'
-triage-cli investigate 12345 --save
+triage-cli investigate 12345 --save       # write .md + .json to triage-notes/
+triage-cli investigate 12345 --no-llm     # skip the LLM; useful for testing
+triage-cli investigate 12345 --tui        # three-pane progress TUI (requires TTY)
 triage-cli investigate 12345 --verbose
 ```
 
-`--file` and `--paste LABEL=TEXT` may be repeated. `--save` writes paired markdown and JSON files under `./triage-notes/`. The generated note is local and paste-ready; the CLI does not write to Zendesk.
+`--file` and `--paste LABEL=TEXT` may be repeated. The generated note is local and paste-ready; the CLI does not write to Zendesk.
 
-Evidence sources currently supported by Guided Investigation:
+Evidence sources:
 
 - Zendesk ticket body and metadata
-- Zendesk comments
+- Zendesk comments and customer ticket history
 - Zendesk attachment metadata
-- Local files
-- Pasted logs or console excerpts
-
-Datadog remains optional enrichment for `triage` and watcher mode; it is not used by `investigate`. Site map lookup, CNC resolution, and Claude are not required for `investigate`.
+- Memory layer (top-3 similar prior investigations via BM25)
+- Local files (`--file`)
+- Pasted logs or console excerpts (`--paste LABEL=TEXT`)
 
 ### Fast one-shot triage
 
@@ -195,14 +196,6 @@ triage-cli triage 12345 --no-interactive
 
 If site resolution fails, the CLI normally prompts for a `site_name`. With `--no-interactive` it aborts instead — use this in any shell pipeline or scheduled context.
 
-### Redaction
-
-By default, caller PII (phone numbers, street addresses, GPS coords) is replaced with `<PHONE>` / `<ADDR>` / `<COORDS>` placeholders before any text is sent to Claude. Use `--no-redact` to disable for debugging.
-
-```bash
-triage-cli triage 12345 --no-redact
-```
-
 ### Rebuild the site map
 
 ```bash
@@ -264,7 +257,7 @@ These are the v1 boundary; do not assume any of them have been addressed:
 
 - Site map is manually curated; refreshing the underlying Confluence inventory is an out-of-band step.
 - No station-level log filtering. Only call-center level via `@log.machineData.callCenterName`. The `DD_STATION_TAG` env var is reserved for v2.
-- Internal Zendesk comments are sent to the configured LLM provider. Caller PII is redacted by default (`--no-redact` disables this), but output is terminal-only for v1 — be aware before adding any "post back to Zendesk" feature.
+- Internal Zendesk comments are sent to Claude. Output is terminal-only for v1, but be aware before adding any "post back to Zendesk" feature — internal comments would leak into anything posted publicly.
 - No retries on transient API failures; if Datadog or Zendesk hiccups, re-run the command.
 - Single-user, local execution. No scheduling, no shared state. (`watch` mode provides local single-user polling without external scheduling.)
 
@@ -279,13 +272,12 @@ triage-cli/
 ├── apex-cnc-inventory.md       # source of truth for the CNC map
 ├── .env.example
 ├── triage_cli/
-│   ├── cli.py                  # typer app: investigate, triage, setup, doctor, watch, and build-map subcommands
-│   ├── setup.py                # shared setup and doctor checks
+│   ├── cli.py                  # typer app: investigate, triage, watch, and build-map subcommands
 │   ├── zendesk.py              # ticket + comment fetch (httpx)
 │   ├── datadog.py              # log query (datadog-api-client)
 │   ├── extract.py              # ticket ID parsing, site lookup, window/anchor
 │   ├── investigation.py        # guided investigation session/evidence/report bridge
-│   ├── llm.py                  # provider protocol, LLM calls, and system prompts
+│   ├── llm.py                  # Claude Agent SDK calls + system prompts
 │   ├── models.py               # pydantic models
 │   ├── pipeline.py             # triage_one single-ticket orchestration
 │   ├── render.py               # markdown print + --save handling
@@ -315,17 +307,11 @@ triage-cli/
 
 ## Troubleshooting
 
-**`UNLEASH_API_KEY must be set` / `UNLEASH_ASSISTANT_ID must be set`**
-One-shot `triage` or watcher mode is using the production Unleash provider without the required Unleash credentials. Fill in `.env`, then re-run.
-
-**`OPENAI_API_KEY must be set`**
-`LLM_PROVIDER=openai` or `LLM_PROVIDER=codex` is selected without an OpenAI API key. Fill in `.env`, then re-run.
-
-**`ImportError: claude_agent_sdk` / `claude-agent-sdk is not installed`**
-Claude fallback was selected without installing the optional dependency. Install with `python -m pip install -e ".[claude]"`, confirm the venv is active, and verify the local `claude` CLI is authenticated.
+**`ImportError: claude_agent_sdk`**
+The package was not installed (run `python -m pip install -e .` again from the repo root with your venv active), or your venv is not actually activated. The SDK is a runtime dependency declared in `pyproject.toml`.
 
 **`Claude Agent SDK call failed` / `extracted_dt None and SDK error in --verbose`**
-The SDK could not reach Claude Code's session while `LLM_PROVIDER=claude`. Run `claude` once interactively to confirm the CLI is installed and your OAuth session is valid. The Agent SDK does not read `ANTHROPIC_API_KEY`.
+The SDK could not reach Claude Code's session. Run `claude` once interactively to confirm the CLI is installed and your OAuth session is valid. The Agent SDK does not read `ANTHROPIC_API_KEY` — Claude Code's auth is the only path.
 
 **Zendesk auth failed (401 / 403)**
 Check that `ZENDESK_API_TOKEN` is the API token (not your password) and that `ZENDESK_EMAIL` is the agent email associated with the token. The client appends `/token` to the email when forming Basic auth — do not pre-append it in `.env`. Also confirm the token has read scope on tickets.

@@ -11,6 +11,7 @@ Public surface:
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import math
@@ -18,7 +19,7 @@ import os
 import sys
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -45,8 +46,6 @@ class WatcherOptions:
     no_logs: bool
     print_notes: bool
     verbose: bool
-    site_map_path: Path = field(default_factory=lambda: Path("data/cnc-map.json"))
-    redact_enabled: bool = True
 
 
 State = dict[str, Any]
@@ -186,43 +185,27 @@ def run_iteration(
                 _emit(f"[{_now_local_hms()}] #{tid} unchanged")
             continue
 
-        site_entry, _strategy = pipeline.resolve_site(
-            ticket, sites, verbose=opts.verbose, redact_enabled=opts.redact_enabled,
-        )
-        if site_entry is None:
-            _emit(f"[{_now_local_hms()}] #{tid} skipped: site unresolvable")
-            if on_failure is not None:
-                on_failure(tid, "site unresolvable")
-            continue
-
         try:
             if on_progress is not None:
                 on_progress(tid, "triaging")
-            report = pipeline.triage_one(
-                ticket,
-                site_entry,
-                dd_client=dd_client,
-                window_minutes=opts.window_minutes,
-                levels=opts.levels,
-                at=None,
-                verbose=opts.verbose,
-                show_spinner=False,
-                redact_enabled=opts.redact_enabled,
+            from triage_cli.investigation import create_session
+            session = create_session(ticket)
+            report = asyncio.run(
+                pipeline.investigate_one(
+                    ticket,
+                    session=session,
+                    dd_client=dd_client,
+                    reporter=pipeline.SilentReporter(),
+                    interactive=False,
+                    verbose=opts.verbose,
+                )
             )
-        except (RuntimeError, ValueError) as e:
+        except (RuntimeError, ValueError, OSError) as e:
             _emit(f"[{_now_local_hms()}] #{tid} failed: {e} (will retry)")
             if on_failure is not None:
                 on_failure(tid, str(e))
             continue
-
-        try:
-            md_path, _json_path = render.save_note(report, ticket.id)
-        except OSError as e:
-            _emit(f"[{_now_local_hms()}] #{tid} failed: could not write note: {e} (will retry)")
-            if on_failure is not None:
-                on_failure(tid, f"could not write note: {e}")
-            continue
-        _emit(f"[{_now_local_hms()}] #{tid} triaged → {md_path}")
+        _emit(f"[{_now_local_hms()}] #{tid} triaged")
         if on_complete is not None:
             on_complete(report)
         if opts.verbose:
@@ -245,7 +228,7 @@ def run_watch(opts: WatcherOptions) -> None:
     (cannot load site map, missing Zendesk env), raises RuntimeError so
     the CLI can print and exit.
     """
-    sites = extract.load_site_map(opts.site_map_path)
+    sites = extract.load_site_map(Path("data/cnc-map.json"))
     state = load_state(opts.state_file)
     cutoff = (
         datetime.now(UTC) - timedelta(hours=opts.backfill_hours)

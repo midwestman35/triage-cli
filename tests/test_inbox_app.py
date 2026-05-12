@@ -316,7 +316,6 @@ def test_run_iteration_blocking_uses_watcher_dependencies(
 ) -> None:
     zd = object()
     dd = object()
-    sites = [object()]
     captured: dict[str, object] = {}
     saved: dict[str, object] = {}
 
@@ -329,10 +328,6 @@ def test_run_iteration_blocking_uses_watcher_dependencies(
 
         def __exit__(self, *_exc: object) -> None:
             return None
-
-    def load_site_map(path: Path) -> list[object]:
-        captured["site_map_path"] = path
-        return sites
 
     def run_iteration(
         zd_arg,
@@ -374,7 +369,6 @@ def test_run_iteration_blocking_uses_watcher_dependencies(
         saved["path"] = path
         saved["state"] = state
 
-    monkeypatch.setattr(app_module.extract, "load_site_map", load_site_map)
     monkeypatch.setattr(app_module.ZendeskClient, "from_env", lambda: Context(zd))
     monkeypatch.setattr(app_module.DatadogClient, "from_env", lambda: Context(dd))
     monkeypatch.setattr(app_module.watcher, "run_iteration", run_iteration)
@@ -385,9 +379,8 @@ def test_run_iteration_blocking_uses_watcher_dependencies(
     app = InboxApp(opts, notes_dir=tmp_path)
     new_state = app._run_iteration_blocking(app._state)
 
-    assert captured["site_map_path"] == Path("data/cnc-map.json")
     assert captured["zd"] is zd
-    assert captured["sites"] == sites
+    assert captured["sites"] == []
     assert captured["state"] == {"version": 1, "triaged": {}}
     assert captured["opts"] is opts
     assert captured["dd_client"] is dd

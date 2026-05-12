@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -174,28 +174,27 @@ def test_run_iteration_marks_only_successfully_triaged(
         id=2, subject="s", description="us-co-aurora-apex", requester_org=None,
         tags=[], created_at=now, updated_at=now, comments=[],
     )
-    t_no_site = Ticket(
-        id=3, subject="s", description="no match here", requester_org=None,
+    t_ok2 = Ticket(
+        id=3, subject="s", description="no site clue needed", requester_org=None,
         tags=[], created_at=now, updated_at=now, comments=[],
     )
-    zd = _zd_with_tickets({1: t_ok, 2: t_fail, 3: t_no_site}, [1, 2, 3])
+    zd = _zd_with_tickets({1: t_ok, 2: t_fail, 3: t_ok2}, [1, 2, 3])
 
-    def fake_triage_one(ticket, site_entry, **kwargs):  # noqa: ARG001
+    def fake_investigate(ticket, **_kwargs):
         if ticket.id == 2:
             raise RuntimeError("simulated Datadog timeout")
         return _report(ticket.id, now)
 
-    monkeypatch.setattr("triage_cli.pipeline.triage_one", fake_triage_one)
     monkeypatch.setattr(
-        "triage_cli.render.save_note",
-        lambda report, tid: (tmp_path / f"{tid}.md", tmp_path / f"{tid}.json"),
+        "triage_cli.pipeline.investigate_one", AsyncMock(side_effect=fake_investigate),
     )
 
     state = {"version": 1, "triaged": {}}
     opts = _opts(tmp_path / "state.json")
     new_state = run_iteration(zd, stub_sites, state, opts, cutoff, dd_client=None)
 
-    assert new_state["triaged"] == {"1": now.isoformat()}
+    # Ticket 2 failed; tickets 1 and 3 were triaged successfully.
+    assert new_state["triaged"] == {"1": now.isoformat(), "3": now.isoformat()}
 
 
 def test_run_iteration_status_lines(
@@ -218,15 +217,13 @@ def test_run_iteration_status_lines(
     }
     zd = _zd_with_tickets(tickets, [1, 2, 3, 4])
 
-    def fake_triage_one(ticket, site_entry, **kwargs):  # noqa: ARG001
+    def fake_investigate(ticket, **_kwargs):
         if ticket.id == 2:
             raise RuntimeError("Datadog timeout")
         return _report(ticket.id, now)
 
-    monkeypatch.setattr("triage_cli.pipeline.triage_one", fake_triage_one)
     monkeypatch.setattr(
-        "triage_cli.render.save_note",
-        lambda report, tid: (tmp_path / f"{tid}.md", tmp_path / f"{tid}.json"),
+        "triage_cli.pipeline.investigate_one", AsyncMock(side_effect=fake_investigate),
     )
 
     state = {"version": 1, "triaged": {"4": now.isoformat()}}
@@ -247,7 +244,8 @@ def test_run_iteration_status_lines(
     assert "#1 triaged" in err
     assert "#1 confidence: medium; events: 0; sources: zendesk" in err
     assert "#2 failed" in err and "Datadog timeout" in err and "will retry" in err
-    assert "#3 skipped: site unresolvable" in err
+    # Ticket 3 is now triaged rather than skipped (site resolution is no longer a gate).
+    assert "#3 triaged" in err
     assert "#4 unchanged" in err
 
 
@@ -272,11 +270,7 @@ def test_run_iteration_print_notes_uses_rendered_markdown(
     zd = _zd_with_tickets({1: ticket}, [1])
     report = _report(1, now)
 
-    monkeypatch.setattr("triage_cli.pipeline.triage_one", lambda *_args, **_kwargs: report)
-    monkeypatch.setattr(
-        "triage_cli.render.save_note",
-        lambda report, tid: (tmp_path / f"{tid}.md", tmp_path / f"{tid}.json"),
-    )
+    monkeypatch.setattr("triage_cli.pipeline.investigate_one", AsyncMock(return_value=report))
     monkeypatch.setattr(
         "triage_cli.render.to_markdown",
         lambda actual_report: "rendered note" if actual_report is report else "wrong report",
@@ -318,11 +312,11 @@ def test_run_iteration_silent_backfill_marks_old_tickets_no_status(
     )
     zd = _zd_with_tickets({99: t_old}, [99])
 
-    # pipeline.triage_one should NOT be called for a backfill-skipped ticket.
-    def boom(*_args, **_kwargs):
-        raise AssertionError("triage_one should not be called for silent-backfill ticket")
+    # pipeline.investigate_one should NOT be called for a backfill-skipped ticket.
+    async def boom(*_args, **_kwargs):
+        raise AssertionError("investigate_one should not be called for silent-backfill ticket")
 
-    monkeypatch.setattr("triage_cli.pipeline.triage_one", boom)
+    monkeypatch.setattr("triage_cli.pipeline.investigate_one", boom)
 
     state = {"version": 1, "triaged": {}}
     opts = _opts(tmp_path / "state.json")
