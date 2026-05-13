@@ -1,0 +1,177 @@
+[
+  {
+    "friendly_name": "CO-UNP",
+    "site_name": "co-unp",
+    "cnc": "1e7a5594-9744-4023-99e2-5f20ae9bf586"
+  },
+  {
+    "friendly_name": "Aurora 911, CO",
+    "site_name": "us-co-aurora-apex",
+    "cnc": "921d7c53-e815-4566-9692-6cbce589e1d3"
+  },
+  {
+    "friendly_name": "West Broomfield Police Department",
+    "site_name": "us-co-west-broomfield-apex",
+    "cnc": "da97e496-1e19-4b52-8dd7-fcdefdf81eb7"
+  },
+  {
+    "friendly_name": "Westminster Police Department",
+    "site_name": "us-co-westminster-apex",
+    "cnc": "30caf0f7-fd45-4372-b170-5ad5d45b31aa"
+  },
+  {
+    "friendly_name": "Fayette County, GA",
+    "site_name": "us-ga-fayette-ccs-apex",
+    "cnc": "56d226d7-87a7-4189-a856-284a87e2d8f6"
+  },
+  {
+    "friendly_name": "US-GMR-APEX",
+    "site_name": "us-gmr-apex",
+    "cnc": "6f12b585-5165-4a81-9bcf-b57b6e1a9c59"
+  },
+  {
+    "friendly_name": "US-Gov-OpsLab-Apex-CCS",
+    "site_name": "us-gov-opslab-apex-ccs",
+    "cnc": "532eb9c5-e789-4433-b94c-3296d5cb61f6"
+  },
+  {
+    "friendly_name": "US-IL-Glenview",
+    "site_name": "us-il-glenview",
+    "cnc": "c0f4a56c-8034-4676-bc3d-aece4c6ed5c5"
+  },
+  {
+    "friendly_name": "Boone County Sheriff's Department, Indiana",
+    "site_name": "us-in-boone-apex",
+    "cnc": "c5112fa4-d067-4469-9bd0-00a41b691c2e"
+  },
+  {
+    "friendly_name": "Vanderberg",
+    "site_name": "us-in-vanderberg-apex-att",
+    "cnc": "f1ad1c65-510b-4c8f-b1ac-a2fe2cffeaa8"
+  },
+  {
+    "friendly_name": "US-LA-Orleans-Apex",
+    "site_name": "us-la-orleans-apex",
+    "cnc": "88772676-680e-45f1-a23e-da6fdc2d6058"
+  },
+  {
+    "friendly_name": "US-MO-Barry-APEX",
+    "site_name": "us-mo-barry-apex",
+    "cnc": "6262ce58-1006-4894-b695-8849183b180f"
+  },
+  {
+    "friendly_name": "Branson PD",
+    "site_name": "us-mo-branson-apex",
+    "cnc": "069ebc41-7b75-43fe-b887-448046a67132"
+  },
+  {
+    "friendly_name": "US-MO-Christian-APEX",
+    "site_name": "us-mo-christian-apex",
+    "cnc": "b80a6bd6-0844-44a0-8185-dcb63d77b844"
+  },
+  {
+    "friendly_name": "US-MO-Dade-APEX",
+    "site_name": "us-mo-dade-apex",
+    "cnc": "c3cfd3af-cb78-4e03-9bc6-f10f2686470c"
+  },
+  {
+    "friendly_name": "US-MO-Dallas-APEX",
+    "site_name": "us-mo-dallas-apex",
+    "cnc": "cb571950-c791-4c7e-b696-c4c9f100ad3d"
+  },
+  {
+    "friendly_name": "US-MO-Stone-APEX",
+    "site_name": "us-mo-stone-apex",
+    "cnc": "76c0c210-b17d-42a5-9089-10d2607569e8"
+  },
+  {
+    "friendly_name": "US-MO-TCAD-APEX",
+    "site_name": "us-mo-tcad-apex",
+    "cnc": "fd7bbbaa-bfdf-4bbb-9d7c-639d4e338117"
+  },
+  {
+    "friendly_name": "Nevada Department of Public Safety",
+    "site_name": "us-nv-nvdps-apex",
+    "cnc": "de9ee414-da5a-471d-bac2-10643190da0b"
+  },
+  {
+    "friendly_name": "Guernsey, OH",
+    "site_name": "us-oh-guernsey-apex",
+    "cnc": "8c769371-a3fc-431c-97ba-2babf04a72b0"
+  },
+  {
+    "friendly_name": "Lancaster, OH",
+    "site_name": "us-oh-lancaster-apex",
+    "cnc": "f7b54d0f-61ec-4583-b711-bf0d15d27e71"
+  },
+  {
+    "friendly_name": "Lorain County PD, OH",
+    "site_name": "us-oh-lorain-pd-apex",
+    "cnc": "e39817f1-ff9b-4880-8d6b-1a78efc6b389"
+  },
+  {
+    "friendly_name": "US-OK-OTTAWA",
+    "site_name": "us-ok-ottawa",
+    "cnc": "1a9af896-60de-47b3-bd1a-d5eef3bc2948"
+  },
+  {
+    "friendly_name": "Adams County",
+    "site_name": "us-pa-adams-apex",
+    "cnc": "39c7d4ee-bfdc-4f19-8c79-3ce96465c836"
+  },
+  {
+    "friendly_name": "Cumberland County",
+    "site_name": "us-pa-cumberland-apex",
+    "cnc": "9f4bc235-e41c-4872-8f7c-aea8f5f7a948"
+  },
+  {
+    "friendly_name": "Dauphin County",
+    "site_name": "us-pa-dauphin-apex",
+    "cnc": "4bb8142d-c29a-4847-8b6a-7014d2ea1dd5"
+  },
+  {
+    "friendly_name": "Franklin County",
+    "site_name": "us-pa-franklin-apex",
+    "cnc": "1164d508-557c-4074-8d8e-6734ef8686a0"
+  },
+  {
+    "friendly_name": "US-TX-Howard",
+    "site_name": "us-tx-howard",
+    "cnc": "3e95895d-b9c9-4815-98be-12c812006427"
+  },
+  {
+    "friendly_name": "Fairfax City of Fairfax",
+    "site_name": "us-va-fairfax-city-of-fairfax-apex",
+    "cnc": "01a2f671-e7cf-4422-b679-05f79435e7dc"
+  },
+  {
+    "friendly_name": "Fairfax George Mason University",
+    "site_name": "us-va-fairfax-gmu-apex",
+    "cnc": "5de903e9-1692-4a7e-b304-7efd64d9b9e3"
+  },
+  {
+    "friendly_name": "Fairfax Pine Ridge",
+    "site_name": "us-va-fairfax-pine-ridge-apex",
+    "cnc": "a68476d8-aef6-4d01-aeed-7d88cb37624f"
+  },
+  {
+    "friendly_name": "Fairfax PSTOC",
+    "site_name": "us-va-fairfax-pstoc-apex",
+    "cnc": "eee82779-3d8e-4b0e-ad26-8f993f4362f3"
+  },
+  {
+    "friendly_name": "Fairfax Town of Herndon",
+    "site_name": "us-va-fairfax-town-of-herndon-apex",
+    "cnc": "9fb48826-fa30-4586-a30d-0f4bb9fcc3b5"
+  },
+  {
+    "friendly_name": "Fairfax Town of Vienna",
+    "site_name": "us-va-fairfax-town-of-vienna-apex",
+    "cnc": "bab38da2-7867-44a5-8372-0c10144cf748"
+  },
+  {
+    "friendly_name": "MACC 911",
+    "site_name": "us-wa-macc911-apex",
+    "cnc": "62b4e022-f40d-4aaf-a83c-d8a7438484b9"
+  }
+]

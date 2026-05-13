@@ -2,76 +2,135 @@
 
 ## What this is
 
-A local CLI for Axon network engineers working the Carbyne APEX NG911/E911 platform. The primary workflow is Guided Investigation: give it a Zendesk ticket URL or ID, it fetches the ticket body, comments, and attachment metadata, optionally folds in local files or pasted logs, and generates a local markdown/JSON handoff draft. Nothing is posted back to Zendesk.
+A local Rust CLI for the Carbyne APEX NG911/E911 NOC. Give it a Zendesk
+ticket URL or ID and it fetches the ticket body, customer history, attachment
+metadata, optionally folds in local files or pasted logs and Datadog
+enrichment, and produces a structured **five-markdown ticket folder**:
+`INTAKE.md`, `EVIDENCE_PREFLIGHT.md`, `FORK_PACKET.md`, `DRAFTS.md`, and
+`STATE.md`. The LLM commits a fork letter (A / B / C / D) against a
+versioned rubric; the analyst reviews and acts on the drafts. Nothing is
+posted back to Zendesk, Jira, or any audited surface.
 
-`triage-cli triage <ticket>` remains available as a fast one-shot summary/report path. `triage-cli watch --view <id>` remains the automated watcher for Zendesk views. Datadog is useful enrichment for `triage` and watcher mode, but it is not required for `investigate`.
+This was originally a Python project (Typer + Textual + pydantic). It was
+ported to Rust in May 2026 and reframed for the v1 contract; the binary is
+now a single static executable with no Python runtime dependency. The frozen
+Python source lives in `archive/python-source-2026-05-12.zip` for reference.
+
+The full v1 contract — folder layout, file shapes, soft-lock semantics,
+validator behavior — is documented in **`docs/spec/v1-reframe.md`**.
+
+## Subcommands
+
+- `triage-cli investigate <id-or-url>` — interactive guided session. Fetches
+  the ticket, downloads attachments to a scratch workspace, prompts the
+  analyst to drop in files / paste logs, then runs the structured pipeline
+  and writes the ticket folder. Requires TTY.
+- `triage-cli triage <id-or-url>` — headless single-shot. Same pipeline,
+  no evidence prompts. Writes the ticket folder and prints
+  `FORK_PACKET.md` to stdout (pipeable handoff).
+- `triage-cli watch --view <id>` — long-running poll loop over a Zendesk
+  view; runs the structured pipeline per new/updated ticket.
+- `triage-cli inbox [--view ...]` — ratatui TUI over the produced ticket
+  folders. Synth-summary right pane + tabbed per-file view. Requires TTY.
+- `triage-cli doctor` — checks env vars, credentials, and scratch-dir
+  writability; exits 0/1.
+- `triage-cli build-map` — regenerates `data/cnc-map.json` from
+  `apex-cnc-inventory.md`.
+- `triage-cli setup` — interactive first-run that prompts for env vars and
+  writes `.env`.
 
 ## Prerequisites
 
-- **Python 3.11+** (the package is pinned to `>=3.11` in `pyproject.toml`).
-- **Zendesk credentials** with read scope on tickets: an agent email plus an API token.
-- **Claude Code CLI installed and authenticated** for `triage` and watcher reports. The guided `investigate` command does not require Claude.
-- **Datadog credentials** are optional enrichment for `triage` and watcher mode. `investigate` works without Datadog.
+- **Rust toolchain 1.95+** (stable). Install via `rustup`:
+  ```bash
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+  ```
+- **Zendesk credentials** with read scope on tickets: an agent email plus an
+  API token.
+- **At least one LLM provider** configured (see *LLM providers* below). The
+  default is the internal `unleash` gateway.
+- **Datadog credentials** are optional enrichment for `triage`, `investigate`,
+  and watcher mode.
 
 ## Install
 
-For first-time setup, use the interactive setup script. It creates the venv,
-installs the package with dev dependencies, prompts for `.env`, builds the site
-map, and resumes safely if interrupted:
-
 ```bash
-python3.11 scripts/setup.py
+git clone <repo-url> && cd triage-cli/triage-cli-rs
+cargo build --release
 ```
 
-Manual install remains available when you need to run the steps yourself:
+Produces `triage-cli-rs/target/release/triage-cli` — a ~7 MB static binary.
 
+Optional: symlink it onto your PATH so commands work from anywhere:
 ```bash
-git clone <repo-url> && cd triage-cli
-python3.11 -m venv .venv
-source .venv/bin/activate
-python -m ensurepip --upgrade
-python -m pip install --upgrade pip setuptools wheel
-python -m pip install -e .
+ln -s "$PWD/target/release/triage-cli" ~/.local/bin/triage-cli
 ```
 
-`uv` works too if you prefer it:
+After install, run from the repo root (`triage-cli/`), which is the cwd the
+binary expects for `data/`, `MEMORY.md`, `apex-cnc-inventory.md`, and `.env`.
+
+## First-run setup
 
 ```bash
-uv pip install -e .
+cd triage-cli                  # the dir with data/, MEMORY.md, apex-cnc-inventory.md
+triage-cli setup               # interactive: writes .env
+triage-cli build-map           # regenerates data/cnc-map.json
+triage-cli doctor              # green/red health check; exits 1 if anything critical is missing
 ```
 
-After install, `triage-cli --help` should list the `investigate`, `triage`, `inbox`,
-`watch`, `doctor`, and `build-map` subcommands.
-
-## Configuration
-
-Copy the example env file and fill in the credentials:
-
+`setup` is idempotent — values from an existing `.env` become defaults on
+re-run. You can also manually copy `.env.example`:
 ```bash
 cp .env.example .env
 ```
+
+## Configuration
+
+### v1-specific environment variables
+
+| Variable | Purpose |
+| --- | --- |
+| `TRIAGE_TICKETS_ROOT` | Where ticket folders are written. Default `./Tickets`. Point this at a Drive-synced folder (e.g. `~/Drive/CarbyneNOC/Tickets`) to share with the team. |
+| `TRIAGE_RUBRIC_PATH` | Dev override: load the fork rubric from this file instead of the embedded copy. Release runs should leave this unset. |
+| `TRIAGE_OWNER` | Identifier recorded in `STATE.md`'s `owner` field. Falls back to `$USER` then `"unknown"`. Used by the soft-lock conflict check. |
+| `DIFF_VIEWER` | Command run on `--diff` soft-lock conflicts (e.g. `code --diff`). Falls back to `diff -u` printed to stderr. |
+
+### Service credentials
 
 | Variable | Purpose |
 | --- | --- |
 | `ZENDESK_SUBDOMAIN` | Your Zendesk subdomain (the `<sub>` in `<sub>.zendesk.com`). |
 | `ZENDESK_EMAIL` | Agent email used for Basic auth. |
 | `ZENDESK_API_TOKEN` | Zendesk API token. The client appends `/token` to the email automatically; do not append it yourself. |
-| `DD_API_KEY` | Optional Datadog API key for `triage`/watch enrichment. |
-| `DD_APP_KEY` | Optional Datadog application key for `triage`/watch enrichment. |
-| `DD_SITE` | Datadog site host. Leave at default `datadoghq.com` unless you are on a non-US tenant. |
-| `DD_CALL_CENTER_TAG` | Datadog tag key for the call-center filter. Leave at default `@log.machineData.callCenterName`. |
-| `DD_STATION_TAG` | Reserved for v2 station-level filtering. Leave at default; v1 does not use it. |
-| `LLM_PROVIDER` | LLM backend: `unleash` (default), `claude`, or `openai`. |
+| `DD_API_KEY` | Optional Datadog API key for `triage` / `investigate` / watch enrichment. |
+| `DD_APP_KEY` | Optional Datadog application key. |
+| `DD_SITE` | Datadog site host. Default `datadoghq.com`. |
+| `DD_CALL_CENTER_TAG` | Datadog tag key for the call-center filter. Default `@log.machineData.callCenterName`. |
+| `DD_STATION_TAG` | Reserved for future station-level filtering. Currently unused. |
+| `LLM_PROVIDER` | `unleash` (default), `claude`, `codex`, or `openai`. |
 | `UNLEASH_API_KEY` | Required when `LLM_PROVIDER=unleash`. |
 | `UNLEASH_ASSISTANT_ID` | Required when `LLM_PROVIDER=unleash`. |
 | `OPENAI_API_KEY` | Required when `LLM_PROVIDER=openai`. |
-| `ANTHROPIC_MODEL` | Model identifier for the Claude provider. Default `claude-sonnet-4-6`. |
+| `ANTHROPIC_MODEL` | Model identifier for the Claude / Codex providers. |
+| `OPENAI_MODEL` | Model identifier for the OpenAI Responses API. |
 
-When `LLM_PROVIDER=claude`, the Claude Agent SDK inherits Claude Code's OAuth session — no `ANTHROPIC_API_KEY` required.
+## LLM providers
+
+| Value | Mechanism | Auth | Notes |
+|---|---|---|---|
+| `unleash` *(default)* | HTTP to `/chats` | `UNLEASH_API_KEY` + `UNLEASH_ASSISTANT_ID` | Internal Axon gateway |
+| `claude` | Subprocess to `claude --print` | Inherits Claude Code OAuth | `claude` must be on PATH |
+| `codex` | Subprocess to `codex exec` | Inherits codex OAuth | `codex` must be on PATH (untested; see `triage-cli-rs/REGRESSIONS.md` R2) |
+| `openai` | HTTP to `/responses` | `OPENAI_API_KEY` | |
+
+When `LLM_PROVIDER=claude`, no `ANTHROPIC_API_KEY` is needed — the subprocess
+inherits Claude Code's OAuth session.
 
 ## Building the site map
 
-The site map at `data/cnc-map.json` is the lookup table from Zendesk requester orgs to APEX `site_name` values (the Datadog filter key) and CNC UUIDs. It is generated from the markdown inventory at `apex-cnc-inventory.md` by `scripts/build_cnc_map.py`.
+`data/cnc-map.json` is the lookup table from Zendesk requester orgs to APEX
+`site_name` values (the Datadog filter key) and CNC UUIDs. It is generated
+from the markdown inventory at `apex-cnc-inventory.md`.
 
 To rebuild it:
 
@@ -79,7 +138,11 @@ To rebuild it:
 triage-cli build-map
 ```
 
-This rewrites `data/cnc-map.json` and `data/cnc-map-gaps.md` (the latter records inventory rows missing a CNC UUID or `site_name` so they can be filled in later). When the upstream Confluence inventory changes, refresh `apex-cnc-inventory.md` out-of-band — re-run the Claude Confluence connector against the source page, then re-run `build-map`. There is no `confluence.py` in this repo by design.
+This rewrites `data/cnc-map.json` and `data/cnc-map-gaps.md` (the latter
+records inventory rows missing a CNC UUID or `site_name`). When the upstream
+Confluence inventory changes, refresh `apex-cnc-inventory.md` out-of-band —
+re-run the Claude Confluence connector against the source page, then re-run
+`build-map`. There is no Confluence module in this repo by design.
 
 ## Usage
 
@@ -89,7 +152,9 @@ This rewrites `data/cnc-map.json` and `data/cnc-map-gaps.md` (the latter records
 triage-cli doctor
 ```
 
-Prints green/red checks for Zendesk credentials, the selected LLM provider key, and `triage-notes/` writability. Exits 0 when all critical checks pass.
+Prints green/red checks for Zendesk credentials, the selected LLM provider
+key (or subprocess binary on PATH), and scratch-dir writability. Exits 0
+when all critical checks pass.
 
 ### Guided investigation
 
@@ -98,28 +163,21 @@ triage-cli investigate 12345
 triage-cli investigate https://<sub>.zendesk.com/agent/tickets/12345
 ```
 
-This is the primary daily-use path. It fetches the ticket, pulls customer history, looks up similar prior investigations from the memory layer, and creates a local handoff draft with an evidence-first LLM assessment.
+The primary daily-use path. Fetches the ticket, downloads attachments to a
+scratch workspace, prompts you to drop in additional local files or paste
+logs, looks up similar prior investigations from the memory layer, runs the
+structured LLM call, and writes the five-markdown ticket folder under
+`${TRIAGE_TICKETS_ROOT:-./Tickets}/<id>/`.
 
-Add local or pasted evidence before the LLM call:
+Pre-supply evidence on the command line to skip the drop-and-wait step:
 
 ```bash
 triage-cli investigate 12345 --file ./station.log --paste 'console=WARN audio dropped'
-triage-cli investigate 12345 --save       # write .md + .json to triage-notes/
-triage-cli investigate 12345 --no-llm     # skip the LLM; useful for testing
-triage-cli investigate 12345 --tui        # three-pane progress TUI (requires TTY)
-triage-cli investigate 12345 --verbose
+triage-cli investigate 12345 --no-llm     # skip the LLM; useful for dry runs
+triage-cli investigate 12345 --verbose    # phase-by-phase stderr trace
 ```
 
-`--file` and `--paste LABEL=TEXT` may be repeated. The generated note is local and paste-ready; the CLI does not write to Zendesk.
-
-Evidence sources:
-
-- Zendesk ticket body and metadata
-- Zendesk comments and customer ticket history
-- Zendesk attachment metadata
-- Memory layer (top-3 similar prior investigations via BM25)
-- Local files (`--file`)
-- Pasted logs or console excerpts (`--paste LABEL=TEXT`)
+`--file` and `--paste LABEL=TEXT` may be repeated.
 
 ### Fast one-shot triage
 
@@ -128,196 +186,231 @@ triage-cli triage 12345
 triage-cli triage https://<sub>.zendesk.com/agent/tickets/12345
 ```
 
-The CLI accepts either a raw ticket ID or a full Zendesk URL. This path is optimized for a quick terminal report and can use site/CNC lookup, Datadog logs, and Claude.
+Headless; pipeable. The same ticket folder is written; `FORK_PACKET.md` is
+streamed to stdout for piping into chat / ad-hoc tools. Status and verbose
+output go to stderr.
 
-### Save the note to disk
-
-```bash
-triage-cli triage 12345 --save
-```
-
-Also writes the rendered note to `./triage-notes/<ticket-id>-<timestamp>.md`. Stdout still shows the note.
-
-### Verbose pipeline trace
+### Common flags (shared by `triage` and `investigate`)
 
 ```bash
-triage-cli triage 12345 --verbose
-```
-
-Verbose output goes to stderr (so stdout stays clean for piping) and shows: ticket fetched, site resolution strategy that won, anchor source (`flag` / `extracted` / `created_at`), Datadog query parameters, log line count, and any anchor-extraction fallbacks.
-
-### Override the anchor timestamp
-
-```bash
-triage-cli triage 12345 --at 2026-05-06T14:32:00Z
-triage-cli triage 12345 --at "2026-05-06T14:32-07:00"
-```
-
-Use this when the ticket was filed well after the incident (the LLM-extracted anchor is best-effort, and `created_at` may be too late). `--at` is the highest-priority anchor source. Accepts ISO 8601 with offset, including a trailing `Z`.
-
-### Override the site
-
-```bash
-triage-cli triage 12345 --site us-nv-nvdps-apex
+triage-cli triage 12345 --verbose              # phase-by-phase progress on stderr
+triage-cli triage 12345 --at 2026-05-06T14:32:00Z   # anchor override
+triage-cli triage 12345 --site us-nv-nvdps-apex     # bypass site lookup
 triage-cli triage 12345 --cnc de9ee414-da5a-471d-bac2-10643190da0b
-```
-
-`--site` skips the lookup entirely and uses the value as-is in the Datadog filter. `--cnc` looks the entry up by UUID in `data/cnc-map.json` and uses its `site_name`. Use `--site` when the requester org or ticket text does not match any inventory entry.
-
-### Skip Datadog for one-shot triage
-
-```bash
-triage-cli triage 12345 --no-logs
-```
-
-Runs the LLM call on the ticket content alone. Guided Investigation does not need this flag because Datadog is not part of its required path.
-
-### Adjust log levels
-
-```bash
+triage-cli triage 12345 --no-logs              # skip Datadog
+triage-cli triage 12345 --no-llm               # skip LLM call
 triage-cli triage 12345 --levels error,warn,info
+triage-cli triage 12345 --window-minutes 60    # default 30
+triage-cli triage 12345 --force                # overwrite another analyst's STATE.md
+triage-cli triage 12345 --diff                 # on soft-lock conflict, open $DIFF_VIEWER
 ```
 
-Default is `error,warn`. Valid values: `error`, `warn`, `info`, `debug`. The flag accepts a comma-separated list and is validated up-front.
+`--at` accepts ISO 8601 with offset, including trailing `Z`. Use it when the
+ticket was filed well after the incident.
 
-### Adjust the log window
+## Ticket folder output
 
-```bash
-triage-cli triage 12345 --window-minutes 60
-```
+A successful investigation writes exactly five files atomically under
+`${TRIAGE_TICKETS_ROOT:-./Tickets}/<id>/`:
 
-Default window is 30 minutes either side of the resolved anchor. The result count is capped at 200 lines regardless; if Datadog returns more, the bundle is marked truncated and the rendered note flags it.
+| File | Content |
+| --- | --- |
+| `INTAKE.md` | Housekeeping checklist, ticket facts, one-line fingerprint, LLM-emitted summary bullets, context-pulls table, initial fork hypothesis, intake decision. |
+| `EVIDENCE_PREFLIGHT.md` | Gathered-evidence table, decisive evidence, missing / non-decisive evidence. |
+| `FORK_PACKET.md` | Fork letter (A/B/C/D), confidence, reasoning, quoted rubric row, evidence summary, related work, handoff checklist. |
+| `DRAFTS.md` | CONFIRM-gated drafts: customer-facing reply, internal Zendesk note, Jira draft (fork A only). |
+| `STATE.md` | YAML frontmatter only: ticket_id, fork, confidence, quoted_rubric_row, rubric_version, owner, status, related, cluster, validator_warnings. |
 
-### Non-interactive mode
+Fork letters:
 
-```bash
-triage-cli triage 12345 --no-interactive
-```
+- **A** Engineering Jira
+- **B** Vendor or Internal IT
+- **C** NOC self-resolve
+- **D** Cannot fork yet (rubric demands more evidence — the next step is gathering it, not routing)
 
-If site resolution fails, the CLI normally prompts for a `site_name`. With `--no-interactive` it aborts instead — use this in any shell pipeline or scheduled context.
+See `docs/spec/v1-reframe.md` for the full file contract, including the
+exact section list inside each file.
 
-### Rebuild the site map
+## Workflow
 
-```bash
-triage-cli build-map
-```
-
-Runs `scripts/build_cnc_map.py` and prints a summary of entries written and gap entries logged.
+1. **Start** — `triage-cli investigate 12345` (or `triage 12345` for
+   headless).
+2. **Engine runs** — Zendesk fetch → customer history → memory lookup →
+   evidence intake → site resolution → optional Datadog enrichment → PII
+   redaction → structured LLM call.
+3. **Ticket folder appears** — `Tickets/12345/` is written atomically; the
+   CLI prints `FORK_PACKET.md` to stdout and "Ticket folder ready: ..." to
+   stderr.
+4. **Review** — open `Tickets/12345/` in your editor (or Claude Code).
+   Inspect the fork commitment in `FORK_PACKET.md`, the evidence trail in
+   `EVIDENCE_PREFLIGHT.md`, and the prepared drafts in `DRAFTS.md`.
+5. **Act on drafts** — copy-paste the customer reply / internal note /
+   Jira draft after review. The CLI does not post anything autonomously.
+6. **Closure** — manually update `STATE.md` (`status: closed`) when the
+   fork is acted on. v1 has no closure automation.
 
 ## Watching a Zendesk view
-
-Run a polling loop that triages every new or updated ticket in a Zendesk view:
 
 ```bash
 triage-cli watch --view 12345
 ```
 
-This will:
-- Poll the view every 5 minutes (`--interval 300`).
-- On first run, triage every ticket whose `updated_at` is within the last 24
-  hours (`--backfill 24h`) and silently mark older tickets as "seen".
-- Save each note to `./triage-notes/<ticket-id>-<timestamp>.md`.
-- Emit one structured status line per ticket to stderr.
-- Persist state to `data/watcher-state-<view-id>.json` so restarts pick up
-  where they left off.
+Polls every 5 minutes (`--interval 300`). On first run, triages every ticket
+whose `updated_at` is within the last 24 hours (`--backfill 24h`) and
+silently marks older tickets as "seen". Emits one structured status line
+per ticket to stderr. State persists across restarts at
+`data/watcher-state-<view-id>.json`.
 
 Common flags:
-- `--backfill 0` — watermark mode; only future updates trigger notes.
+
+- `--backfill 0` — watermark mode; only future updates trigger triage.
 - `--backfill inf` — triage every ticket in the view on first run.
-- `--print-notes` — also stream the full markdown to stdout.
-- `--no-logs` — skip Datadog (ticket-content-only triage).
+- `--print-notes` — also stream the produced `FORK_PACKET.md` content to
+  stdout per ticket.
+- `--no-logs` — skip Datadog.
 
 See `docs/runbooks/06-watching-a-view.md` for a full operator runbook.
 
-## One-Shot Output Format
+## Inbox TUI
 
-The one-shot `triage` note is plain markdown with four fixed sections, in this order:
-
-```markdown
-## Summary
-Two sentences describing what the ticket reports. No speculation.
-
-## Log signals
-What the logs in the window show — error counts, recurring messages, timing
-relative to the anchor. If logs are empty or routine, says so plainly.
-
-## Likely cause (inference)
-Best guess at cause, marked as inference. If the logs do not support a cause,
-says "Insufficient log evidence to infer cause" rather than guessing.
-
-## Suggested first action
-One concrete next step ("check X" / "verify Y") for the engineer.
+```bash
+triage-cli inbox                       # your assigned tickets
+triage-cli inbox --view 12345 --poll 60
 ```
 
-The exact wording of the system prompt that produces this lives in `triage_cli/llm.py` (`TRIAGE_SYSTEM_PROMPT`).
+A ratatui app over the produced ticket-folder corpus. Scans
+`${TRIAGE_TICKETS_ROOT:-./Tickets}/` for subdirectories containing a
+`STATE.md`. Each row is one ticket; the right pane defaults to a synth
+single-line summary (fork letter, confidence, rubric row, status, owner,
+related). `Tab` cycles into a tabbed view across `INTAKE.md`,
+`EVIDENCE_PREFLIGHT.md`, `FORK_PACKET.md`, `DRAFTS.md`, `STATE.md`. A
+non-blocking yellow banner appears when the selected ticket's
+`rubric_version` does not match the shipped rubric.
 
-## Known limitations
-
-These are the v1 boundary; do not assume any of them have been addressed:
-
-- Site map is manually curated; refreshing the underlying Confluence inventory is an out-of-band step.
-- No station-level log filtering. Only call-center level via `@log.machineData.callCenterName`. The `DD_STATION_TAG` env var is reserved for v2.
-- Internal Zendesk comments are sent to Claude. Output is terminal-only for v1, but be aware before adding any "post back to Zendesk" feature — internal comments would leak into anything posted publicly.
-- No retries on transient API failures; if Datadog or Zendesk hiccups, re-run the command.
-- Single-user, local execution. No scheduling, no shared state. (`watch` mode provides local single-user polling without external scheduling.)
+**Keybindings**: `↑/k`, `↓/j` navigate · `Enter` triage a queued ticket /
+focus the detail pane · `Tab` / `Shift+Tab` cycle file tabs · `Esc` return
+to synth view (then to the list) · `r` refresh · `y` copy the synth summary
+to clipboard · `o` open the ticket in Zendesk in the browser · `q` /
+`Ctrl-C` quit.
 
 ## Project layout
 
 ```
 triage-cli/
-├── pyproject.toml
-├── README.md
-├── HANDOFF.md                  # operative spec
-├── CONVERSATION.md             # planning transcript
-├── apex-cnc-inventory.md       # source of truth for the CNC map
-├── .env.example
-├── triage_cli/
-│   ├── cli.py                  # typer app: investigate, triage, watch, and build-map subcommands
-│   ├── zendesk.py              # ticket + comment fetch (httpx)
-│   ├── datadog.py              # log query (datadog-api-client)
-│   ├── extract.py              # ticket ID parsing, site lookup, window/anchor
-│   ├── investigation.py        # guided investigation session/evidence/report bridge
-│   ├── llm.py                  # Claude Agent SDK calls + system prompts
-│   ├── models.py               # pydantic models
-│   ├── pipeline.py             # triage_one single-ticket orchestration
-│   ├── render.py               # markdown print + --save handling
-│   └── watcher.py              # watch command: poll loop, state, backfill
+├── README.md                       # this file
+├── CLAUDE.md / AGENTS.md           # agent-facing repo guidance (kept in sync)
+├── .env / .env.example
+├── apex-cnc-inventory.md           # source of truth for the CNC map
+├── MEMORY.md                       # investigation memory (editable)
+├── Tickets/                        # ticket folders (configurable via TRIAGE_TICKETS_ROOT)
+│   └── <id>/
+│       ├── INTAKE.md
+│       ├── EVIDENCE_PREFLIGHT.md
+│       ├── FORK_PACKET.md
+│       ├── DRAFTS.md
+│       ├── STATE.md
+│       └── .debug/                 # raw LLM responses stashed after retry failure
+├── triage-notes/                   # scratch dir used by interactive workspace + doctor
 ├── data/
-│   ├── cnc-map.json            # generated; do not hand-edit
-│   └── cnc-map-gaps.md         # generated; rows without CNC/site_name
-├── scripts/
-│   └── build_cnc_map.py        # parses apex-cnc-inventory.md
-└── tests/
-    ├── fixtures/
-    └── test_extract.py
+│   ├── cnc-map.json                # generated by `triage-cli build-map`
+│   ├── cnc-map-gaps.md             # generated; rows skipped during conversion
+│   ├── memory.db                   # SQLite FTS5 index over MEMORY.md (schema v2)
+│   └── watcher-state-<view>.json   # per-view watch/inbox state
+├── docs/
+│   ├── spec/v1-reframe.md          # the v1 contract; authoritative
+│   ├── adr/                        # architecture decisions
+│   ├── runbooks/                   # operator runbooks
+│   └── CHEATSHEET.md
+├── archive/                        # frozen pre-port Python source
+└── triage-cli-rs/                  # Rust crate
+    ├── Cargo.toml
+    ├── REGRESSIONS.md
+    ├── playbook/
+    │   └── fork-rubric.md          # embedded at build time via include_str!
+    └── src/
+        ├── main.rs                 # entry point
+        ├── cli.rs                  # clap subcommands
+        ├── pipeline.rs             # investigate_one_structured
+        ├── ticket_folder.rs        # five-markdown writer + soft-lock
+        ├── playbook.rs             # Rubric loader (embedded + env override)
+        ├── zendesk.rs              # Zendesk HTTP client
+        ├── datadog.rs              # Datadog Logs v2 HTTP client
+        ├── llm.rs                  # provider dispatch + structured output + retry
+        ├── providers/              # unleash, openai, claude, codex
+        ├── tui/                    # inbox ratatui app
+        ├── models.rs               # serde data models
+        ├── memory.rs               # MEMORY.md + FTS5 (schema v2)
+        ├── watcher.rs              # poll loop + state
+        ├── interactive.rs          # prompts, attachments, drop-and-wait
+        ├── investigation.rs        # session builder
+        ├── extract.rs              # ticket ID parse + site lookup + anchor
+        ├── build_map.rs            # cnc-map.json generation
+        ├── setup.rs                # `triage-cli setup` + `doctor`
+        └── redact.rs               # PII scrub at LLM boundary
 ```
 
-## Where to find things
+## Common dev commands
 
-| What | Where |
-| --- | --- |
-| Triage system prompt | `triage_cli/llm.py` (`TRIAGE_SYSTEM_PROMPT`) |
-| Anchor extraction prompt | `triage_cli/llm.py` (`ANCHOR_EXTRACTION_PROMPT`) |
-| Pipeline flow (numbered steps) | `triage_cli/cli.py` `triage()` |
-| Site lookup logic | `triage_cli/extract.py` (`lookup_site`, `load_site_map`) |
-| Anchor resolution priority | `triage_cli/extract.py` (`resolve_anchor`) |
-| Site map source | `apex-cnc-inventory.md` -> `scripts/build_cnc_map.py` -> `data/cnc-map.json` |
-| Datadog query construction | `triage_cli/datadog.py` |
-| Zendesk client | `triage_cli/zendesk.py` |
+```bash
+cd triage-cli-rs
+cargo build --release           # ~7 MB binary at target/release/triage-cli
+cargo test --lib                # unit tests (mocked clients; no network)
+cargo clippy --all-targets -- -D warnings
+cargo fmt --all -- --check
+```
 
 ## Troubleshooting
 
-**`ImportError: claude_agent_sdk`**
-The package was not installed (run `python -m pip install -e .` again from the repo root with your venv active), or your venv is not actually activated. The SDK is a runtime dependency declared in `pyproject.toml`.
+**`triage-cli: command not found`**
+The binary isn't on PATH. Either run it as
+`triage-cli-rs/target/release/triage-cli ...` or symlink it (see *Install*).
 
-**`Claude Agent SDK call failed` / `extracted_dt None and SDK error in --verbose`**
-The SDK could not reach Claude Code's session. Run `claude` once interactively to confirm the CLI is installed and your OAuth session is valid. The Agent SDK does not read `ANTHROPIC_API_KEY` — Claude Code's auth is the only path.
+**`✗ <provider key> not set` from `doctor`**
+The selected `LLM_PROVIDER` doesn't have its required credential. Either set
+the env var or switch to a different provider via `LLM_PROVIDER=...`.
 
-**Zendesk auth failed (401 / 403)**
-Check that `ZENDESK_API_TOKEN` is the API token (not your password) and that `ZENDESK_EMAIL` is the agent email associated with the token. The client appends `/token` to the email when forming Basic auth — do not pre-append it in `.env`. Also confirm the token has read scope on tickets.
+**`Zendesk auth failed - check ZENDESK_EMAIL and ZENDESK_API_TOKEN`**
+The Zendesk client appends `/token` to the email when forming basic auth —
+do not pre-append it. Also confirm the token has read scope on tickets.
 
 **`site_name '<X>' contains characters that are unsafe`**
-The Datadog client validates `site_name` before injecting it into the query string. Either fix the offending entry in `apex-cnc-inventory.md` and re-run `build-map`, or pass a clean value via `--site`. Site names should match the lowercase-with-hyphens convention (e.g. `us-nv-nvdps-apex`).
+The Datadog client validates `site_name` before injecting it into the query
+string. Either fix the offending entry in `apex-cnc-inventory.md` and re-run
+`build-map`, or pass a clean value via `--site`. Site names should match the
+lowercase-with-hyphens convention (e.g. `us-nv-nvdps-apex`).
 
-**Site cannot be resolved and you don't want the prompt**
-Pass `--site <site_name>` (or `--cnc <uuid>`) to bypass lookup, or `--no-interactive` to abort instead of prompting.
+**`STATE.md soft-lock conflict: owned by <other-analyst>` (exit code 2)**
+Another analyst already wrote a ticket folder for this ticket. The CLI
+preserves their work and refuses to overwrite without an explicit
+acknowledgement. Options:
+
+- Talk to the other analyst — they may be mid-investigation.
+- Re-run with `--diff` to see the full STATE.md diff (in `$DIFF_VIEWER` if
+  set; otherwise `diff -u` printed to stderr).
+- Re-run with `--force` to overwrite. This is intentional — the soft-lock is
+  a warning, not enforcement.
+
+`TRIAGE_OWNER` sets the owner identifier recorded in `STATE.md`; the default
+is `$USER`.
+
+**Validator soft-warnings printed after a successful run**
+The rubric-row validator is soft-warn (spec § 10, decision 1). If the LLM's
+`quoted_rubric_row` is not a verbatim substring of the shipped rubric, the
+warning is printed to stderr and stashed in `STATE.md`'s
+`validator_warnings: [...]` field. The investigation still completes — the
+warning surfaces drift rather than blocking it.
+
+**`validation failed; raw response stashed at <path>`**
+Two consecutive parse / shape-validation failures. The raw LLM response is
+saved at `${TRIAGE_TICKETS_ROOT}/<id>/.debug/llm-response-<timestamp>.json`
+for inspection. No ticket folder is written on this failure path; re-run
+the command after fixing the underlying provider issue.
+
+**Inbox shows a yellow `rubric_version` banner**
+The selected ticket's `STATE.md` was written under a different rubric
+version than the one shipped with your current binary. The on-disk artifact
+is honored as-is; the banner just calls attention to the drift.
+
+**Site cannot be resolved**
+Pass `--site <site_name>` or `--cnc <uuid>` to bypass lookup, or fix the
+mapping in `apex-cnc-inventory.md` and re-run `build-map`.

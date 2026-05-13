@@ -1,0 +1,61 @@
+[package]
+name = "triage-cli"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+description = "Triage Zendesk tickets for the Carbyne APEX NG911/E911 platform. Rust port."
+license = "Apache-2.0"
+
+[[bin]]
+name = "triage-cli"
+path = "src/main.rs"
+
+[dependencies]
+# CLI + config
+clap = { version = "4.5", features = ["derive", "env"] }
+dotenvy = "0.15"
+
+# Async runtime + HTTP
+tokio = { version = "1.43", features = ["macros", "rt-multi-thread", "fs", "io-util", "process", "signal", "time", "sync"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "gzip"] }
+futures-util = "0.3"
+
+# Serialization + data
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde", "clock"] }
+regex = "1"
+once_cell = "1"
+indexmap = "2"
+
+# Errors
+anyhow = "1"
+thiserror = "1"
+
+# Storage
+rusqlite = { version = "0.31", features = ["bundled"] }
+sha2 = "0.10"
+tempfile = "3"
+
+# Terminal UX
+indicatif = "0.17"
+dialoguer = "0.11"
+console = "0.15"
+owo-colors = "4"
+
+# TUI
+ratatui = { version = "0.28", features = ["crossterm"] }
+crossterm = "0.28"
+
+# Filesystem + utilities
+which = "6"
+dirs = "5"
+
+[features]
+default = []
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

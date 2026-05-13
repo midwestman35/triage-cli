@@ -12,4 +12,7 @@ build/
 .DS_Store
 data/watcher-state-*.json
 data/memory.db
+data/*.log
+Tickets/
+target/
 .superpowers/
