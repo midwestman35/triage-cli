@@ -220,7 +220,7 @@ fn to_log_line(item: &Value) -> LogLine {
             .unwrap_or_else(|_| Utc::now()),
         Value::Number(n) => n
             .as_i64()
-            .and_then(|ms| DateTime::<Utc>::from_timestamp_millis(ms))
+            .and_then(DateTime::<Utc>::from_timestamp_millis)
             .unwrap_or_else(Utc::now),
         _ => Utc::now(),
     };

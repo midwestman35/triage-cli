@@ -226,9 +226,8 @@ struct InboxApp {
 
 /// Public entry point.
 pub async fn run_inbox(opts: WatcherOptions) -> io::Result<()> {
-    let rubric = Rubric::load().map_err(|e| {
-        io::Error::other(format!("could not load fork rubric: {e}"))
-    })?;
+    let rubric =
+        Rubric::load().map_err(|e| io::Error::other(format!("could not load fork rubric: {e}")))?;
     let tickets_root = tickets_root();
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
 
@@ -411,7 +410,10 @@ impl InboxApp {
         let handle = tokio::spawn(async move {
             match poll_iteration(state_snapshot, opts, backfill_cutoff, tx.clone()).await {
                 Ok((new_state, view_ids)) => {
-                    let _ = tx.send(InboxEvent::PollFinished { new_state, view_ids });
+                    let _ = tx.send(InboxEvent::PollFinished {
+                        new_state,
+                        view_ids,
+                    });
                 }
                 Err(msg) => {
                     let _ = tx.send(InboxEvent::PollFailed { msg });
@@ -444,7 +446,10 @@ impl InboxApp {
             InboxEvent::PollStarted => {
                 self.polling = true;
             }
-            InboxEvent::PollFinished { new_state, view_ids } => {
+            InboxEvent::PollFinished {
+                new_state,
+                view_ids,
+            } => {
                 self.polling = false;
                 self.state = new_state;
                 let _ = watcher::save_state(
@@ -637,7 +642,10 @@ impl InboxApp {
             return;
         };
         let Some(state) = row.state.as_ref() else {
-            self.notify("No STATE.md available for selected ticket", NotifyKind::Warning);
+            self.notify(
+                "No STATE.md available for selected ticket",
+                NotifyKind::Warning,
+            );
             return;
         };
         let text = render_synth_summary(row.ticket_id, state, self.rubric.version()).join("\n");
@@ -725,12 +733,16 @@ impl InboxApp {
         let plural = if count == 1 { "ticket" } else { "tickets" };
         let polling_marker = if self.polling { " · polling…" } else { "" };
         let title = Line::from(vec![
-            Span::styled("triage-cli inbox", Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "triage-cli inbox",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
             Span::raw("  ·  "),
-            Span::raw(format!("{view_label} · {count} {plural} · last poll: {last}{polling_marker}")),
+            Span::raw(format!(
+                "{view_label} · {count} {plural} · last poll: {last}{polling_marker}"
+            )),
         ]);
-        let para = Paragraph::new(title)
-            .block(Block::default().borders(Borders::BOTTOM));
+        let para = Paragraph::new(title).block(Block::default().borders(Borders::BOTTOM));
         frame.render_widget(para, area);
     }
 
@@ -782,10 +794,7 @@ impl InboxApp {
                 let summary = match row.state.as_ref() {
                     Some(s) => {
                         let status = s.status.clone().unwrap_or_else(|| "open".into());
-                        let owner = s
-                            .owner
-                            .clone()
-                            .unwrap_or_else(|| "(unowned)".into());
+                        let owner = s.owner.clone().unwrap_or_else(|| "(unowned)".into());
                         truncate(&format!("{owner} · {status}"), 60)
                     }
                     None => row
@@ -855,18 +864,19 @@ impl InboxApp {
 
         match row.status {
             Status::Queued => {
-                let para = Paragraph::new(
-                    "○ In queue — press Enter to triage now."
-                        .dim()
-                        .to_string(),
-                )
-                .wrap(Wrap { trim: false });
+                let para =
+                    Paragraph::new("○ In queue — press Enter to triage now.".dim().to_string())
+                        .wrap(Wrap { trim: false });
                 frame.render_widget(para, inner);
             }
             Status::Triaging => {
                 let split = Layout::default()
                     .direction(Direction::Vertical)
-                    .constraints([Constraint::Length(2), Constraint::Length(2), Constraint::Min(0)])
+                    .constraints([
+                        Constraint::Length(2),
+                        Constraint::Length(2),
+                        Constraint::Min(0),
+                    ])
                     .split(inner);
                 let label = row
                     .phase_label
@@ -1024,9 +1034,7 @@ impl InboxApp {
         ]));
         lines.push(Line::from(""));
         lines.push(Line::from(
-            "Enter to submit · Esc to cancel"
-                .dim()
-                .to_string(),
+            "Enter to submit · Esc to cancel".dim().to_string(),
         ));
         let para = Paragraph::new(lines).wrap(Wrap { trim: false });
         frame.render_widget(para, inner);
@@ -1081,7 +1089,10 @@ async fn poll_iteration(
 ) -> Result<(State, HashSet<u64>), String> {
     let zd = ZendeskClient::from_env().map_err(|e| e.to_string())?;
     let view_ids: Vec<u64> = match opts.view_id {
-        Some(id) => zd.list_view_ticket_ids(id).await.map_err(|e| e.to_string())?,
+        Some(id) => zd
+            .list_view_ticket_ids(id)
+            .await
+            .map_err(|e| e.to_string())?,
         None => zd.list_my_ticket_ids().await.map_err(|e| e.to_string())?,
     };
     let view_set: HashSet<u64> = view_ids.iter().copied().collect();
@@ -1152,7 +1163,8 @@ async fn poll_iteration(
         new_state.triaged.insert(key, updated.to_rfc3339());
     }
     let live_set: HashSet<String> = view_set.iter().map(|id| id.to_string()).collect();
-    new_state = watcher::prune_by_membership(new_state, &live_set, watcher::DEFAULT_MEMBERSHIP_GRACE_DAYS);
+    new_state =
+        watcher::prune_by_membership(new_state, &live_set, watcher::DEFAULT_MEMBERSHIP_GRACE_DAYS);
     Ok((new_state, view_set))
 }
 
@@ -1175,8 +1187,8 @@ async fn triage_one_ticket(
     let effective_override = if let Some(s) = site_override.clone() {
         Some(s)
     } else {
-        let (entry, _) = extract::lookup_site(&ticket, &sites, None, None)
-            .map_err(|e| e.to_string())?;
+        let (entry, _) =
+            extract::lookup_site(&ticket, &sites, None, None).map_err(|e| e.to_string())?;
         if entry.is_none() && !sites.is_empty() {
             let (responder_tx, responder_rx) = oneshot::channel();
             let _ = tx.send(InboxEvent::SiteInputNeeded {
@@ -1227,15 +1239,26 @@ async fn run_pipeline(
     tx: mpsc::UnboundedSender<InboxEvent>,
 ) -> Result<StructuredInvestigation, String> {
     let mut session = investigation::create_session(ticket.clone());
-    let dd = if no_logs { None } else { DatadogClient::from_env().ok() };
+    let dd = if no_logs {
+        None
+    } else {
+        DatadogClient::from_env().ok()
+    };
     let rubric = Rubric::load().map_err(|e| e.to_string())?;
     let reporter = PhaseReporter {
         ticket_id: ticket.id,
         tx,
     };
-    pipeline::investigate_one_structured(ticket, &mut session, dd.as_ref(), &rubric, &reporter, &opts)
-        .await
-        .map_err(|e| e.to_string())
+    pipeline::investigate_one_structured(
+        ticket,
+        &mut session,
+        dd.as_ref(),
+        &rubric,
+        &reporter,
+        &opts,
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
 
 struct PhaseReporter {
@@ -1282,7 +1305,12 @@ fn pretty_phase_label(phase: &str) -> &'static str {
 fn confidence_cell(c: &str) -> Cell<'static> {
     let normalized = c.to_ascii_lowercase();
     let (text, style) = match normalized.as_str() {
-        "high" => ("high", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+        "high" => (
+            "high",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
         "medium" => ("med", Style::default().fg(Color::Yellow)),
         "low" => ("low", Style::default().fg(Color::Red)),
         _ => (normalized.as_str(), Style::default()),
@@ -1312,7 +1340,11 @@ fn relative_time(dt: DateTime<Utc>, now: DateTime<Utc>) -> String {
 }
 
 fn copy_to_clipboard(text: &str) -> bool {
-    let candidates: &[&[&str]] = &[&["pbcopy"], &["wl-copy"], &["xclip", "-selection", "clipboard"]];
+    let candidates: &[&[&str]] = &[
+        &["pbcopy"],
+        &["wl-copy"],
+        &["xclip", "-selection", "clipboard"],
+    ];
     for cmd in candidates {
         let Some((bin, args)) = cmd.split_first() else {
             continue;
@@ -1573,9 +1605,14 @@ pub fn render_synth_summary(
     lines.push(format!("  \"{}\"", row));
     lines.push(format!(
         "  rubric_version on STATE.md: {}",
-        state.rubric_version.clone().unwrap_or_else(|| "(unset)".into())
+        state
+            .rubric_version
+            .clone()
+            .unwrap_or_else(|| "(unset)".into())
     ));
-    lines.push(format!("  shipped rubric_version:    {shipped_rubric_version}"));
+    lines.push(format!(
+        "  shipped rubric_version:    {shipped_rubric_version}"
+    ));
     lines.push(String::new());
 
     lines.push("Related:".to_string());
@@ -1598,7 +1635,10 @@ pub fn render_synth_summary(
     lines.push(format!("  Jira:    {jira}"));
     lines.push(format!(
         "  Master:  {}",
-        state.master.map(|i| format!("#{i}")).unwrap_or_else(|| "(none)".into()),
+        state
+            .master
+            .map(|i| format!("#{i}"))
+            .unwrap_or_else(|| "(none)".into()),
     ));
     if let Some(c) = &state.cluster {
         lines.push(format!("  Cluster: {c}"));
@@ -1616,9 +1656,7 @@ pub fn render_synth_summary(
 
 /// Render the rubric-version mismatch banner line.
 pub fn rubric_mismatch_banner(state_version: &str, shipped_version: &str) -> String {
-    format!(
-        "⚠ Rubric version mismatch: state={state_version}, shipped={shipped_version}"
-    )
+    format!("⚠ Rubric version mismatch: state={state_version}, shipped={shipped_version}")
 }
 
 /// Returns true when the on-disk `STATE.md` `rubric_version` does not match
@@ -1638,9 +1676,7 @@ fn read_file_for_display(path: &Path) -> String {
         Ok(s) => s,
         Err(e) => format!(
             "(could not read {}: {e})",
-            path.file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("file"),
+            path.file_name().and_then(|s| s.to_str()).unwrap_or("file"),
         ),
     }
 }

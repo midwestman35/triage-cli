@@ -58,7 +58,7 @@ fn unleash_headers() -> Result<Vec<(String, String)>, ProviderError> {
     let authorization = if lowered.starts_with("bearer ") {
         api_key.clone()
     } else if lowered.starts_with("bearer:") {
-        let after = api_key.splitn(2, ':').nth(1).unwrap_or("").trim();
+        let after = api_key.split_once(':').map(|x| x.1).unwrap_or("").trim();
         format!("Bearer {after}")
     } else {
         format!("Bearer {api_key}")

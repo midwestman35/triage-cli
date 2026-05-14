@@ -14,7 +14,7 @@ use crate::models::{
 
 /// Create a guided investigation session from a fetched Zendesk ticket.
 pub fn create_session(ticket: Ticket) -> InvestigationSession {
-    let comments: Vec<Comment> = ticket.comments.iter().cloned().collect();
+    let comments: Vec<Comment> = ticket.comments.to_vec();
     let evidence = InvestigationEvidence {
         ticket_id: ticket.id,
         comments: comments.clone(),
@@ -180,8 +180,8 @@ fn first_line(text: &str) -> String {
     line.chars().take(160).collect()
 }
 
-fn sort_timeline(events: &mut Vec<TimelineEvent>) {
-    events.sort_by_key(|e| e.timestamp.unwrap_or_else(|| DateTime::<Utc>::MAX_UTC));
+fn sort_timeline(events: &mut [TimelineEvent]) {
+    events.sort_by_key(|e| e.timestamp.unwrap_or(DateTime::<Utc>::MAX_UTC));
 }
 
 #[allow(dead_code)]

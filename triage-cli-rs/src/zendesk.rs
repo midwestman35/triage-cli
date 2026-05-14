@@ -403,7 +403,7 @@ impl ZendeskClient {
         if !status.is_success() {
             return Err(ZendeskError::HttpStatus(
                 status.as_u16(),
-                format!("downloading attachment"),
+                "downloading attachment".to_string(),
             ));
         }
 

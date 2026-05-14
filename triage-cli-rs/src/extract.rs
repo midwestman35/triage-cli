@@ -191,7 +191,7 @@ pub fn lookup_site(
         let sn = entry.site_name.to_ascii_lowercase();
         if !sn.is_empty()
             && haystack.contains(&sn)
-            && best_site.map_or(true, |b| entry.site_name.len() > b.site_name.len())
+            && best_site.is_none_or(|b| entry.site_name.len() > b.site_name.len())
         {
             best_site = Some(entry);
         }
@@ -205,7 +205,7 @@ pub fn lookup_site(
         let fn_lc = entry.friendly_name.to_ascii_lowercase();
         if !fn_lc.is_empty()
             && haystack.contains(&fn_lc)
-            && best_friendly.map_or(true, |b| entry.friendly_name.len() > b.friendly_name.len())
+            && best_friendly.is_none_or(|b| entry.friendly_name.len() > b.friendly_name.len())
         {
             best_friendly = Some(entry);
         }
