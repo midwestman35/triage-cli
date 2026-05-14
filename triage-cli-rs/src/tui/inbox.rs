@@ -310,13 +310,11 @@ pub async fn run_inbox(opts: WatcherOptions) -> io::Result<()> {
         }
     }
 
-    // Persist state before tearing down.
-    let pruned = watcher::prune_state(
-        std::mem::take(&mut app.state),
-        watcher::DEFAULT_PRUNE_CAP,
-        watcher::DEFAULT_TTL_DAYS,
-    );
-    let _ = watcher::save_state(&opts.state_file, &pruned);
+    // Persist state before tearing down. `poll_iteration` already pruned
+    // the state with the live_set in scope, so no re-prune is needed here;
+    // re-pruning without a live_set would risk evicting in-view tickets
+    // dormant past the TTL and re-triage them on next poll.
+    let _ = watcher::save_state(&opts.state_file, &app.state);
     for handle in app.pending_triages.drain(..) {
         handle.abort();
     }
@@ -452,17 +450,8 @@ impl InboxApp {
             } => {
                 self.polling = false;
                 self.state = new_state;
-                let _ = watcher::save_state(
-                    &self.opts.state_file,
-                    &watcher::prune_state(
-                        State {
-                            version: self.state.version,
-                            triaged: self.state.triaged.clone(),
-                        },
-                        watcher::DEFAULT_PRUNE_CAP,
-                        watcher::DEFAULT_TTL_DAYS,
-                    ),
-                );
+                // `poll_iteration` already pruned with the live_set; just save.
+                let _ = watcher::save_state(&self.opts.state_file, &self.state);
                 self.view_ids = view_ids;
                 // Insert queued placeholders for any view tickets we haven't
                 // already seen as a triaged ticket folder.
@@ -1165,6 +1154,12 @@ async fn poll_iteration(
     let live_set: HashSet<String> = view_set.iter().map(|id| id.to_string()).collect();
     new_state =
         watcher::prune_by_membership(new_state, &live_set, watcher::DEFAULT_MEMBERSHIP_GRACE_DAYS);
+    new_state = watcher::prune_state(
+        new_state,
+        watcher::DEFAULT_PRUNE_CAP,
+        watcher::DEFAULT_TTL_DAYS,
+        &live_set,
+    );
     Ok((new_state, view_set))
 }
 

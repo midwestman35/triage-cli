@@ -141,15 +141,35 @@ pub fn should_triage(ticket: &Ticket, state: &State, backfill_cutoff: DateTime<U
     }
 }
 
-pub fn prune_state(state: State, max_entries: usize, ttl_days: i64) -> State {
+/// Applies the count cap and TTL filter. Entries whose ticket id is in
+/// `live_ids` are exempt from the TTL filter — a ticket currently in the
+/// view is always kept regardless of how old its `updated_at` is, since
+/// dropping it would cause the next iteration to re-triage it and write a
+/// duplicate ticket folder. Unparseable timestamps are dropped with a
+/// warning to stderr so the operator can repair the state file.
+pub fn prune_state(
+    state: State,
+    max_entries: usize,
+    ttl_days: i64,
+    live_ids: &HashSet<String>,
+) -> State {
     let cutoff = Utc::now() - chrono::Duration::days(ttl_days);
     let mut items: Vec<(String, String)> = state
         .triaged
         .into_iter()
-        .filter(|(_, ts)| {
-            DateTime::parse_from_rfc3339(ts)
-                .map(|d| d.with_timezone(&Utc) >= cutoff)
-                .unwrap_or(false)
+        .filter(|(id, ts)| {
+            if live_ids.contains(id) {
+                return true;
+            }
+            match DateTime::parse_from_rfc3339(ts) {
+                Ok(d) => d.with_timezone(&Utc) >= cutoff,
+                Err(_) => {
+                    eprintln!(
+                        "watcher: dropping state entry {id:?} with unparseable timestamp {ts:?}"
+                    );
+                    false
+                }
+            }
         })
         .collect();
     items.sort_by(|a, b| b.1.cmp(&a.1));
@@ -160,9 +180,19 @@ pub fn prune_state(state: State, max_entries: usize, ttl_days: i64) -> State {
     }
 }
 
-/// Drops state entries for tickets that are no longer in the view AND are
-/// older than `grace_days`. Entries within the grace window are kept so a
-/// ticket that briefly leaves and re-enters the view isn't re-triaged.
+/// Drops state entries for tickets that are no longer in the view AND whose
+/// stored `updated_at` is older than `grace_days`. Entries within the grace
+/// window are kept so a ticket that briefly leaves and re-enters the view
+/// isn't re-triaged.
+///
+/// **Caveat (v1 state schema):** the grace window is measured against
+/// `ticket.updated_at` (when Zendesk last changed the ticket), *not* the
+/// time since the ticket left the view. A ticket that drops out of the view
+/// today but was last updated 8 days ago will be evicted on the next call,
+/// because the v1 state schema has no "left view at" field to anchor the
+/// window on. Making the grace truly departure-relative is a v2 schema
+/// change.
+///
 /// Unparseable timestamps are treated as expired and dropped.
 pub fn prune_by_membership(mut state: State, live_ids: &HashSet<String>, grace_days: i64) -> State {
     let cutoff = Utc::now() - chrono::Duration::days(grace_days);
@@ -303,6 +333,7 @@ pub async fn run_iteration(
         }
     }
     state = prune_by_membership(state, &live_set, DEFAULT_MEMBERSHIP_GRACE_DAYS);
+    state = prune_state(state, DEFAULT_PRUNE_CAP, DEFAULT_TTL_DAYS, &live_set);
     Ok(state)
 }
 
@@ -345,13 +376,9 @@ pub async fn run_watch(opts: WatcherOptions) -> Result<(), WatcherError> {
                 }
             }
         }
-        let pruned = prune_state(
-            std::mem::replace(&mut state, State::empty()),
-            DEFAULT_PRUNE_CAP,
-            DEFAULT_TTL_DAYS,
-        );
-        save_state(&opts.state_file, &pruned)?;
-        state = pruned;
+        // `run_iteration` already pruned the returned state (membership +
+        // TTL with the live_set in scope). Just persist it.
+        save_state(&opts.state_file, &state)?;
         emit(&format!(
             "[{}] iteration {iteration} done; sleeping {}s",
             now_local_hms(),
@@ -361,8 +388,7 @@ pub async fn run_watch(opts: WatcherOptions) -> Result<(), WatcherError> {
             _ = tokio::time::sleep(interval) => {}
             _ = &mut token => {
                 emit(&format!("[{}] watcher stopped (Ctrl-C)", now_local_hms()));
-                let pruned = prune_state(state, DEFAULT_PRUNE_CAP, DEFAULT_TTL_DAYS);
-                save_state(&opts.state_file, &pruned)?;
+                save_state(&opts.state_file, &state)?;
                 return Ok(());
             }
         }
@@ -388,10 +414,14 @@ mod tests {
         }
     }
 
+    fn live(ids: &[&str]) -> HashSet<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
     #[test]
     fn prune_drops_entries_older_than_ttl() {
         let state = make_state(&[("1", 10), ("2", 31), ("3", 5)]);
-        let pruned = prune_state(state, 1000, 30);
+        let pruned = prune_state(state, 1000, 30, &live(&[]));
         assert!(
             pruned.triaged.contains_key("1"),
             "10-day-old entry should be kept"
@@ -410,7 +440,7 @@ mod tests {
     fn prune_count_cap_applied_after_ttl() {
         // 3 fresh entries, cap of 2 — oldest fresh entry should be evicted
         let state = make_state(&[("old-fresh", 20), ("newer", 5), ("newest", 1)]);
-        let pruned = prune_state(state, 2, 30);
+        let pruned = prune_state(state, 2, 30, &live(&[]));
         assert_eq!(pruned.triaged.len(), 2);
         assert!(
             !pruned.triaged.contains_key("old-fresh"),
@@ -427,19 +457,44 @@ mod tests {
         state
             .triaged
             .insert("good".to_string(), Utc::now().to_rfc3339());
-        let pruned = prune_state(state, 1000, 30);
+        let pruned = prune_state(state, 1000, 30, &live(&[]));
         assert!(!pruned.triaged.contains_key("bad"));
         assert!(pruned.triaged.contains_key("good"));
     }
 
     #[test]
     fn prune_empty_state_is_a_noop() {
-        let pruned = prune_state(State::empty(), 1000, 30);
+        let pruned = prune_state(State::empty(), 1000, 30, &live(&[]));
         assert!(pruned.triaged.is_empty());
     }
 
-    fn live(ids: &[&str]) -> HashSet<String> {
-        ids.iter().map(|s| s.to_string()).collect()
+    #[test]
+    fn prune_keeps_live_entries_past_ttl() {
+        // Regression for the bug where in-view tickets dormant for >30 days
+        // were being evicted from state and then re-triaged on the next
+        // poll, producing duplicate ticket folders.
+        let state = make_state(&[("live-stale", 60), ("dead-stale", 60)]);
+        let pruned = prune_state(state, 1000, 30, &live(&["live-stale"]));
+        assert!(
+            pruned.triaged.contains_key("live-stale"),
+            "in-view ticket must be kept regardless of age"
+        );
+        assert!(
+            !pruned.triaged.contains_key("dead-stale"),
+            "out-of-view ticket past TTL must still be dropped"
+        );
+    }
+
+    #[test]
+    fn prune_keeps_live_unparseable_entry() {
+        // Unparseable timestamp would normally evict, but if the ticket is
+        // currently in-view we keep it to avoid the re-triage duplicate.
+        let mut state = State::empty();
+        state
+            .triaged
+            .insert("live-bad".to_string(), "not-a-date".to_string());
+        let pruned = prune_state(state, 1000, 30, &live(&["live-bad"]));
+        assert!(pruned.triaged.contains_key("live-bad"));
     }
 
     #[test]
