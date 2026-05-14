@@ -64,8 +64,12 @@ pub fn doctor() -> ExitCode {
         }
     }
 
-    let dd_ok = env::var("DD_API_KEY").map(|v| !v.is_empty()).unwrap_or(false)
-        && env::var("DD_APP_KEY").map(|v| !v.is_empty()).unwrap_or(false);
+    let dd_ok = env::var("DD_API_KEY")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
+        && env::var("DD_APP_KEY")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false);
     if dd_ok {
         eprintln!(
             "  {} Datadog configured (DD_API_KEY, DD_APP_KEY)",
@@ -107,10 +111,7 @@ fn probe_writable(dir: &Path) -> std::io::Result<()> {
 
 /// Interactive first-run setup. Idempotent: existing values become defaults.
 pub fn setup() -> ExitCode {
-    eprintln!(
-        "{} triage-cli setup",
-        "→".cyan()
-    );
+    eprintln!("{} triage-cli setup", "→".cyan());
     eprintln!(
         "Will prompt for credentials and write them to {}.",
         ENV_PATH
@@ -151,7 +152,10 @@ pub fn setup() -> ExitCode {
         next.push(("UNLEASH_ASSISTANT_ID".into(), aid));
     }
 
-    let dd_key = prompt_text_optional("DD_API_KEY (optional, blank to skip)", existing.get("DD_API_KEY"));
+    let dd_key = prompt_text_optional(
+        "DD_API_KEY (optional, blank to skip)",
+        existing.get("DD_API_KEY"),
+    );
     let dd_app = prompt_text_optional("DD_APP_KEY (optional)", existing.get("DD_APP_KEY"));
     if !dd_key.is_empty() {
         next.push(("DD_API_KEY".into(), dd_key));
@@ -164,20 +168,13 @@ pub fn setup() -> ExitCode {
         eprintln!("{} could not write {ENV_PATH}: {e}", "✗".red());
         return ExitCode::FAILURE;
     }
-    eprintln!(
-        "{} wrote {} ({} keys)",
-        "✓".green(),
-        ENV_PATH,
-        next.len()
-    );
+    eprintln!("{} wrote {} ({} keys)", "✓".green(), ENV_PATH, next.len());
     eprintln!("Run `triage-cli doctor` next to verify.");
     ExitCode::SUCCESS
 }
 
 fn prompt_text(label: &str, default: Option<&String>) -> String {
-    let prompt = Input::<String>::new()
-        .with_prompt(label)
-        .allow_empty(false);
+    let prompt = Input::<String>::new().with_prompt(label).allow_empty(false);
     let prompt = if let Some(d) = default.cloned() {
         prompt.default(d)
     } else {
@@ -187,9 +184,7 @@ fn prompt_text(label: &str, default: Option<&String>) -> String {
 }
 
 fn prompt_text_optional(label: &str, default: Option<&String>) -> String {
-    let prompt = Input::<String>::new()
-        .with_prompt(label)
-        .allow_empty(true);
+    let prompt = Input::<String>::new().with_prompt(label).allow_empty(true);
     let prompt = if let Some(d) = default.cloned() {
         prompt.default(d)
     } else {
@@ -225,8 +220,7 @@ fn read_env_file(path: &Path) -> std::collections::HashMap<String, String> {
 
 fn unquote(s: &str) -> &str {
     if s.len() >= 2
-        && ((s.starts_with('"') && s.ends_with('"'))
-            || (s.starts_with('\'') && s.ends_with('\'')))
+        && ((s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')))
     {
         &s[1..s.len() - 1]
     } else {

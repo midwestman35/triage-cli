@@ -363,15 +363,13 @@ impl ZendeskClient {
         dest_path: &Path,
         max_bytes: u64,
     ) -> Result<(u64, String), ZendeskError> {
-        let partial = dest_path.with_extension(
-            format!(
-                "{}.partial",
-                dest_path
-                    .extension()
-                    .map(|e| e.to_string_lossy().into_owned())
-                    .unwrap_or_default()
-            ),
-        );
+        let partial = dest_path.with_extension(format!(
+            "{}.partial",
+            dest_path
+                .extension()
+                .map(|e| e.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        ));
 
         let response_result = self
             .auth(self.client.get(url))
@@ -474,7 +472,8 @@ impl ZendeskClient {
                 .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
                 .collect()
         });
-        self.get_json_dyn(path, converted.as_deref(), not_found).await
+        self.get_json_dyn(path, converted.as_deref(), not_found)
+            .await
     }
 
     async fn get_json_dyn(
@@ -488,9 +487,8 @@ impl ZendeskClient {
         } else {
             format!("{}{}", self.base_url, path_or_url)
         };
-        let parsed = Url::parse(&url).map_err(|_| {
-            ZendeskError::HttpStatus(0, format!("invalid URL: {url}"))
-        })?;
+        let parsed = Url::parse(&url)
+            .map_err(|_| ZendeskError::HttpStatus(0, format!("invalid URL: {url}")))?;
 
         let mut req = self.client.get(parsed);
         if let Some(ps) = params {
@@ -579,8 +577,7 @@ fn to_comment(
     raw: &Value,
     users_by_id: &std::collections::HashMap<u64, Value>,
 ) -> Result<Comment, ZendeskError> {
-    let rc: RawComment =
-        serde_json::from_value(raw.clone()).map_err(ZendeskError::NonJson)?;
+    let rc: RawComment = serde_json::from_value(raw.clone()).map_err(ZendeskError::NonJson)?;
     let body = rc.plain_body.or(rc.body).unwrap_or_default();
     let created_at = rc
         .created_at
@@ -607,12 +604,18 @@ fn attachments_from_raw(raw: &[Value]) -> Vec<AttachmentEvidence> {
         let Some(filename) = filename else {
             continue;
         };
-        let content_type = raw.get("content_type").and_then(Value::as_str).map(str::to_string);
+        let content_type = raw
+            .get("content_type")
+            .and_then(Value::as_str)
+            .map(str::to_string);
         let size = raw
             .get("size")
             .or_else(|| raw.get("size_bytes"))
             .and_then(Value::as_u64);
-        let content_url = raw.get("content_url").and_then(Value::as_str).map(str::to_string);
+        let content_url = raw
+            .get("content_url")
+            .and_then(Value::as_str)
+            .map(str::to_string);
         out.push(AttachmentEvidence {
             filename: filename.to_string(),
             content_type,

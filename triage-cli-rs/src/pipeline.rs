@@ -195,8 +195,7 @@ pub async fn investigate_one_structured(
     // Phase: memory_lookup
     reporter.phase_started("memory_lookup", "querying prior investigations");
     let symptom_head: String = ticket.description.chars().take(500).collect();
-    let prior =
-        memory::retrieve_similar(&ticket.subject, &symptom_head, 3).unwrap_or_default();
+    let prior = memory::retrieve_similar(&ticket.subject, &symptom_head, 3).unwrap_or_default();
     if let Ok(Some(_dup)) = memory::find_duplicate(&ticket.id.to_string()) {
         eprintln!("⚠ ZD-{} was previously investigated", ticket.id);
     }
@@ -246,15 +245,11 @@ pub async fn investigate_one_structured(
                         } else {
                             None
                         };
-                        let (anchor_dt, _src) = extract::resolve_anchor(
-                            &ticket,
-                            opts.anchor_override,
-                            extracted_dt,
-                        );
+                        let (anchor_dt, _src) =
+                            extract::resolve_anchor(&ticket, opts.anchor_override, extracted_dt);
                         let (start, end) = extract::build_window(anchor_dt, opts.window_minutes)?;
-                        let (logs, truncated) = dd
-                            .get_logs(&entry.site_name, &levels, start, end)
-                            .await?;
+                        let (logs, truncated) =
+                            dd.get_logs(&entry.site_name, &levels, start, end).await?;
                         log_lines = logs;
                         log_truncated = truncated;
                         site_entry = Some(entry);
@@ -294,40 +289,35 @@ pub async fn investigate_one_structured(
             customer_history: session.evidence.customer_history.clone(),
             memory_context: session.memory_context.clone(),
         };
-        let outcome = match llm::triage_structured(
-            &bundle,
-            rubric,
-            None,
-            opts.verbose,
-            opts.redact_enabled,
-        )
-        .await
-        {
-            Ok(o) => o,
-            Err(e) => {
-                // On retry-after failure, stash the raw response under
-                // Tickets/<id>/.debug/ before propagating (spec § 6, decision 6).
-                if let LlmError::StructuredAfterRetry { raw_response, .. } = &e {
-                    let root = ticket_folder::tickets_root();
-                    match ticket_folder::stash_debug_response(&root, ticket.id, raw_response) {
-                        Ok(p) => reporter.phase_failed(
-                            "llm_call",
-                            &format!(
-                                "structured validation failed; raw stashed at {}",
-                                p.display()
+        let outcome =
+            match llm::triage_structured(&bundle, rubric, None, opts.verbose, opts.redact_enabled)
+                .await
+            {
+                Ok(o) => o,
+                Err(e) => {
+                    // On retry-after failure, stash the raw response under
+                    // Tickets/<id>/.debug/ before propagating (spec § 6, decision 6).
+                    if let LlmError::StructuredAfterRetry { raw_response, .. } = &e {
+                        let root = ticket_folder::tickets_root();
+                        match ticket_folder::stash_debug_response(&root, ticket.id, raw_response) {
+                            Ok(p) => reporter.phase_failed(
+                                "llm_call",
+                                &format!(
+                                    "structured validation failed; raw stashed at {}",
+                                    p.display()
+                                ),
                             ),
-                        ),
-                        Err(stash_err) => reporter.phase_failed(
-                            "llm_call",
-                            &format!(
-                                "structured validation failed; stash also failed: {stash_err}"
+                            Err(stash_err) => reporter.phase_failed(
+                                "llm_call",
+                                &format!(
+                                    "structured validation failed; stash also failed: {stash_err}"
+                                ),
                             ),
-                        ),
+                        }
                     }
+                    return Err(PipelineError::Llm(e));
                 }
-                return Err(PipelineError::Llm(e));
-            }
-        };
+            };
         reporter.phase_done(
             "llm_call",
             &format!(
@@ -450,8 +440,7 @@ pub async fn resolve_site(
     site_override: Option<&str>,
     verbose: bool,
 ) -> Result<(Option<SiteEntry>, SiteStrategy), PipelineError> {
-    let (entry, strategy) =
-        extract::lookup_site(ticket, sites, cnc_override, site_override)?;
+    let (entry, strategy) = extract::lookup_site(ticket, sites, cnc_override, site_override)?;
     if entry.is_some() {
         return Ok((entry, strategy));
     }

@@ -81,7 +81,11 @@ fn unleash_text_from_response(data: &Value) -> String {
         Value::Array(items) => items.iter().map(unleash_text_from_response).collect(),
         Value::Object(_) => {
             let message = data.get("message").cloned().unwrap_or(Value::Null);
-            let parts = message.get("parts").and_then(Value::as_array).cloned().unwrap_or_default();
+            let parts = message
+                .get("parts")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
             let mut chunks = Vec::with_capacity(parts.len());
             for part in parts {
                 if part.get("type").and_then(Value::as_str) == Some("Text") {
@@ -125,7 +129,11 @@ pub(crate) async fn post_json(
     let response_headers: std::collections::HashMap<String, String> = resp
         .headers()
         .iter()
-        .filter_map(|(k, v)| v.to_str().ok().map(|s| (k.as_str().to_ascii_lowercase(), s.to_string())))
+        .filter_map(|(k, v)| {
+            v.to_str()
+                .ok()
+                .map(|s| (k.as_str().to_ascii_lowercase(), s.to_string()))
+        })
         .collect();
     if status.as_u16() >= 400 {
         return Err(provider_error(status.as_u16(), resp).await);

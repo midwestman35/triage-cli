@@ -140,9 +140,8 @@ fn migrate_v1_columns(conn: &Connection) -> Result<(), MemoryError> {
             "SELECT ticket_id, customer, subject, symptom, assessment, resolution \
              FROM investigations_backup",
         )?;
-        let mut insert = tx.prepare(
-            "INSERT INTO investigations VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        )?;
+        let mut insert =
+            tx.prepare("INSERT INTO investigations VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)")?;
         let rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -211,7 +210,9 @@ fn needs_rebuild(conn: &Connection, md_path: &Path) -> Result<bool, MemoryError>
     Ok(mtime_utc > last_indexed.with_timezone(&Utc))
 }
 
-fn parse_memory_md(md_path: &Path) -> std::io::Result<Vec<std::collections::HashMap<String, String>>> {
+fn parse_memory_md(
+    md_path: &Path,
+) -> std::io::Result<Vec<std::collections::HashMap<String, String>>> {
     if !md_path.exists() {
         return Ok(Vec::new());
     }
@@ -238,13 +239,14 @@ fn parse_memory_md(md_path: &Path) -> std::io::Result<Vec<std::collections::Hash
 
 /// Parse MEMORY.md and rebuild the FTS5 index from scratch. Returns entry count.
 pub fn rebuild_index(db_path: Option<&Path>) -> Result<usize, MemoryError> {
-    let path = db_path.map(Path::to_path_buf).unwrap_or_else(memory_db_path);
+    let path = db_path
+        .map(Path::to_path_buf)
+        .unwrap_or_else(memory_db_path);
     let conn = ensure_db(&path)?;
     let entries = parse_memory_md(&memory_md_path())?;
     conn.execute("DELETE FROM investigations", [])?;
-    let mut stmt = conn.prepare(
-        "INSERT INTO investigations VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-    )?;
+    let mut stmt =
+        conn.prepare("INSERT INTO investigations VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)")?;
     for e in &entries {
         stmt.execute(params![
             e.get("id").map(String::as_str).unwrap_or(""),
@@ -252,7 +254,9 @@ pub fn rebuild_index(db_path: Option<&Path>) -> Result<usize, MemoryError> {
             e.get("subject").map(String::as_str).unwrap_or(""),
             e.get("symptom").map(String::as_str).unwrap_or(""),
             e.get("assessment").map(String::as_str).unwrap_or(""),
-            e.get("resolution").map(String::as_str).unwrap_or("[unknown]"),
+            e.get("resolution")
+                .map(String::as_str)
+                .unwrap_or("[unknown]"),
             e.get("fork_letter").map(String::as_str).unwrap_or(""),
             e.get("quoted_rubric_row").map(String::as_str).unwrap_or(""),
             e.get("rubric_version").map(String::as_str).unwrap_or(""),

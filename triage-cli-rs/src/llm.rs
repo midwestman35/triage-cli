@@ -46,9 +46,8 @@ pub struct StructuredOutcome {
     pub validator_warnings: Vec<String>,
 }
 
-static FENCE_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?is)^\s*```(?:json)?\s*(.*?)\s*```\s*$").unwrap()
-});
+static FENCE_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?is)^\s*```(?:json)?\s*(.*?)\s*```\s*$").unwrap());
 
 /// Extract a JSON object payload from an LLM response.
 ///
@@ -149,7 +148,10 @@ fn response_preview(s: &str) -> String {
     }
     let head = String::from_utf8_lossy(&bytes[..HEAD]);
     let tail = String::from_utf8_lossy(&bytes[bytes.len() - TAIL..]);
-    format!("{head}\n…[{} bytes elided]…\n{tail}", bytes.len() - HEAD - TAIL)
+    format!(
+        "{head}\n…[{} bytes elided]…\n{tail}",
+        bytes.len() - HEAD - TAIL
+    )
 }
 
 //
@@ -159,7 +161,8 @@ fn response_preview(s: &str) -> String {
 // ──────────────────────────────────────────────────────────────────────
 //
 
-const STRUCTURED_PROMPT_PREAMBLE: &str = "You are a triage assistant for a NOC engineer working on the Carbyne APEX \
+const STRUCTURED_PROMPT_PREAMBLE: &str =
+    "You are a triage assistant for a NOC engineer working on the Carbyne APEX \
 NG911/E911 platform at Axon. You receive a Zendesk ticket, customer history, \
 prior memory hits, optional Datadog logs, and analyst-supplied evidence.\n\n\
 Your job is to produce a SINGLE JSON object (a StructuredTriageReport) that \
@@ -392,7 +395,12 @@ pub async fn extract_site(
     let site_list: String = sites
         .iter()
         .filter(|e| !e.site_name.is_empty())
-        .map(|e| format!("  site_name: {}  |  friendly_name: {}", e.site_name, e.friendly_name))
+        .map(|e| {
+            format!(
+                "  site_name: {}  |  friendly_name: {}",
+                e.site_name, e.friendly_name
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n");
     let desc_head: String = ticket.description.chars().take(500).collect();
@@ -454,10 +462,7 @@ pub async fn extract_anchor(
 fn ticket_for_anchor(ticket: &Ticket) -> String {
     let mut lines = vec![
         format!("Subject: {}", ticket.subject),
-        format!(
-            "Description: {}",
-            indent_continuations(&ticket.description)
-        ),
+        format!("Description: {}", indent_continuations(&ticket.description)),
         "Comments:".into(),
     ];
     if ticket.comments.is_empty() {
@@ -481,8 +486,8 @@ mod structured_tests {
     use super::*;
     use crate::models::{
         Confidence, ContextPull, DraftsBlock, ForkCommitment, ForkLetter, ForkPacket,
-        GatheredEvidence, HandoffBlock, HandoffItem, InitialRoute, IntakeBlock,
-        IntakeDecision, IntakeTicketFacts, PreflightBlock, RelatedWork,
+        GatheredEvidence, HandoffBlock, HandoffItem, InitialRoute, IntakeBlock, IntakeDecision,
+        IntakeTicketFacts, PreflightBlock, RelatedWork,
     };
 
     fn sample_report(rubric_version: &str) -> StructuredTriageReport {

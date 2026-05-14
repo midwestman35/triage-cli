@@ -24,7 +24,11 @@ use crate::zendesk::ZendeskClient;
 const VALID_LEVELS: &[&str] = &["error", "warn", "info", "debug"];
 
 #[derive(Debug, Parser)]
-#[command(name = "triage-cli", version, about = "Triage Zendesk tickets for the Carbyne APEX NG911/E911 platform.")]
+#[command(
+    name = "triage-cli",
+    version,
+    about = "Triage Zendesk tickets for the Carbyne APEX NG911/E911 platform."
+)]
 struct Cli {
     #[command(subcommand)]
     command: Cmd,
@@ -216,7 +220,9 @@ fn parse_levels(s: &str) -> Vec<String> {
         .map(String::as_str)
         .collect();
     if !invalid.is_empty() {
-        die(&format!("Invalid log levels: {invalid:?}. Valid: {VALID_LEVELS:?}"));
+        die(&format!(
+            "Invalid log levels: {invalid:?}. Valid: {VALID_LEVELS:?}"
+        ));
     }
     parts
 }
@@ -264,7 +270,9 @@ fn resolve_view(view: Option<&str>) -> (Option<u64>, String) {
     let views_path = PathBuf::from("data/views.json");
     if views_path.exists() {
         if let Ok(text) = std::fs::read_to_string(&views_path) {
-            if let Ok(map) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&text) {
+            if let Ok(map) =
+                serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&text)
+            {
                 if let Some(id) = map.get(v).and_then(|val| val.as_u64()) {
                     return (Some(id), v.to_string());
                 }
@@ -303,7 +311,10 @@ async fn cmd_triage(c: TriageCmd) -> ExitCode {
         Err(e) => die(&e.to_string()),
     };
     if c.verbose {
-        eprintln!("Fetched ticket #{} — subject: {}", ticket.id, ticket.subject);
+        eprintln!(
+            "Fetched ticket #{} — subject: {}",
+            ticket.id, ticket.subject
+        );
     }
 
     let mut session = investigation::create_session(ticket.clone());
@@ -382,7 +393,10 @@ async fn cmd_investigate(c: InvestigateCmd) -> ExitCode {
     let levels = parse_levels(&c.levels);
     for path in &c.files {
         if !path.exists() {
-            die(&format!("Local evidence file not found: {}", path.display()));
+            die(&format!(
+                "Local evidence file not found: {}",
+                path.display()
+            ));
         }
     }
 
@@ -417,13 +431,8 @@ async fn cmd_investigate(c: InvestigateCmd) -> ExitCode {
         ticket.comments.len()
     );
 
-    let downloaded = interactive::download_attachments(
-        &ticket,
-        &zd,
-        &workspace,
-        150 * 1024 * 1024,
-    )
-    .await;
+    let downloaded =
+        interactive::download_attachments(&ticket, &zd, &workspace, 150 * 1024 * 1024).await;
     let local_files = interactive::prompt_drop_and_wait(&workspace);
     eprintln!(
         "{}",
@@ -487,10 +496,7 @@ async fn cmd_investigate(c: InvestigateCmd) -> ExitCode {
     };
     print_fork_packet_to_stdout(&outcome.paths.fork_packet);
     surface_validator_warnings(&outcome.validator_warnings);
-    eprintln!(
-        "Ticket folder ready: {}",
-        outcome.paths.folder.display()
-    );
+    eprintln!("Ticket folder ready: {}", outcome.paths.folder.display());
     ExitCode::SUCCESS
 }
 
@@ -566,11 +572,7 @@ fn print_soft_lock_summary(
         eprintln!("  (No structured-field differences detected — only the owner has changed.)");
     } else {
         eprintln!("Conflicting fields:");
-        let label_width = summary
-            .iter()
-            .map(|(k, _, _)| k.len())
-            .max()
-            .unwrap_or(0);
+        let label_width = summary.iter().map(|(k, _, _)| k.len()).max().unwrap_or(0);
         for (field, old, new) in summary {
             eprintln!(
                 "  {:width$}  {} → {}",
@@ -589,10 +591,7 @@ fn print_soft_lock_summary(
 /// rendered content that would have been written. Honors `$DIFF_VIEWER`
 /// (spawned with two filename arguments); falls back to `diff -u` printed
 /// to stderr.
-fn show_full_state_diff(
-    existing_path: &Path,
-    new_content: &str,
-) -> std::io::Result<()> {
+fn show_full_state_diff(existing_path: &Path, new_content: &str) -> std::io::Result<()> {
     use std::io::Write;
     use std::process::Command;
 

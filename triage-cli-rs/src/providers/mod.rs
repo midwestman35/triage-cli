@@ -63,7 +63,10 @@ pub fn get_provider() -> Result<Box<dyn LlmProvider>, ProviderError> {
     }
 }
 
-pub(crate) fn required_env(name: &'static str, provider: &'static str) -> Result<String, ProviderError> {
+pub(crate) fn required_env(
+    name: &'static str,
+    provider: &'static str,
+) -> Result<String, ProviderError> {
     let v = env::var(name).unwrap_or_default();
     let trimmed = v.trim();
     if trimmed.is_empty() {

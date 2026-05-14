@@ -68,9 +68,8 @@ impl Rubric {
     }
 }
 
-static VERSION_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r#"(?m)^rubric_version:\s*"?([^"\n]+?)"?\s*$"#).unwrap()
-});
+static VERSION_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r#"(?m)^rubric_version:\s*"?([^"\n]+?)"?\s*$"#).unwrap());
 
 fn parse_version(text: &str) -> Option<String> {
     VERSION_RE
@@ -122,9 +121,7 @@ mod tests {
     #[test]
     fn contains_row_matches_substring_from_embedded() {
         let r = Rubric::load().expect("load");
-        assert!(r.contains_row(
-            "customer LAN, switch, or SDWAN. Link to site master ticket"
-        ));
+        assert!(r.contains_row("customer LAN, switch, or SDWAN. Link to site master ticket"));
     }
 
     #[test]

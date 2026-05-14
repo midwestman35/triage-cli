@@ -36,7 +36,11 @@ pub fn create_session(ticket: Ticket) -> InvestigationSession {
     for (index, comment) in comments.iter().enumerate() {
         timeline.push(comment_event(comment, index));
         for (a_idx, _att) in comment.attachments.iter().enumerate() {
-            timeline.push(attachment_event_from_comment(comment, &comment.attachments[a_idx], a_idx));
+            timeline.push(attachment_event_from_comment(
+                comment,
+                &comment.attachments[a_idx],
+                a_idx,
+            ));
         }
     }
     sort_timeline(&mut timeline);
@@ -94,7 +98,11 @@ pub fn add_pasted_evidence(
 }
 
 fn comment_event(comment: &Comment, index: usize) -> TimelineEvent {
-    let visibility = if comment.is_public { "public" } else { "internal" };
+    let visibility = if comment.is_public {
+        "public"
+    } else {
+        "internal"
+    };
     let first_line = first_line(&comment.body);
     TimelineEvent {
         timestamp: Some(comment.created_at),
@@ -178,5 +186,7 @@ fn sort_timeline(events: &mut Vec<TimelineEvent>) {
 
 #[allow(dead_code)]
 fn _file_basename(p: &Path) -> PathBuf {
-    p.file_name().map(PathBuf::from).unwrap_or_else(|| p.to_path_buf())
+    p.file_name()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| p.to_path_buf())
 }
