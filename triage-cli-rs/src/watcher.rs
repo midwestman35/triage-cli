@@ -1,5 +1,6 @@
 //! Long-running watcher: poll a Zendesk view and triage new/updated tickets.
 
+use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -19,6 +20,8 @@ use crate::zendesk::{ZendeskClient, ZendeskError};
 
 const STATE_VERSION: u32 = 1;
 pub const DEFAULT_PRUNE_CAP: usize = 1000;
+pub const DEFAULT_TTL_DAYS: i64 = 30;
+pub const DEFAULT_MEMBERSHIP_GRACE_DAYS: i64 = 7;
 
 #[derive(Debug, Error)]
 pub enum WatcherError {
@@ -138,17 +141,42 @@ pub fn should_triage(ticket: &Ticket, state: &State, backfill_cutoff: DateTime<U
     }
 }
 
-pub fn prune_state(state: State, max_entries: usize) -> State {
-    if state.triaged.len() <= max_entries {
-        return state;
-    }
-    let mut items: Vec<(String, String)> = state.triaged.into_iter().collect();
+pub fn prune_state(state: State, max_entries: usize, ttl_days: i64) -> State {
+    let cutoff = Utc::now() - chrono::Duration::days(ttl_days);
+    let mut items: Vec<(String, String)> = state
+        .triaged
+        .into_iter()
+        .filter(|(_, ts)| {
+            DateTime::parse_from_rfc3339(ts)
+                .map(|d| d.with_timezone(&Utc) >= cutoff)
+                .unwrap_or(false)
+        })
+        .collect();
     items.sort_by(|a, b| b.1.cmp(&a.1));
-    let kept = items.into_iter().take(max_entries).collect();
+    items.truncate(max_entries);
     State {
         version: STATE_VERSION,
-        triaged: kept,
+        triaged: items.into_iter().collect(),
     }
+}
+
+/// Drops state entries for tickets that are no longer in the view AND are
+/// older than `grace_days`. Entries within the grace window are kept so a
+/// ticket that briefly leaves and re-enters the view isn't re-triaged.
+/// Unparseable timestamps are treated as expired and dropped.
+pub fn prune_by_membership(
+    mut state: State,
+    live_ids: &HashSet<String>,
+    grace_days: i64,
+) -> State {
+    let cutoff = Utc::now() - chrono::Duration::days(grace_days);
+    state.triaged.retain(|id, ts| {
+        live_ids.contains(id)
+            || DateTime::parse_from_rfc3339(ts)
+                .map(|d| d.with_timezone(&Utc) >= cutoff)
+                .unwrap_or(false)
+    });
+    state
 }
 
 fn now_local_hms() -> String {
@@ -185,6 +213,8 @@ pub async fn run_iteration(
             }
         },
     };
+
+    let live_set: HashSet<String> = view_ids.iter().map(|id| id.to_string()).collect();
 
     for tid in view_ids {
         let key = tid.to_string();
@@ -275,6 +305,7 @@ pub async fn run_iteration(
             }
         }
     }
+    state = prune_by_membership(state, &live_set, DEFAULT_MEMBERSHIP_GRACE_DAYS);
     Ok(state)
 }
 
@@ -317,7 +348,7 @@ pub async fn run_watch(opts: WatcherOptions) -> Result<(), WatcherError> {
                 }
             }
         }
-        let pruned = prune_state(std::mem::replace(&mut state, State::empty()), DEFAULT_PRUNE_CAP);
+        let pruned = prune_state(std::mem::replace(&mut state, State::empty()), DEFAULT_PRUNE_CAP, DEFAULT_TTL_DAYS);
         save_state(&opts.state_file, &pruned)?;
         state = pruned;
         emit(&format!(
@@ -329,10 +360,95 @@ pub async fn run_watch(opts: WatcherOptions) -> Result<(), WatcherError> {
             _ = tokio::time::sleep(interval) => {}
             _ = &mut token => {
                 emit(&format!("[{}] watcher stopped (Ctrl-C)", now_local_hms()));
-                let pruned = prune_state(state, DEFAULT_PRUNE_CAP);
+                let pruned = prune_state(state, DEFAULT_PRUNE_CAP, DEFAULT_TTL_DAYS);
                 save_state(&opts.state_file, &pruned)?;
                 return Ok(());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_state(entries: &[(&str, i64)]) -> State {
+        // entries: (ticket_id, age_days_ago)
+        let triaged = entries
+            .iter()
+            .map(|(id, days_ago)| {
+                let ts = (Utc::now() - chrono::Duration::days(*days_ago)).to_rfc3339();
+                (id.to_string(), ts)
+            })
+            .collect();
+        State { version: STATE_VERSION, triaged }
+    }
+
+    #[test]
+    fn prune_drops_entries_older_than_ttl() {
+        let state = make_state(&[("1", 10), ("2", 31), ("3", 5)]);
+        let pruned = prune_state(state, 1000, 30);
+        assert!(pruned.triaged.contains_key("1"), "10-day-old entry should be kept");
+        assert!(!pruned.triaged.contains_key("2"), "31-day-old entry should be dropped");
+        assert!(pruned.triaged.contains_key("3"), "5-day-old entry should be kept");
+    }
+
+    #[test]
+    fn prune_count_cap_applied_after_ttl() {
+        // 3 fresh entries, cap of 2 — oldest fresh entry should be evicted
+        let state = make_state(&[("old-fresh", 20), ("newer", 5), ("newest", 1)]);
+        let pruned = prune_state(state, 2, 30);
+        assert_eq!(pruned.triaged.len(), 2);
+        assert!(!pruned.triaged.contains_key("old-fresh"), "cap should evict oldest remaining");
+    }
+
+    #[test]
+    fn prune_drops_unparseable_timestamps() {
+        let mut state = State::empty();
+        state.triaged.insert("bad".to_string(), "not-a-date".to_string());
+        state.triaged.insert("good".to_string(), Utc::now().to_rfc3339());
+        let pruned = prune_state(state, 1000, 30);
+        assert!(!pruned.triaged.contains_key("bad"));
+        assert!(pruned.triaged.contains_key("good"));
+    }
+
+    #[test]
+    fn prune_empty_state_is_a_noop() {
+        let pruned = prune_state(State::empty(), 1000, 30);
+        assert!(pruned.triaged.is_empty());
+    }
+
+    fn live(ids: &[&str]) -> HashSet<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn membership_prune_keeps_live_ids_regardless_of_age() {
+        let state = make_state(&[("live-old", 60), ("live-new", 1)]);
+        let pruned = prune_by_membership(state, &live(&["live-old", "live-new"]), 7);
+        assert!(pruned.triaged.contains_key("live-old"), "live IDs are always kept");
+        assert!(pruned.triaged.contains_key("live-new"));
+    }
+
+    #[test]
+    fn membership_prune_keeps_non_live_within_grace() {
+        let state = make_state(&[("gone-recent", 3), ("gone-old", 10)]);
+        let pruned = prune_by_membership(state, &live(&[]), 7);
+        assert!(pruned.triaged.contains_key("gone-recent"), "within grace period — keep");
+        assert!(!pruned.triaged.contains_key("gone-old"), "outside grace period — drop");
+    }
+
+    #[test]
+    fn membership_prune_drops_unparseable_non_live_timestamps() {
+        let mut state = State::empty();
+        state.triaged.insert("bad".to_string(), "not-a-date".to_string());
+        let pruned = prune_by_membership(state, &live(&[]), 7);
+        assert!(!pruned.triaged.contains_key("bad"));
+    }
+
+    #[test]
+    fn membership_prune_empty_live_and_empty_state_is_noop() {
+        let pruned = prune_by_membership(State::empty(), &live(&[]), 7);
+        assert!(pruned.triaged.is_empty());
     }
 }

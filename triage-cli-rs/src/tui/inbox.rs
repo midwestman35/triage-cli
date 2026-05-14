@@ -315,6 +315,7 @@ pub async fn run_inbox(opts: WatcherOptions) -> io::Result<()> {
     let pruned = watcher::prune_state(
         std::mem::take(&mut app.state),
         watcher::DEFAULT_PRUNE_CAP,
+        watcher::DEFAULT_TTL_DAYS,
     );
     let _ = watcher::save_state(&opts.state_file, &pruned);
     for handle in app.pending_triages.drain(..) {
@@ -454,6 +455,7 @@ impl InboxApp {
                             triaged: self.state.triaged.clone(),
                         },
                         watcher::DEFAULT_PRUNE_CAP,
+                        watcher::DEFAULT_TTL_DAYS,
                     ),
                 );
                 self.view_ids = view_ids;
@@ -1149,6 +1151,8 @@ async fn poll_iteration(
         });
         new_state.triaged.insert(key, updated.to_rfc3339());
     }
+    let live_set: HashSet<String> = view_set.iter().map(|id| id.to_string()).collect();
+    new_state = watcher::prune_by_membership(new_state, &live_set, watcher::DEFAULT_MEMBERSHIP_GRACE_DAYS);
     Ok((new_state, view_set))
 }
 
