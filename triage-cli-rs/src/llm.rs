@@ -16,9 +16,6 @@ use crate::playbook::Rubric;
 use crate::providers::{get_provider, ProviderError};
 use crate::redact::{redact, RedactionCounts};
 
-pub const DEFAULT_CLAUDE_MODEL: &str = "claude-sonnet-4-6";
-pub const DEFAULT_OPENAI_MODEL: &str = "gpt-5.5";
-
 pub const SITE_EXTRACTION_PROMPT: &str = "You identify which Carbyne APEX customer site a\nZendesk support ticket is about. A list of known sites is provided. Return JSON\nwith a single field:\n\n{\"site_name\": \"<site_name from the list>\" or null}\n\nRules:\n- You MUST only return a site_name that appears verbatim in the provided list.\n- Return null if no site clearly matches — do not guess.\n- Geographic, agency name, and abbreviation cues in the subject/description\n  matter more than exact wording. \"Roswell PD GA\" → look for a Georgia/Roswell site.";
 
 pub const ANCHOR_EXTRACTION_PROMPT: &str = "You extract the most likely incident timestamp\nfrom a Zendesk ticket. Read the subject, description, and comments. Return JSON\nwith a single field:\n\n{\"timestamp\": \"<ISO 8601 in UTC>\" or null}\n\nReturn null if there is no clear timestamp in the content. Do not guess. A\ngeneric \"this morning\" with no date is null. An explicit \"2026-05-06 14:32 PT\"\nis a timestamp. When in doubt, return null.";
@@ -63,9 +60,9 @@ static FENCE_RE: Lazy<Regex> = Lazy::new(|| {
 ///
 /// We try `(1)`, then `(2)` via the FENCE_RE anchor regex. If neither works,
 /// we fall back to a balanced-brace scan that finds the first `{...}` block
-/// at depth 0 (skipping `{` inside strings and escapes). This matches the
-/// behaviour of the Python `_strip_code_fence` *and* the implicit looseness
-/// that the Claude Agent SDK provided by separating assistant text blocks.
+/// at depth 0 (skipping `{` inside strings and escapes). This mirrors Python's
+/// `_strip_code_fence` and tolerates assistant-text-block separation common in
+/// older provider responses.
 fn extract_json_object(s: &str) -> &str {
     let trimmed = s.trim();
     if trimmed.starts_with('{') {
@@ -126,9 +123,20 @@ fn balanced_object(s: &str) -> Option<&str> {
 }
 
 fn model_for_provider(name: &str) -> String {
+    // Two providers are valid (see `providers::get_provider`):
+    //   * "codex"   — passes the result to `codex exec --model` (subprocess).
+    //   * "unleash" — ignores the model string entirely; the assistant is
+    //                 selected server-side via `UNLEASH_ASSISTANT_ID`. The
+    //                 `UNLEASH_MODEL` env var has no effect today and is read
+    //                 only so a future server-side surface can pick it up
+    //                 without another code change.
+    // Any other `name` here would indicate `get_provider` and this function
+    // disagree about the valid set; the catchall returns an empty string
+    // rather than panicking so triage still attempts to run.
     match name {
-        "openai" => env::var("OPENAI_MODEL").unwrap_or_else(|_| DEFAULT_OPENAI_MODEL.into()),
-        _ => env::var("ANTHROPIC_MODEL").unwrap_or_else(|_| DEFAULT_CLAUDE_MODEL.into()),
+        "codex" => env::var("CODEX_MODEL")
+            .unwrap_or_else(|_| crate::providers::codex::DEFAULT_CODEX_MODEL.to_string()),
+        _ => env::var("UNLEASH_MODEL").unwrap_or_default(),
     }
 }
 

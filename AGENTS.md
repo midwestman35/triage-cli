@@ -25,11 +25,9 @@ Controlled by `LLM_PROVIDER` env var (default: `unleash`).
 | Value | Mechanism | Required |
 |---|---|---|
 | `unleash` (default) | HTTP to internal Axon gateway | `UNLEASH_API_KEY`, `UNLEASH_ASSISTANT_ID` |
-| `claude` | Subprocess to `claude --print`; inherits Claude Code OAuth | `claude` CLI on PATH |
 | `codex` | Subprocess to `codex exec`; inherits Codex OAuth | `codex` CLI on PATH |
-| `openai` | HTTP to OpenAI Responses API | `OPENAI_API_KEY` |
 
-Do not "fix" the Claude provider by switching to the `anthropic` HTTP SDK. The user has an enterprise OAuth seat with no provisioned Anthropic API key; that path does not work. Claude / Codex providers read `ANTHROPIC_MODEL`; OpenAI reads `OPENAI_MODEL`; Unleash uses the configured assistant ID.
+The `claude` and `openai` providers were removed 2026-05-14 in favor of unleash + codex (see `docs/adr/0002-prune-claude-openai-providers.md`); if a future Anthropic API path is added, it must work with the enterprise OAuth seat the operator has — i.e. via the `claude` CLI subprocess, not the SDK. Codex reads `CODEX_MODEL` (default `gpt-5-codex`); Unleash ignores any model parameter — the model is selected server-side by `UNLEASH_ASSISTANT_ID`.
 
 ## Memory layer
 
@@ -79,7 +77,7 @@ Tests are inline (`#[cfg(test)]`) in the same `.rs` source files. Mocked clients
 
 `triage-cli-rs/` follows one-module-per-file. The binary entry point is `src/main.rs` → `triage_cli::run()` (in `src/lib.rs`) → `cli::run()`. Current modules under `src/`:
 
-`build_map`, `cli`, `datadog`, `extract`, `interactive`, `investigation`, `llm`, `memory`, `models`, `pipeline`, `playbook`, `providers/` (`mod`, `unleash`, `claude`, `codex`, `openai`), `redact`, `setup`, `ticket_folder`, `tui/` (`mod`, `inbox`), `watcher`, `zendesk`.
+`build_map`, `cli`, `datadog`, `extract`, `interactive`, `investigation`, `llm`, `memory`, `models`, `pipeline`, `playbook`, `providers/` (`mod`, `unleash`, `codex`), `redact`, `setup`, `ticket_folder`, `tui/` (`mod`, `inbox`), `watcher`, `zendesk`.
 
 The legacy `render` module and `tui/investigate.rs` were removed in the v1 reframe — there is no longer a prose-note renderer or a mid-investigation TUI.
 
@@ -121,7 +119,7 @@ The rubric lives at `triage-cli-rs/playbook/fork-rubric.md` and is **embedded in
 
 ### LLM access — structured output, provider trait
 
-`llm.rs` dispatches to a provider via the `LlmProvider` trait in `providers/mod.rs` (uses native `async fn` in traits, no `async-trait` crate). Implementations: `unleash`, `claude`, `codex`, `openai`. Two single-turn async calls:
+`llm.rs` dispatches to a provider via the `LlmProvider` trait in `providers/mod.rs` (uses native `async fn` in traits, no `async-trait` crate). Implementations: `unleash`, `codex`. Two single-turn async calls:
 
 - `triage_structured(bundle, rubric, ...)` — main path. Asks the provider for a single JSON object deserializable into `StructuredTriageReport`, validates `ForkCommitment` against the rubric (soft-warn), and returns the report plus any validator warnings.
 - `extract_anchor(ticket)` — best-effort timestamp extraction; returns `None` on any failure (invalid JSON, missing key, unparseable timestamp). Only transport errors propagate.
@@ -220,7 +218,7 @@ Logging during the TUI run is redirected to a per-view file printed at startup s
 | Embedded rubric file | `triage-cli-rs/playbook/fork-rubric.md` |
 | Investigation session + evidence | `triage-cli-rs/src/investigation.rs` |
 | Memory layer (MEMORY.md + SQLite FTS5, schema v2) | `triage-cli-rs/src/memory.rs`, `MEMORY.md`, `data/memory.db` |
-| LLM provider trait + impls | `triage-cli-rs/src/providers/` (`mod.rs`, `unleash.rs`, `claude.rs`, `codex.rs`, `openai.rs`) |
+| LLM provider trait + impls | `triage-cli-rs/src/providers/` (`mod.rs`, `unleash.rs`, `codex.rs`) |
 | LLM structured-output dispatch + validator + retry | `triage-cli-rs/src/llm.rs` (`triage_structured`) |
 | PII redaction | `triage-cli-rs/src/redact.rs` |
 | Inbox TUI | `triage-cli-rs/src/tui/inbox.rs` |

@@ -28,14 +28,12 @@ ApiException: 401 Unauthorized
 
 ```
 UNLEASH_API_KEY must be set when LLM_PROVIDER=unleash.
-OPENAI_API_KEY must be set when LLM_PROVIDER=openai.
-Claude Agent SDK call failed: ...
+codex CLI not found on PATH.
 ```
 
-- `LLM_PROVIDER=unleash` requires `UNLEASH_API_KEY` and `UNLEASH_ASSISTANT_ID`.
-- `LLM_PROVIDER=openai` or `LLM_PROVIDER=codex` requires `OPENAI_API_KEY`.
-- `LLM_PROVIDER=claude` requires `python -m pip install -e ".[claude]"` and a local Claude Code OAuth session. Run `claude` once interactively in the same shell to verify auth state.
-- Claude fallback does **not** read `ANTHROPIC_API_KEY`. Setting one will not help.
+- `LLM_PROVIDER=unleash` requires `UNLEASH_API_KEY` and `UNLEASH_ASSISTANT_ID`. The Unleash assistant picks the model server-side; the CLI does not pass a model parameter.
+- `LLM_PROVIDER=codex` requires the `codex` CLI on `PATH` and an existing codex OAuth session (run `codex` once interactively to authenticate). The model defaults to `gpt-5-codex`; override with `CODEX_MODEL`.
+- Only `unleash` and `codex` are accepted as of 2026-05-14. Any other value (`claude`, `openai`, …) is rejected by `doctor`. See `docs/adr/0002-prune-claude-openai-providers.md` for why those providers were removed.
 
 ## Site resolution
 
@@ -82,7 +80,7 @@ Wait the duration suggested in the error and re-run. There are no automatic retr
 
 ### Empty triage note
 
-The LLM returned no assistant text blocks. Almost always an SDK auth issue — re-run `claude` interactively to refresh the session, then retry.
+The LLM returned no assistant text blocks. With `LLM_PROVIDER=unleash`, this is usually a transient gateway error — re-run after a few seconds. With `LLM_PROVIDER=codex`, the codex OAuth session may have expired — re-run `codex` interactively in the same shell to refresh, then retry.
 
 ### Anchor extraction returns null in `--verbose`, but the ticket text has a timestamp
 

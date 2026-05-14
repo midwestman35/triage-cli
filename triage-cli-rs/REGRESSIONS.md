@@ -13,32 +13,25 @@ Status keys:
 
 ## OPEN
 
-### R1 — `claude` provider is a subprocess, not an in-process SDK call
-**Python:** `triage_cli/providers/claude.py` uses the `claude_agent_sdk` Python
-library, which streams `AssistantMessage`/`TextBlock` blocks in-process. It
-inherits Claude Code's OAuth session.
+### R1 — `claude` provider is a subprocess, not an in-process SDK call *(CLOSED)*
+**Status:** CLOSED. Provider removed 2026-05-14 in favor of unleash+codex. See `docs/adr/0002-prune-claude-openai-providers.md`. Regression no longer applies.
 
-**Rust:** No Claude Agent SDK exists for Rust. The port shells out to the
+**Python (historical):** `triage_cli/providers/claude.py` used the `claude_agent_sdk` Python
+library, which streamed `AssistantMessage`/`TextBlock` blocks in-process. It
+inherited Claude Code's OAuth session.
+
+**Rust (historical):** No Claude Agent SDK existed for Rust. The port shelled out to the
 `claude` CLI via `claude -p <prompt>` (subprocess, prompt-on-stdin). It still
-inherits Claude Code OAuth, but the stream is replaced by a single buffered
+inherited Claude Code OAuth, but the stream was replaced by a single buffered
 stdout read.
 
-**Impact:** Latency to first byte will be marginally higher; partial-output
-display impossible (we only see stdout after the process exits). System prompt
-is now passed via `--system-prompt`. Models may behave slightly differently
-because the SDK and the CLI take prompts via different paths.
-
-**Eval target:** Acceptable for v1; revisit if/when an official Rust Claude SDK
-ships.
-
 ### R2 — `codex` provider is new; no Python equivalent
-**Python:** Three providers (`unleash`, `claude`, `openai`).
+**Python (historical):** Three providers (`unleash`, `claude`, `openai`).
 
-**Rust:** Four providers: above plus `codex`. Codex is invoked via
-`codex exec <prompt>` per goal text ("subprocess calls to codex exec or
-claude"). Selected via `LLM_PROVIDER=codex`.
+**Rust:** Two providers: `unleash` (HTTP) and `codex` (subprocess). The `claude` and `openai` providers were removed 2026-05-14 (ADR-0002). Codex is invoked via
+`codex exec <prompt>`; selected via `LLM_PROVIDER=codex`. Default model `gpt-5-codex` (env `CODEX_MODEL`).
 
-**Impact:** Net-new functionality, not a regression. Documented for awareness.
+**Impact:** Net-new functionality on the Rust side, not a regression. Documented for awareness.
 
 ### R3 — TUI uses ratatui+crossterm instead of Textual *(now feature-parity)*
 **Python:** `triage_cli/inbox/` and `triage_cli/tui/` use Textual.
@@ -178,7 +171,7 @@ Resolved in this session:
 - ~~build-map: port to Rust~~ (R10 closed)
 - Memory paths: stay cwd-relative (matches Python)
 - `--save`: keep always-on, no `--no-save`
-- openai provider: keep alongside unleash/claude/codex
+- openai provider: removed 2026-05-14 per ADR-0002.
 
 Still open:
 

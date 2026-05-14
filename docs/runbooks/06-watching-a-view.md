@@ -4,7 +4,7 @@
 
 ## Prerequisites
 
-- The standard `triage-cli` env (`ZENDESK_*`, `DATADOG_*`, `ANTHROPIC_MODEL`).
+- The standard `triage-cli` env (`ZENDESK_*`, `DD_*`, and the credentials for the selected `LLM_PROVIDER` — see `docs/runbooks/05-switching-models.md`).
 - The numeric Zendesk view ID. Find it in the Zendesk UI: open the view and
   the URL ends in `/views/<id>`.
 - A built site map at `data/cnc-map.json` (run `triage-cli build-map` if
@@ -50,8 +50,8 @@ Status verbs:
 - `skipped: site unresolvable` — ticket subject/description/org didn't match
   the site map. State is **not** marked, so the next time this ticket gets
   touched (or you fix the site map) it'll retry.
-- `failed: <reason> (will retry)` — transient error (Datadog timeout, Claude
-  rate limit, Zendesk 5xx). State is **not** marked; the next iteration
+- `failed: <reason> (will retry)` — transient error (Datadog timeout, LLM
+  provider error, Zendesk 5xx). State is **not** marked; the next iteration
   retries.
 
 ## State file
@@ -74,7 +74,7 @@ so it doesn't grow unbounded.
 ## Recovering from accidental state deletion
 
 If you delete the state file, the watcher treats every ticket within the
-backfill horizon as "new" and re-triages them. Cost: `2 × N` Claude calls
+backfill horizon as "new" and re-triages them. Cost: `2 × N` LLM calls
 where `N` is the number of tickets in the horizon. To avoid the burst, run
 once with `--backfill 0` after restoring; that re-marks every ticket in the
 view as "seen" without producing notes, then your next watcher invocation

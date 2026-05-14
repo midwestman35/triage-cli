@@ -10,7 +10,7 @@ ticket list; the right pane renders the selected `TriageReport`.
 
 ## Prerequisites
 
-- The standard `triage-cli` env (`ZENDESK_*`, `DATADOG_*`, `ANTHROPIC_MODEL`).
+- The standard `triage-cli` env (`ZENDESK_*`, `DD_*`, and the credentials for the selected `LLM_PROVIDER` — see `docs/runbooks/05-switching-models.md`).
 - The numeric Zendesk view ID. Find it in the Zendesk UI: open the view and
   the URL ends in `/views/<id>`.
 - A built site map at `data/cnc-map.json` (run `triage-cli build-map` if

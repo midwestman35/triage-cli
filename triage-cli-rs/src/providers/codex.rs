@@ -13,6 +13,10 @@ use tokio::process::Command;
 
 use super::{LlmProvider, ProviderError};
 
+/// Default model passed via `codex exec --model` when `CODEX_MODEL` is unset.
+/// Single source of truth — `llm::model_for_provider` references this.
+pub const DEFAULT_CODEX_MODEL: &str = "gpt-5-codex";
+
 pub struct CodexSubprocessProvider;
 
 impl LlmProvider for CodexSubprocessProvider {

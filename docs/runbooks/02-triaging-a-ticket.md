@@ -2,7 +2,7 @@
 
 > **When to use this:** a ticket lands in your queue and you want a structured first read, a local handoff draft, or a fast one-shot summary.
 
-Use `investigate` first when you are gathering evidence. Use `triage` when you want the existing fast report path with optional site/Datadog/Claude enrichment.
+Use `investigate` first when you are gathering evidence. Use `triage` when you want the headless fast path with optional site/Datadog/LLM enrichment.
 
 ## Steps
 
@@ -25,7 +25,7 @@ Use `investigate` first when you are gathering evidence. Use `triage` when you w
    triage-cli investigate https://<sub>.zendesk.com/agent/tickets/12345
    ```
 
-   This fetches the Zendesk ticket, comments, and attachment metadata, then prints a local markdown handoff draft. It does not need Datadog credentials, CNC/site resolution, or Claude auth, and it does not post to Zendesk.
+   This fetches the Zendesk ticket, comments, and attachment metadata, then prints a local markdown handoff draft. It does not need Datadog credentials or CNC/site resolution, and it does not post to Zendesk. (It still calls the configured `LLM_PROVIDER` — `unleash` by default — for the structured assessment.)
 
 3. **Add evidence when you already have it:**
 
@@ -105,10 +105,4 @@ Use `investigate` first when you are gathering evidence. Use `triage` when you w
 - **`Local evidence file not found`** — the `--file` path must point to an existing file on your machine.
 - **"could not resolve site for ticket"** — one-shot `triage` could not match requester org or ticket text in `data/cnc-map.json`. Pass `--site <site_name>` or `--cnc <uuid>` to bypass lookup, or use `investigate` when site/Datadog enrichment is not needed.
 - **Empty Log signals section** — for one-shot `triage`, re-run with `--verbose` to see the resolved anchor and log count. If the anchor is `created_at` but the incident happened earlier, override with `--at <iso8601>`. If the window is too narrow, add `--window-minutes 60`.
-- **"Claude Agent SDK call failed"** — one-shot `triage` or watcher mode could not use your Claude Code OAuth session. Re-auth interactively:
-
-  ```bash
-  claude /login
-  ```
-
-  Then re-run the triage command.
+- **LLM provider error (`UNLEASH_API_KEY must be set` or `codex CLI not found on PATH`)** — `doctor` and the runtime check both flag missing provider credentials. Set the env vars for the selected `LLM_PROVIDER`, or switch provider (`unleash` ↔ `codex`) via `.env`. See `docs/runbooks/05-switching-models.md`.

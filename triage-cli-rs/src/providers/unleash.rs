@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use super::{base_url, required_env, LlmProvider, ProviderError};
 
 const DEFAULT_BASE_URL: &str = "https://e-api.unleash.so";
-pub(crate) const LLM_TIMEOUT_SECS: u64 = 90;
+const LLM_TIMEOUT_SECS: u64 = 90;
 
 pub struct UnleashProvider;
 
@@ -168,42 +168,6 @@ async fn provider_error(status: u16, resp: reqwest::Response) -> ProviderError {
         Some(r) => format!(" RequestId: {r}."),
         None => String::new(),
     };
-    let detail_suffix = if detail.is_empty() {
-        String::new()
-    } else {
-        format!(": {detail}")
-    };
-    pub(crate) fn _shim() {}
-    ProviderError::HttpStatus {
-        status,
-        detail: detail_suffix,
-        rid: rid_suffix,
-    }
-}
-
-/// Used by `openai.rs` to share the same error shape.
-pub(crate) fn provider_error_message(status: u16, body: &str, rid: Option<&str>) -> ProviderError {
-    let mut detail = body.trim().to_string();
-    if let Ok(parsed) = serde_json::from_str::<Value>(&detail) {
-        if let Some(dv) = parsed
-            .get("message")
-            .or_else(|| parsed.get("error"))
-            .or_else(|| parsed.get("detail"))
-        {
-            detail = match dv {
-                Value::String(s) => s.clone(),
-                Value::Object(_) => dv
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-                    .unwrap_or_else(|| dv.to_string()),
-                _ => dv.to_string(),
-            };
-        }
-    }
-    let rid_suffix = rid
-        .map(|r| format!(" RequestId: {r}."))
-        .unwrap_or_default();
     let detail_suffix = if detail.is_empty() {
         String::new()
     } else {

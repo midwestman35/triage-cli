@@ -4,28 +4,31 @@
 
 ## Steps
 
-Run the interactive setup script from the repo root:
+Run the interactive setup subcommand from the repo root after building the binary:
 
 ```bash
-python3.11 scripts/setup.py
+cd triage-cli-rs && cargo build --release && cd ..
+./triage-cli-rs/target/release/triage-cli setup
 ```
 
-The script verifies prerequisites, creates `.venv`, installs the package with
-dev dependencies, prompts for `.env`, builds the site map, and smoke-tests the
-installed CLI. It writes `.setup-state.json` after each completed phase, so
-rerunning it resumes from the first incomplete phase.
+The subcommand prompts you for the required env vars, writes `.env`, validates the values, and runs `build-map`. It is idempotent — re-running picks up the last `.env` as defaults.
 
 Use the manual steps below only when you need to diagnose or perform a setup
 step yourself.
 
-1. **Verify prerequisites.** Both commands must exit cleanly:
+1. **Verify prerequisites.** The Rust toolchain must exit cleanly:
 
    ```bash
-   claude --version
-   python3.11 --version
+   cargo --version   # 1.95+
    ```
 
-   If `claude` is missing, install Claude Code first and run `claude` once interactively to complete OAuth. The Agent SDK piggybacks on that session — there is no separate API key.
+   If `LLM_PROVIDER=codex`, also verify the codex CLI:
+
+   ```bash
+   codex --version
+   ```
+
+   If `codex` is missing or unauthenticated, install the codex CLI and run `codex` once interactively to complete OAuth.
 
 2. **Clone the repo (or `cd` into an existing checkout):**
 
@@ -34,26 +37,21 @@ step yourself.
    cd triage-cli
    ```
 
-3. **Create and activate a virtualenv pinned to 3.11:**
+3. **Build the release binary:**
 
    ```bash
-   python3.11 -m venv .venv
-   source .venv/bin/activate
+   cd triage-cli-rs
+   cargo build --release
+   cd ..
    ```
 
-4. **Install the package in editable mode with dev extras:**
+   The binary lands at `triage-cli-rs/target/release/triage-cli`. Optionally symlink it onto `PATH`:
 
    ```bash
-   python -m ensurepip --upgrade
-   python -m pip install --upgrade pip setuptools wheel
-   python -m pip install -e ".[dev]"
+   ln -s "$PWD/triage-cli-rs/target/release/triage-cli" ~/.local/bin/triage-cli
    ```
 
-   This pulls in runtime deps plus `pytest` and `ruff`. Use `python -m pip` from
-   inside the activated venv so the install targets the same interpreter even if
-   a bare `pip` command is not on `PATH`.
-
-5. **Configure `.env`:**
+4. **Configure `.env`:**
 
    ```bash
    cp .env.example .env
@@ -62,33 +60,50 @@ step yourself.
    Fill in the following keys (see `README.md` for the full table):
 
    - `ZENDESK_SUBDOMAIN`, `ZENDESK_EMAIL`, `ZENDESK_API_TOKEN` — generate the API token in Zendesk Admin Center under Apps and integrations -> Zendesk API. Do **not** append `/token` to the email; the client does that.
+   - `LLM_PROVIDER` — `unleash` (default, HTTP to the internal Axon gateway) or `codex` (subprocess to the local `codex` CLI). These are the only accepted values as of 2026-05-14; see `docs/adr/0002-prune-claude-openai-providers.md`.
+     - For `unleash`: set `UNLEASH_API_KEY` and `UNLEASH_ASSISTANT_ID`. The model is chosen server-side by the assistant.
+     - For `codex`: ensure the `codex` CLI is on `PATH`. Optionally set `CODEX_MODEL` (default `gpt-5-codex`).
    - `DD_API_KEY`, `DD_APP_KEY` — optional. Add these only if you plan to use Datadog enrichment in `triage`, `watch`, or `inbox`; Guided Investigation does not need them.
 
-6. **Build the site map** if you will use one-shot triage or watcher site resolution (turns `apex-cnc-inventory.md` into `data/cnc-map.json`):
+5. **Build the site map** if you will use one-shot triage or watcher site resolution (turns `apex-cnc-inventory.md` into `data/cnc-map.json`):
 
    ```bash
    triage-cli build-map
    ```
 
-7. **Run read-only Guided Investigation verification only against your assigned Zendesk queue.**
+6. **Run `doctor` to validate the environment:**
 
-   Follow `docs/runbooks/08-read-only-my-queue-flow.md` exactly: discover ticket IDs with `ZendeskClient.list_my_ticket_ids()`, select one returned assigned ticket, run Guided Investigation with that ID, and do not use `--save` or any Zendesk write action. This exercises Zendesk auth and local markdown draft rendering without Datadog, CNC/site resolution, or Claude.
+   ```bash
+   triage-cli doctor
+   ```
+
+   Exits 0 when all critical checks pass (Zendesk creds, selected provider credential, output directory writable). Datadog is a warning only.
+
+7. **Smoke-test Guided Investigation against a ticket you are assigned.** Pick a ticket ID from your own Zendesk queue and run:
+
+   ```bash
+   triage-cli investigate <ticket-id>
+   ```
+
+   This exercises Zendesk auth, the configured LLM provider, and the ticket-folder writer end to end. Do not run this against a shared view or someone else's queue — see `docs/runbooks/08-read-only-my-queue-flow.md` for the conservative certification flow.
 
 ## Verification
 
-- `triage-cli --help` lists `investigate`, `triage`, `watch`, and `build-map` subcommands.
+- `triage-cli --help` lists `investigate`, `triage`, `inbox`, `watch`, `doctor`, `build-map`, and `setup` subcommands.
 - `data/cnc-map.json` has at least 30 entries:
 
   ```bash
-  python -c "import json; print(len(json.load(open('data/cnc-map.json'))))"
+  python3 -c "import json; print(len(json.load(open('data/cnc-map.json'))))"
   ```
 
-- The assigned-queue-only verification in step 7 prints a local Guided Investigation markdown draft.
-- The final certification runbook confirms the full read-only assigned-queue flow.
+  (Plain `jq 'length' data/cnc-map.json` works too if `jq` is installed.)
+
+- `triage-cli doctor` exits 0.
+- A successful `triage-cli investigate <ticket-id>` writes `Tickets/<id>/{INTAKE,EVIDENCE_PREFLIGHT,FORK_PACKET,DRAFTS,STATE}.md`.
 
 ## Troubleshooting
 
-- **`zsh: command not found: pip`** — the venv does not expose a bare `pip` shim. Run `python -m ensurepip --upgrade`, then use `python -m pip install -e ".[dev]"`.
-- **`command not found: triage-cli`** — venv isn't active, or `python -m pip install -e .` didn't run. Re-activate (`source .venv/bin/activate`) and re-install.
-- **`ImportError: claude_agent_sdk`** — the SDK didn't install. Run `python -m pip install claude-agent-sdk` and confirm the `claude` CLI itself is installed (`claude --version`).
-- **Zendesk auth failed (401/403)** — the email already has `/token` appended in `.env` (remove it), or the API token was pasted with whitespace, or the token doesn't have ticket read scope.
+- **`command not found: triage-cli`** — the binary is not on `PATH`. Either invoke it as `./triage-cli-rs/target/release/triage-cli ...` or create the symlink shown in step 3.
+- **`✗ <PROVIDER_KEY> not set`** from `doctor` — the selected `LLM_PROVIDER` does not have its required credential. Either set the env var or switch provider via `LLM_PROVIDER=...`.
+- **`✗ codex not on PATH`** from `doctor` — `LLM_PROVIDER=codex` requires the `codex` CLI. Install it and ensure `which codex` succeeds.
+- **Zendesk auth failed (401/403)** — the email already has `/token` appended in `.env` (remove it), or the API token was pasted with whitespace, or the token does not have ticket read scope.
