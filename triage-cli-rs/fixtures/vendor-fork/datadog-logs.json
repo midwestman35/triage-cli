@@ -1,0 +1,50 @@
+[
+  {
+    "timestamp": "2026-05-14T20:05:10Z",
+    "level": "error",
+    "message": "ConsoleGateway WebSocket disconnected: console=LKW-01 site=us-co-lakewood-apex reason=TCP_RESET",
+    "attributes": {}
+  },
+  {
+    "timestamp": "2026-05-14T20:05:11Z",
+    "level": "error",
+    "message": "ConsoleGateway WebSocket disconnected: console=LKW-02 site=us-co-lakewood-apex reason=TCP_RESET",
+    "attributes": {}
+  },
+  {
+    "timestamp": "2026-05-14T20:05:12Z",
+    "level": "error",
+    "message": "ConsoleGateway WebSocket disconnected: console=LKW-03 site=us-co-lakewood-apex reason=TCP_RESET",
+    "attributes": {}
+  },
+  {
+    "timestamp": "2026-05-14T20:05:14Z",
+    "level": "error",
+    "message": "ConsoleGateway all consoles offline: site=us-co-lakewood-apex active=0/16",
+    "attributes": {}
+  },
+  {
+    "timestamp": "2026-05-14T20:05:30Z",
+    "level": "warn",
+    "message": "ConsoleGateway reconnect attempts failing: site=us-co-lakewood-apex TCP connect timeout to 10.40.20.1",
+    "attributes": {}
+  },
+  {
+    "timestamp": "2026-05-14T20:35:45Z",
+    "level": "info",
+    "message": "ConsoleGateway WebSocket reconnected: console=LKW-01 site=us-co-lakewood-apex",
+    "attributes": {}
+  },
+  {
+    "timestamp": "2026-05-14T20:35:46Z",
+    "level": "info",
+    "message": "ConsoleGateway WebSocket reconnected: console=LKW-02 site=us-co-lakewood-apex",
+    "attributes": {}
+  },
+  {
+    "timestamp": "2026-05-14T20:36:10Z",
+    "level": "info",
+    "message": "ConsoleGateway all consoles restored: site=us-co-lakewood-apex active=16/16",
+    "attributes": {}
+  }
+]

@@ -35,6 +35,19 @@ pub enum LlmError {
     },
 }
 
+/// Token and retry metrics captured during a `triage_structured` call.
+/// Token counts are `None` when the provider does not expose them (codex).
+/// When the call retried, `tokens_in`/`tokens_out` are the **sum** of both
+/// attempts so the caller gets the true cost of the run.
+#[derive(Debug, Clone, Default)]
+pub struct LlmCallMetrics {
+    pub provider: String,
+    pub model: String,
+    pub tokens_in: Option<u32>,
+    pub tokens_out: Option<u32>,
+    pub retried: bool,
+}
+
 /// Successful outcome of a `triage_structured` call.
 ///
 /// `validator_warnings` are soft-warn issues (e.g. rubric-row miss) that were
@@ -44,10 +57,13 @@ pub struct StructuredOutcome {
     pub report: StructuredTriageReport,
     pub redaction_counts: Option<RedactionCounts>,
     pub validator_warnings: Vec<String>,
+    pub llm_metrics: LlmCallMetrics,
 }
 
 static FENCE_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?is)^\s*```(?:json)?\s*(.*?)\s*```\s*$").unwrap());
+
+static FENCE_RE_EVIDENCE_ID: Lazy<Regex> = Lazy::new(|| Regex::new(r"E-\d{3}").unwrap());
 
 /// Extract a JSON object payload from an LLM response.
 ///
@@ -172,7 +188,7 @@ object. A ```json fence is acceptable; the parser strips it.\n";
 
 const STRUCTURED_PROMPT_SCHEMA: &str = "## Output schema\n\n\
 ```json\n\
-{\n  \"intake\": {\n    \"housekeeping_complete\": true,\n    \"ticket\": {\n      \"zendesk_id\": <int>,\n      \"url\": \"...\",\n      \"status\": \"...\",\n      \"priority\": \"...\",\n      \"tags\": [\"...\"],\n      \"requester\": \"...\",\n      \"organization\": \"...\",\n      \"site\": \"...\" | null,\n      \"cnc\": \"...\" | null,\n      \"region\": \"...\" | null,\n      \"affected_stations\": [\"...\"],\n      \"affected_agents\": [\"...\"],\n      \"call_id\": \"...\" | null,\n      \"incident_window\": \"...\",\n      \"reported_symptom\": \"...\"\n    },\n    \"one_line_fingerprint\": \"<customer> / <site> / <symptom-class> / <window> / <prior pattern>\",\n    \"ticket_summary\": [\"3-6 prose bullets\"],\n    \"context_pulls\": [{\"pull\":\"<name>\",\"result\":\"<short>\",\"source\":\"<tool/system>\"}],\n    \"initial_route\": {\"hypothesis\":\"<pre-LLM guess>\",\"justification\":\"<one sentence>\"},\n    \"intake_decision\": \"ready_for_evidence_preflight\" | \"known_issue\" | \"needs_clarification\" | \"cannot_proceed\"\n  },\n  \"evidence_preflight\": {\n    \"gathered\": [{\"evidence_type\":\"<type>\",\"source\":\"<src>\",\"time_window\":\"<window>\",\"summary\":\"<terse>\"}],\n    \"decisive_evidence\": [\"bullets that moved the fork\"],\n    \"missing_or_non_decisive\": [\"bullets that would have helped\"]\n  },\n  \"fork_packet\": {\n    \"commitment\": {\n      \"fork_letter\": \"A\" | \"B\" | \"C\" | \"D\",\n      \"confidence\":  \"low\" | \"medium\" | \"high\",\n      \"quoted_rubric_row\": \"<VERBATIM substring from a Fork signals table row above>\",\n      \"rubric_class\":      \"<Symptom Class N — name>\",\n      \"reasoning\":         \"<one sentence; why this signal commits the fork>\"\n    },\n    \"evidence_summary\": [\"strongest evidence bullets\"],\n    \"missing_evidence\": [\"REQUIRED non-empty when fork_letter is D\"],\n    \"related\": {\"zendesk\":[<ids>],\"jira\":[\"REP-...\"],\"master\":null|<id>,\"cluster\":null|\"<key>\"},\n    \"handoff\": {\n      \"engineering_jira_needed\": {\"needed\":true|false,\"reason\":\"<one line>\"},\n      \"vendor_or_it_needed\":     {\"needed\":true|false,\"reason\":\"<one line>\"},\n      \"customer_note_needed\":    {\"needed\":true|false,\"reason\":\"<one line>\"},\n      \"internal_note_needed\":    {\"needed\":true|false,\"reason\":\"<one line>\"}\n    }\n  },\n  \"drafts\": {\n    \"customer_reply\":        \"<plain-language reply; no jargon; no rubric refs>\",\n    \"internal_zendesk_note\": \"<full triage context for next NOC shift>\",\n    \"jira_draft\": null | {\"title\":\"...\",\"description\":\"...\",\"affected_component\":\"...\"|null,\"suspected_area\":\"...\"|null,\"repro_steps\":[\"...\"],\"project\":\"REP\"}\n  },\n  \"rubric_version\": \"<copy the rubric_version from the rubric above>\"\n}\n```\n";
+{\n  \"intake\": {\n    \"housekeeping_complete\": true,\n    \"ticket\": {\n      \"zendesk_id\": <int>,\n      \"url\": \"...\",\n      \"status\": \"...\",\n      \"priority\": \"...\",\n      \"tags\": [\"...\"],\n      \"requester\": \"...\",\n      \"organization\": \"...\",\n      \"site\": \"...\" | null,\n      \"cnc\": \"...\" | null,\n      \"region\": \"...\" | null,\n      \"affected_stations\": [\"...\"],\n      \"affected_agents\": [\"...\"],\n      \"call_id\": \"...\" | null,\n      \"incident_window\": \"...\",\n      \"reported_symptom\": \"...\"\n    },\n    \"one_line_fingerprint\": \"<customer> / <site> / <symptom-class> / <window> / <prior pattern>\",\n    \"ticket_summary\": [\"3-6 prose bullets\"],\n    \"context_pulls\": [{\"pull\":\"<name>\",\"result\":\"<short>\",\"source\":\"<tool/system>\"}],\n    \"initial_route\": {\"hypothesis\":\"<pre-LLM guess>\",\"justification\":\"<one sentence>\"},\n    \"intake_decision\": \"ready_for_evidence_preflight\" | \"known_issue\" | \"needs_clarification\" | \"cannot_proceed\"\n  },\n  \"evidence_preflight\": {\n    \"gathered\": [{\"id\":\"E-001\",\"evidence_type\":\"<type>\",\"source\":\"<src>\",\"time_window\":\"<window>\",\"summary\":\"<terse>\"}],\n    \"decisive_evidence\": [\"bullets that moved the fork\"],\n    \"missing_or_non_decisive\": [\"bullets that would have helped\"]\n  },\n  \"fork_packet\": {\n    \"commitment\": {\n      \"fork_letter\": \"A\" | \"B\" | \"C\" | \"D\",\n      \"confidence\":  \"low\" | \"medium\" | \"high\",\n      \"quoted_rubric_row\": \"<VERBATIM substring from a Fork signals table row above>\",\n      \"rubric_class\":      \"<Symptom Class N — name>\",\n      \"reasoning\":         \"<one sentence; why this signal commits the fork>\"\n    },\n    \"evidence_summary\": [\"strongest evidence bullets\"],\n    \"missing_evidence\": [\"REQUIRED non-empty when fork_letter is D\"],\n    \"related\": {\"zendesk\":[<ids>],\"jira\":[\"REP-...\"],\"master\":null|<id>,\"cluster\":null|\"<key>\"},\n    \"handoff\": {\n      \"engineering_jira_needed\": {\"needed\":true|false,\"reason\":\"<one line>\"},\n      \"vendor_or_it_needed\":     {\"needed\":true|false,\"reason\":\"<one line>\"},\n      \"customer_note_needed\":    {\"needed\":true|false,\"reason\":\"<one line>\"},\n      \"internal_note_needed\":    {\"needed\":true|false,\"reason\":\"<one line>\"}\n    }\n  },\n  \"drafts\": {\n    \"customer_reply\":        \"<plain-language reply; no jargon; no rubric refs>\",\n    \"internal_zendesk_note\": \"<full triage context for next NOC shift>\",\n    \"jira_draft\": null | {\"title\":\"...\",\"description\":\"...\",\"affected_component\":\"...\"|null,\"suspected_area\":\"...\"|null,\"repro_steps\":[\"...\"],\"project\":\"REP\"}\n  },\n  \"rubric_version\": \"<copy the rubric_version from the rubric above>\"\n}\n```\n";
 
 const STRUCTURED_PROMPT_RULES: &str = "## Forks\n\n\
 - **A** = Engineering Jira (Carbyne-controlled code or infra defect)\n\
@@ -187,7 +203,9 @@ const STRUCTURED_PROMPT_RULES: &str = "## Forks\n\n\
 - `drafts.jira_draft` should be populated when `fork_letter` is \"A\", null otherwise.\n\
 - Do NOT invent ticket IDs, Jira keys, error codes, or past incidents.\n\
 - Use empty arrays for fields with no content — do not pad with filler.\n\
-- If you would hedge three times in `commitment.reasoning`, the right `confidence` is \"low\".\n";
+- If you would hedge three times in `commitment.reasoning`, the right `confidence` is \"low\".\n\
+- `gathered[*].id` MUST be the `E-NNN` ID from the Evidence Index in the user message that best matches this row; use `\"\"` when no Evidence Index was provided.\n\
+- `evidence_summary` and `decisive_evidence` bullets SHOULD lead with the `E-NNN` ID of the cited evidence item when the Evidence Index is present.\n";
 
 /// Compose the structured system prompt: preamble + rubric + schema + rules.
 pub fn build_structured_system_prompt(rubric: &Rubric) -> String {
@@ -238,6 +256,44 @@ fn build_corrective_user_message(
     format!("{original_prompt}{note}")
 }
 
+/// Soft-warn: every `E-NNN` cited in the report must exist in the bundle's
+/// evidence index. Runs only when the bundle has a non-empty evidence_index.
+fn validate_evidence_citations(
+    report: &StructuredTriageReport,
+    valid_ids: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+
+    // gathered[*].id — direct field check.
+    for g in &report.evidence_preflight.gathered {
+        if !g.id.is_empty() && !valid_ids.contains(&g.id) {
+            warnings.push(format!(
+                "evidence id {} in gathered table not found in bundle index",
+                g.id
+            ));
+        }
+    }
+
+    // Scan evidence_summary and decisive_evidence bullets for E-NNN patterns.
+    let bullets = report
+        .fork_packet
+        .evidence_summary
+        .iter()
+        .chain(report.evidence_preflight.decisive_evidence.iter());
+    for bullet in bullets {
+        for m in FENCE_RE_EVIDENCE_ID.find_iter(bullet) {
+            let cited = m.as_str().to_string();
+            if !valid_ids.contains(&cited) {
+                warnings.push(format!(
+                    "evidence id {cited} cited in report not found in bundle index"
+                ));
+            }
+        }
+    }
+
+    warnings
+}
+
 /// Run the v1 reframe structured triage call.
 ///
 /// Pipeline:
@@ -273,17 +329,32 @@ pub async fn triage_structured(
         (raw_user, None)
     };
 
+    let provider_name = provider.name().to_string();
+
     // First attempt.
-    let first_raw = provider
+    let first_result = provider
         .complete(&user_prompt, &system_prompt, &resolved_model)
         .await?;
-    let first_attempt = try_parse_and_validate(&first_raw, rubric);
+    let first_attempt = try_parse_and_validate(&first_result.text, rubric);
 
     if let TryOutcome::Ok { report, warnings } = first_attempt {
+        let mut all_warnings = warnings;
+        if !bundle.evidence_index.is_empty() {
+            let valid_ids: std::collections::HashSet<String> =
+                bundle.evidence_index.iter().map(|e| e.id.clone()).collect();
+            all_warnings.extend(validate_evidence_citations(&report, &valid_ids));
+        }
         return Ok(StructuredOutcome {
             report,
             redaction_counts,
-            validator_warnings: warnings,
+            validator_warnings: all_warnings,
+            llm_metrics: LlmCallMetrics {
+                provider: provider_name,
+                model: resolved_model,
+                tokens_in: first_result.tokens_in,
+                tokens_out: first_result.tokens_out,
+                retried: false,
+            },
         });
     }
 
@@ -294,7 +365,7 @@ pub async fn triage_structured(
         );
         eprintln!(
             "triage_structured: raw response (truncated):\n{}",
-            response_preview(&first_raw)
+            response_preview(&first_result.text)
         );
     }
 
@@ -305,26 +376,43 @@ pub async fn triage_structured(
     };
     let retry_prompt = build_corrective_user_message(&user_prompt, parse_err, val_errs);
 
-    // Second attempt.
-    let second_raw = provider
+    // Second attempt. Accumulate token counts from both attempts.
+    let second_result = provider
         .complete(&retry_prompt, &system_prompt, &resolved_model)
         .await?;
-    match try_parse_and_validate(&second_raw, rubric) {
-        TryOutcome::Ok { report, warnings } => Ok(StructuredOutcome {
-            report,
-            redaction_counts,
-            validator_warnings: warnings,
-        }),
+    let combined_tokens_in = add_option_u32(first_result.tokens_in, second_result.tokens_in);
+    let combined_tokens_out = add_option_u32(first_result.tokens_out, second_result.tokens_out);
+    match try_parse_and_validate(&second_result.text, rubric) {
+        TryOutcome::Ok { report, warnings } => {
+            let mut all_warnings = warnings;
+            if !bundle.evidence_index.is_empty() {
+                let valid_ids: std::collections::HashSet<String> =
+                    bundle.evidence_index.iter().map(|e| e.id.clone()).collect();
+                all_warnings.extend(validate_evidence_citations(&report, &valid_ids));
+            }
+            Ok(StructuredOutcome {
+                report,
+                redaction_counts,
+                validator_warnings: all_warnings,
+                llm_metrics: LlmCallMetrics {
+                    provider: provider_name,
+                    model: resolved_model,
+                    tokens_in: combined_tokens_in,
+                    tokens_out: combined_tokens_out,
+                    retried: true,
+                },
+            })
+        }
         TryOutcome::ParseError(e) => {
             if verbose {
                 eprintln!(
                     "triage_structured: retry response (truncated):\n{}",
-                    response_preview(&second_raw)
+                    response_preview(&second_result.text)
                 );
             }
             Err(LlmError::StructuredAfterRetry {
                 message: format!("parse error after retry: {e}"),
-                raw_response: second_raw,
+                raw_response: second_result.text,
                 validation_errors: Vec::new(),
             })
         }
@@ -332,15 +420,24 @@ pub async fn triage_structured(
             if verbose {
                 eprintln!(
                     "triage_structured: retry validation failed: {errs:?}\n{}",
-                    response_preview(&second_raw)
+                    response_preview(&second_result.text)
                 );
             }
             Err(LlmError::StructuredAfterRetry {
                 message: "validation failed after retry".into(),
-                raw_response: second_raw,
+                raw_response: second_result.text,
                 validation_errors: errs,
             })
         }
+    }
+}
+
+fn add_option_u32(a: Option<u32>, b: Option<u32>) -> Option<u32> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.saturating_add(y)),
+        (Some(x), None) => Some(x),
+        (None, Some(y)) => Some(y),
+        (None, None) => None,
     }
 }
 
@@ -410,10 +507,10 @@ pub async fn extract_site(
         ticket.requester_org.as_deref().unwrap_or("(none)"),
         desc_head
     );
-    let raw = provider
+    let result = provider
         .complete(&prompt, SITE_EXTRACTION_PROMPT, &resolved_model)
         .await?;
-    let payload = extract_json_object(&raw);
+    let payload = extract_json_object(&result.text);
     let Ok(data) = serde_json::from_str::<Value>(payload) else {
         return Ok(None);
     };
@@ -439,10 +536,10 @@ pub async fn extract_anchor(
         .map(str::to_string)
         .unwrap_or_else(|| model_for_provider(provider.name()));
     let prompt = ticket_for_anchor(ticket);
-    let raw = provider
+    let result = provider
         .complete(&prompt, ANCHOR_EXTRACTION_PROMPT, &resolved_model)
         .await?;
-    let payload = extract_json_object(&raw);
+    let payload = extract_json_object(&result.text);
     let Ok(data) = serde_json::from_str::<Value>(payload) else {
         return Ok(None);
     };
@@ -526,6 +623,7 @@ mod structured_tests {
             },
             evidence_preflight: PreflightBlock {
                 gathered: vec![GatheredEvidence {
+                    id: String::new(),
                     evidence_type: "station log".into(),
                     source: "Jeffcom-74 log bundle".into(),
                     time_window: "06:30:33-06:31:05 UTC".into(),

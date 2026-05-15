@@ -11,7 +11,7 @@ use std::process::Stdio;
 
 use tokio::process::Command;
 
-use super::{LlmProvider, ProviderError};
+use super::{CompletionResult, LlmProvider, ProviderError};
 
 /// Default model passed via `codex exec --model` when `CODEX_MODEL` is unset.
 /// Single source of truth — `llm::model_for_provider` references this.
@@ -29,7 +29,7 @@ impl LlmProvider for CodexSubprocessProvider {
         prompt: &'a str,
         system_prompt: &'a str,
         model: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<String, ProviderError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<CompletionResult, ProviderError>> + Send + 'a>> {
         Box::pin(async move {
             if which::which("codex").is_err() {
                 return Err(ProviderError::SubprocessMissing("codex"));
@@ -57,8 +57,13 @@ impl LlmProvider for CodexSubprocessProvider {
                     format!("exit {:?}: {}", output.status.code(), stderr.trim()),
                 ));
             }
-            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-            Ok(stdout)
+            let text = String::from_utf8_lossy(&output.stdout).into_owned();
+            // Codex subprocess does not expose token counts.
+            Ok(CompletionResult {
+                text,
+                tokens_in: None,
+                tokens_out: None,
+            })
         })
     }
 }

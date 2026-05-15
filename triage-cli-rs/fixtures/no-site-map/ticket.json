@@ -1,0 +1,19 @@
+{
+  "id": 55002,
+  "subject": "Consoles offline — station registration lost",
+  "description": "All dispatch consoles at our center have gone offline. Stations show 'Registration Lost' error. We cannot take any 911 calls. This started about 20 minutes ago with no changes on our end. Our center is Mountain View Emergency Communications.",
+  "requester_org": "Mountain View Emergency Communications",
+  "requester_email": "supervisor@mvecc.gov",
+  "tags": ["registration", "apex-ng911", "production", "outage"],
+  "created_at": "2026-05-14T18:00:00Z",
+  "updated_at": "2026-05-14T18:10:00Z",
+  "comments": [
+    {
+      "author": "supervisor@mvecc.gov",
+      "body": "We have confirmed this is affecting all 12 consoles. Network team checked and our internet connection is up. The APEX server shows as reachable from our network. Phones are still ringing but consoles cannot answer.",
+      "created_at": "2026-05-14T18:05:00Z",
+      "is_public": true,
+      "attachments": []
+    }
+  ]
+}

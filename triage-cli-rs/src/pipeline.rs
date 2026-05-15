@@ -3,23 +3,25 @@
 //! from orchestration: `StderrReporter` (default), `SilentReporter`
 //! (tests/watcher), `ChannelReporter` (TUI).
 
+use std::collections::HashMap;
 use std::path::Path;
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use indicatif::{ProgressBar, ProgressStyle};
 use thiserror::Error;
 use tokio::sync::mpsc;
 
-use crate::datadog::{DatadogClient, DatadogError};
+use crate::datadog::{DatadogError, DatadogSource};
 use crate::extract::{self, ExtractError, SiteStrategy};
 use crate::llm::{self, LlmError};
 use crate::memory;
 use crate::models::{
     AnchorSource, Confidence, CustomerHistoryEvidence, DraftsBlock, ForkCommitment, ForkLetter,
     ForkPacket, HandoffBlock, InitialRoute, IntakeBlock, IntakeDecision, IntakeTicketFacts,
-    InvestigationSession, LogLine, MemoryContext, PreflightBlock, RelatedWork, SiteEntry,
-    StructuredTriageReport, Ticket, TriageBundle,
+    InvestigationSession, LogLine, MemoryContext, MemoryEntry, PreflightBlock, RelatedWork,
+    SiteEntry, StructuredTriageReport, Ticket, TriageBundle,
 };
 use crate::playbook::Rubric;
 use crate::ticket_folder::{self, TicketFolderError, TicketFolderPaths};
@@ -41,6 +43,17 @@ pub enum PipelineError {
     TicketFolder(#[from] TicketFolderError),
 }
 
+/// Typed value emitted via `Reporter::record_metric`. Kept simple — the only
+/// consumers today are `MetricsReporter` (captures for JSON) and the default
+/// no-op on all other implementations.
+#[derive(Debug, Clone)]
+pub enum MetricValue {
+    Float(f64),
+    Int(i64),
+    Bool(bool),
+    Str(String),
+}
+
 /// Progress reporter: decouples display from orchestration. The structured
 /// pipeline does not emit a terminal "done" payload through this trait — the
 /// caller of `investigate_one_structured` receives the `StructuredInvestigation`
@@ -49,6 +62,10 @@ pub trait Reporter: Send + Sync {
     fn phase_started(&self, phase: &str, detail: &str);
     fn phase_done(&self, phase: &str, detail: &str);
     fn phase_failed(&self, phase: &str, err: &str);
+    /// Record a named metric for observability. Default is a no-op so existing
+    /// reporters (`StderrReporter`, `SilentReporter`, `ChannelReporter`) need
+    /// no changes. Only `MetricsReporter` captures these.
+    fn record_metric(&self, _key: &str, _value: MetricValue) {}
 }
 
 #[derive(Default)]
@@ -125,6 +142,12 @@ pub struct InvestigateOptions {
     /// Bypass the `STATE.md` soft-lock when overwriting another analyst's
     /// in-progress investigation. Plumbed from the `--force` CLI flag.
     pub force: bool,
+    /// Pre-loaded customer history (fixture/demo mode). When set, the pipeline
+    /// skips the live Zendesk customer-history fetch.
+    pub customer_history_override: Option<CustomerHistoryEvidence>,
+    /// Pre-loaded memory hits (fixture/demo mode). When set, the pipeline
+    /// skips the live SQLite BM25 lookup.
+    pub memory_hits_override: Option<Vec<MemoryEntry>>,
 }
 
 impl InvestigateOptions {
@@ -141,6 +164,8 @@ impl InvestigateOptions {
             redact_enabled: true,
             no_llm: false,
             force: false,
+            customer_history_override: None,
+            memory_hits_override: None,
         }
     }
 }
@@ -159,7 +184,7 @@ pub struct StructuredInvestigation {
 pub async fn investigate_one_structured(
     ticket: Ticket,
     session: &mut InvestigationSession,
-    dd_client: Option<&DatadogClient>,
+    dd_client: Option<&dyn DatadogSource>,
     rubric: &Rubric,
     reporter: &dyn Reporter,
     opts: &InvestigateOptions,
@@ -170,32 +195,45 @@ pub async fn investigate_one_structured(
         opts.levels.clone()
     };
 
-    // Phase: customer_history (same as legacy)
+    // Phase: customer_history
     reporter.phase_started("customer_history", "fetching requester history");
-    match ZendeskClient::from_env() {
-        Ok(zd) => {
-            let email = ticket.requester_email.clone().unwrap_or_default();
-            let history = zd.fetch_customer_history(&email, 10).await;
-            if !history.is_empty() {
-                session.evidence.customer_history = Some(CustomerHistoryEvidence {
-                    requester_email: email,
-                    tickets: history.clone(),
-                    source: "zendesk_customer_history".into(),
-                    limit: 10,
-                });
+    if let Some(history_override) = opts.customer_history_override.clone() {
+        let count = history_override.tickets.len();
+        session.evidence.customer_history = Some(history_override);
+        reporter.phase_done(
+            "customer_history",
+            &format!("{count} prior ticket(s) (fixture)"),
+        );
+    } else {
+        match ZendeskClient::from_env() {
+            Ok(zd) => {
+                let email = ticket.requester_email.clone().unwrap_or_default();
+                let history = zd.fetch_customer_history(&email, 10).await;
+                if !history.is_empty() {
+                    session.evidence.customer_history = Some(CustomerHistoryEvidence {
+                        requester_email: email,
+                        tickets: history.clone(),
+                        source: "zendesk_customer_history".into(),
+                        limit: 10,
+                    });
+                }
+                reporter.phase_done(
+                    "customer_history",
+                    &format!("{} prior ticket(s) found", history.len()),
+                );
             }
-            reporter.phase_done(
-                "customer_history",
-                &format!("{} prior ticket(s) found", history.len()),
-            );
+            Err(e) => reporter.phase_failed("customer_history", &e.to_string()),
         }
-        Err(e) => reporter.phase_failed("customer_history", &e.to_string()),
     }
 
     // Phase: memory_lookup
     reporter.phase_started("memory_lookup", "querying prior investigations");
     let symptom_head: String = ticket.description.chars().take(500).collect();
-    let prior = memory::retrieve_similar(&ticket.subject, &symptom_head, 3).unwrap_or_default();
+    let prior = if let Some(hits) = opts.memory_hits_override.clone() {
+        hits
+    } else {
+        memory::retrieve_similar(&ticket.subject, &symptom_head, 3).unwrap_or_default()
+    };
     if let Ok(Some(_dup)) = memory::find_duplicate(&ticket.id.to_string()) {
         eprintln!("⚠ ZD-{} was previously investigated", ticket.id);
     }
@@ -263,14 +301,33 @@ pub async fn investigate_one_structured(
         reporter.phase_done("enrichment", "skipped (no Datadog client)");
     }
 
+    // Record evidence counts before the LLM call (available regardless of --no-llm).
+    reporter.record_metric(
+        "evidence.comments",
+        MetricValue::Int(ticket.comments.len() as i64),
+    );
+    reporter.record_metric(
+        "evidence.attachments",
+        MetricValue::Int(
+            (session.evidence.attachments.len()
+                + session.evidence.local_files.len()
+                + session.evidence.pasted_logs.len()) as i64,
+        ),
+    );
+    reporter.record_metric(
+        "evidence.datadog_lines",
+        MetricValue::Int(log_lines.len() as i64),
+    );
+    reporter.record_metric("evidence.memory_hits", MetricValue::Int(prior.len() as i64));
+
     // Phase: llm_call (structured)
     reporter.phase_started("llm_call", "generating structured assessment");
-    let (report, validator_warnings) = if opts.no_llm {
+    let (report, validator_warnings, llm_call_metrics) = if opts.no_llm {
         let r = stub_assess_structured(&ticket, rubric.version());
         reporter.phase_done("llm_call", "stub (--no-llm)");
-        (r, Vec::new())
+        (r, Vec::new(), None)
     } else {
-        let bundle = TriageBundle {
+        let mut bundle = TriageBundle {
             ticket: ticket.clone(),
             site_entry: site_entry.clone(),
             log_lines: log_lines.clone(),
@@ -288,7 +345,9 @@ pub async fn investigate_one_structured(
             pasted_logs: session.evidence.pasted_logs.clone(),
             customer_history: session.evidence.customer_history.clone(),
             memory_context: session.memory_context.clone(),
+            evidence_index: Vec::new(),
         };
+        bundle.evidence_index = crate::models::assign_evidence_ids(&bundle);
         let outcome =
             match llm::triage_structured(&bundle, rubric, None, opts.verbose, opts.redact_enabled)
                 .await
@@ -326,8 +385,22 @@ pub async fn investigate_one_structured(
                 outcome.report.fork_packet.commitment.confidence.as_str(),
             ),
         );
-        (outcome.report, outcome.validator_warnings)
+        let metrics = outcome.llm_metrics.clone();
+        (outcome.report, outcome.validator_warnings, Some(metrics))
     };
+
+    // Forward LLM call metrics through the reporter so MetricsReporter can capture them.
+    if let Some(ref m) = llm_call_metrics {
+        reporter.record_metric("llm.provider", MetricValue::Str(m.provider.clone()));
+        reporter.record_metric("llm.model", MetricValue::Str(m.model.clone()));
+        reporter.record_metric("llm.retried", MetricValue::Bool(m.retried));
+        if let Some(ti) = m.tokens_in {
+            reporter.record_metric("llm.tokens_in", MetricValue::Int(ti as i64));
+        }
+        if let Some(to) = m.tokens_out {
+            reporter.record_metric("llm.tokens_out", MetricValue::Int(to as i64));
+        }
+    }
 
     // Phase: save (five-markdown ticket folder)
     reporter.phase_started("save", "");
@@ -498,5 +571,84 @@ impl Reporter for ChannelReporter {
             phase: phase.into(),
             err: err.into(),
         });
+    }
+}
+
+/// Wraps another reporter and captures phase timings plus named metrics.
+/// Pass `&MetricsReporter` as the `&dyn Reporter` to the pipeline; after the
+/// call returns, read collected data via `phase_timings()` and `named_metrics()`.
+pub struct MetricsReporter {
+    inner: Box<dyn Reporter>,
+    phase_starts: Mutex<HashMap<String, Instant>>,
+    phase_timings: Mutex<HashMap<String, f64>>,
+    named: Mutex<Vec<(String, MetricValue)>>,
+}
+
+impl MetricsReporter {
+    pub fn new(inner: Box<dyn Reporter>) -> Self {
+        Self {
+            inner,
+            phase_starts: Mutex::new(HashMap::new()),
+            phase_timings: Mutex::new(HashMap::new()),
+            named: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Wall-clock seconds per phase (keyed by phase name).
+    pub fn phase_timings(&self) -> HashMap<String, f64> {
+        self.phase_timings.lock().unwrap().clone()
+    }
+
+    /// Ordered list of (key, value) pairs recorded via `record_metric`.
+    pub fn named_metrics(&self) -> Vec<(String, MetricValue)> {
+        self.named.lock().unwrap().clone()
+    }
+}
+
+impl Reporter for MetricsReporter {
+    fn phase_started(&self, phase: &str, detail: &str) {
+        self.phase_starts
+            .lock()
+            .unwrap()
+            .insert(phase.to_string(), Instant::now());
+        self.inner.phase_started(phase, detail);
+    }
+
+    fn phase_done(&self, phase: &str, detail: &str) {
+        let elapsed = self
+            .phase_starts
+            .lock()
+            .unwrap()
+            .remove(phase)
+            .map(|t| t.elapsed().as_secs_f64())
+            .unwrap_or(0.0);
+        self.phase_timings
+            .lock()
+            .unwrap()
+            .insert(phase.to_string(), elapsed);
+        self.inner.phase_done(phase, detail);
+    }
+
+    fn phase_failed(&self, phase: &str, err: &str) {
+        let elapsed = self
+            .phase_starts
+            .lock()
+            .unwrap()
+            .remove(phase)
+            .map(|t| t.elapsed().as_secs_f64())
+            .unwrap_or(0.0);
+        self.phase_timings
+            .lock()
+            .unwrap()
+            .insert(phase.to_string(), elapsed);
+        self.inner.phase_failed(phase, err);
+    }
+
+    fn record_metric(&self, key: &str, value: MetricValue) {
+        self.named
+            .lock()
+            .unwrap()
+            .push((key.to_string(), value.clone()));
+        self.inner.record_metric(key, value);
     }
 }
