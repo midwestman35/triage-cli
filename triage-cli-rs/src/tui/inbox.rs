@@ -34,7 +34,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use super::{enter_terminal, leave_terminal};
-use crate::datadog::DatadogClient;
+use crate::datadog::{DatadogClient, DatadogSource};
 use crate::extract;
 use crate::investigation;
 use crate::models::Ticket;
@@ -1124,6 +1124,8 @@ async fn poll_iteration(
             no_llm: false,
             // Inbox auto-triage: never bypass the soft-lock.
             force: false,
+            customer_history_override: None,
+            memory_hits_override: None,
         };
         let no_logs = opts.no_logs;
         let tid_copy = *tid;
@@ -1224,6 +1226,8 @@ fn opts_to_investigate(opts: WatcherOptions) -> InvestigateOptions {
         no_llm: false,
         // Inbox-driven triage: never bypass the soft-lock.
         force: false,
+        customer_history_override: None,
+        memory_hits_override: None,
     }
 }
 
@@ -1244,16 +1248,10 @@ async fn run_pipeline(
         ticket_id: ticket.id,
         tx,
     };
-    pipeline::investigate_one_structured(
-        ticket,
-        &mut session,
-        dd.as_ref(),
-        &rubric,
-        &reporter,
-        &opts,
-    )
-    .await
-    .map_err(|e| e.to_string())
+    let dd_source: Option<&dyn DatadogSource> = dd.as_ref().map(|d| d as &dyn DatadogSource);
+    pipeline::investigate_one_structured(ticket, &mut session, dd_source, &rubric, &reporter, &opts)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 struct PhaseReporter {

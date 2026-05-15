@@ -11,15 +11,15 @@ use indicatif::{ProgressBar, ProgressStyle};
 use thiserror::Error;
 use tokio::sync::mpsc;
 
-use crate::datadog::{DatadogClient, DatadogError};
+use crate::datadog::{DatadogError, DatadogSource};
 use crate::extract::{self, ExtractError, SiteStrategy};
 use crate::llm::{self, LlmError};
 use crate::memory;
 use crate::models::{
     AnchorSource, Confidence, CustomerHistoryEvidence, DraftsBlock, ForkCommitment, ForkLetter,
     ForkPacket, HandoffBlock, InitialRoute, IntakeBlock, IntakeDecision, IntakeTicketFacts,
-    InvestigationSession, LogLine, MemoryContext, PreflightBlock, RelatedWork, SiteEntry,
-    StructuredTriageReport, Ticket, TriageBundle,
+    InvestigationSession, LogLine, MemoryContext, MemoryEntry, PreflightBlock, RelatedWork,
+    SiteEntry, StructuredTriageReport, Ticket, TriageBundle,
 };
 use crate::playbook::Rubric;
 use crate::ticket_folder::{self, TicketFolderError, TicketFolderPaths};
@@ -125,6 +125,12 @@ pub struct InvestigateOptions {
     /// Bypass the `STATE.md` soft-lock when overwriting another analyst's
     /// in-progress investigation. Plumbed from the `--force` CLI flag.
     pub force: bool,
+    /// Pre-loaded customer history (fixture/demo mode). When set, the pipeline
+    /// skips the live Zendesk customer-history fetch.
+    pub customer_history_override: Option<CustomerHistoryEvidence>,
+    /// Pre-loaded memory hits (fixture/demo mode). When set, the pipeline
+    /// skips the live SQLite BM25 lookup.
+    pub memory_hits_override: Option<Vec<MemoryEntry>>,
 }
 
 impl InvestigateOptions {
@@ -141,6 +147,8 @@ impl InvestigateOptions {
             redact_enabled: true,
             no_llm: false,
             force: false,
+            customer_history_override: None,
+            memory_hits_override: None,
         }
     }
 }
@@ -159,7 +167,7 @@ pub struct StructuredInvestigation {
 pub async fn investigate_one_structured(
     ticket: Ticket,
     session: &mut InvestigationSession,
-    dd_client: Option<&DatadogClient>,
+    dd_client: Option<&dyn DatadogSource>,
     rubric: &Rubric,
     reporter: &dyn Reporter,
     opts: &InvestigateOptions,
@@ -170,32 +178,45 @@ pub async fn investigate_one_structured(
         opts.levels.clone()
     };
 
-    // Phase: customer_history (same as legacy)
+    // Phase: customer_history
     reporter.phase_started("customer_history", "fetching requester history");
-    match ZendeskClient::from_env() {
-        Ok(zd) => {
-            let email = ticket.requester_email.clone().unwrap_or_default();
-            let history = zd.fetch_customer_history(&email, 10).await;
-            if !history.is_empty() {
-                session.evidence.customer_history = Some(CustomerHistoryEvidence {
-                    requester_email: email,
-                    tickets: history.clone(),
-                    source: "zendesk_customer_history".into(),
-                    limit: 10,
-                });
+    if let Some(history_override) = opts.customer_history_override.clone() {
+        let count = history_override.tickets.len();
+        session.evidence.customer_history = Some(history_override);
+        reporter.phase_done(
+            "customer_history",
+            &format!("{count} prior ticket(s) (fixture)"),
+        );
+    } else {
+        match ZendeskClient::from_env() {
+            Ok(zd) => {
+                let email = ticket.requester_email.clone().unwrap_or_default();
+                let history = zd.fetch_customer_history(&email, 10).await;
+                if !history.is_empty() {
+                    session.evidence.customer_history = Some(CustomerHistoryEvidence {
+                        requester_email: email,
+                        tickets: history.clone(),
+                        source: "zendesk_customer_history".into(),
+                        limit: 10,
+                    });
+                }
+                reporter.phase_done(
+                    "customer_history",
+                    &format!("{} prior ticket(s) found", history.len()),
+                );
             }
-            reporter.phase_done(
-                "customer_history",
-                &format!("{} prior ticket(s) found", history.len()),
-            );
+            Err(e) => reporter.phase_failed("customer_history", &e.to_string()),
         }
-        Err(e) => reporter.phase_failed("customer_history", &e.to_string()),
     }
 
     // Phase: memory_lookup
     reporter.phase_started("memory_lookup", "querying prior investigations");
     let symptom_head: String = ticket.description.chars().take(500).collect();
-    let prior = memory::retrieve_similar(&ticket.subject, &symptom_head, 3).unwrap_or_default();
+    let prior = if let Some(hits) = opts.memory_hits_override.clone() {
+        hits
+    } else {
+        memory::retrieve_similar(&ticket.subject, &symptom_head, 3).unwrap_or_default()
+    };
     if let Ok(Some(_dup)) = memory::find_duplicate(&ticket.id.to_string()) {
         eprintln!("⚠ ZD-{} was previously investigated", ticket.id);
     }

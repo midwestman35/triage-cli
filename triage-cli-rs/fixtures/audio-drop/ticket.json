@@ -1,0 +1,33 @@
+{
+  "id": 55001,
+  "subject": "Audio drops on 911 calls — all dispatch consoles affected",
+  "description": "We are experiencing intermittent audio drops on incoming 911 calls. The issue started around 09:30 local time and is affecting all dispatch consoles at Jefferson County PSAP. Callers report dead air for 2–5 seconds before audio returns. This started the morning after the APEX software update applied last night (2026-05-13 23:00 UTC).",
+  "requester_org": "Jefferson County PSAP",
+  "requester_email": "dispatch@jeffcounty.gov",
+  "tags": ["audio", "apex-ng911", "production", "post-update"],
+  "created_at": "2026-05-14T15:32:00Z",
+  "updated_at": "2026-05-14T15:55:00Z",
+  "comments": [
+    {
+      "author": "dispatch@jeffcounty.gov",
+      "body": "Adding more context: this is happening on all 8 console stations, not just one. Restarting individual consoles does not help. The audio drop lasts about 3 seconds and then recovers. We are seeing this on every call, not just some.",
+      "created_at": "2026-05-14T15:40:00Z",
+      "is_public": true,
+      "attachments": []
+    },
+    {
+      "author": "noc@carbyne.com",
+      "body": "[internal] Checked APEX audio pipeline. RTP packet loss detected on site us-co-jeffcom-apex. Logs show codec negotiation failures starting at 09:28 local. Suspect codec config regressed in last night's update. Escalating to engineering.",
+      "created_at": "2026-05-14T15:50:00Z",
+      "is_public": false,
+      "attachments": [
+        {
+          "filename": "apex-audio-diag-20260514.log",
+          "content_type": "text/plain",
+          "size_bytes": 4200,
+          "content_url": null
+        }
+      ]
+    }
+  ]
+}

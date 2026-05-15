@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::datadog::DatadogClient;
+use crate::datadog::{DatadogClient, DatadogSource};
 use crate::extract;
 use crate::investigation;
 use crate::models::{SiteEntry, Ticket};
@@ -219,7 +219,7 @@ pub async fn run_iteration(
     mut state: State,
     opts: &WatcherOptions,
     backfill_cutoff: DateTime<Utc>,
-    dd_client: Option<&DatadogClient>,
+    dd_client: Option<&dyn DatadogSource>,
     rubric: &Rubric,
 ) -> Result<State, WatcherError> {
     let view_ids = match opts.view_id {
@@ -285,6 +285,8 @@ pub async fn run_iteration(
             // soft-lock conflict surfaces as an error and the ticket is
             // skipped for this poll cycle.
             force: false,
+            customer_history_override: None,
+            memory_hits_override: None,
         };
         let reporter: Box<dyn Reporter> = Box::new(SilentReporter);
         match pipeline::investigate_one_structured(
@@ -368,8 +370,16 @@ pub async fn run_watch(opts: WatcherOptions) -> Result<(), WatcherError> {
         } else {
             match DatadogClient::from_env() {
                 Ok(dd) => {
-                    state = run_iteration(&zd, &sites, state, &opts, cutoff, Some(&dd), &rubric)
-                        .await?;
+                    state = run_iteration(
+                        &zd,
+                        &sites,
+                        state,
+                        &opts,
+                        cutoff,
+                        Some(&dd as &dyn DatadogSource),
+                        &rubric,
+                    )
+                    .await?;
                 }
                 Err(_) => {
                     state = run_iteration(&zd, &sites, state, &opts, cutoff, None, &rubric).await?;

@@ -1,0 +1,26 @@
+{
+  "id": 55004,
+  "subject": "Network Error banner on all consoles — site-wide WebSocket disconnect",
+  "description": "All 16 console stations at Lakewood PSAP are showing 'Network Error' banners and WebSocket disconnect messages. The issue started at approximately 14:10 local time. Our IT team confirmed a switch firmware update was applied to the core switch at 14:05. Reverting the switch firmware at 14:35 restored console connectivity. All stations are now operational.",
+  "requester_org": "Lakewood PSAP",
+  "requester_email": "itops@lakewood911.gov",
+  "tags": ["network-error", "websocket", "apex-ng911", "vendor", "resolved"],
+  "created_at": "2026-05-14T20:15:00Z",
+  "updated_at": "2026-05-14T20:50:00Z",
+  "comments": [
+    {
+      "author": "itops@lakewood911.gov",
+      "body": "Confirmed: switch firmware rollback at 14:35 resolved all console Network Error banners. All 16 stations reconnected within 60 seconds of rollback. Root cause was vendor switch firmware v3.8.1 breaking VLAN trunking on port-channel 4 which carries APEX console traffic.",
+      "created_at": "2026-05-14T20:40:00Z",
+      "is_public": true,
+      "attachments": []
+    },
+    {
+      "author": "noc@carbyne.com",
+      "body": "[internal] Confirmed network-layer cause. APEX server logs show clean WebSocket disconnects correlated exactly with switch firmware event at 14:05. No APEX software issue. Customer IT handled the fix. Vendor fork (B) — link to site master ticket.",
+      "created_at": "2026-05-14T20:45:00Z",
+      "is_public": false,
+      "attachments": []
+    }
+  ]
+}

@@ -1,0 +1,18 @@
+[
+  {
+    "ticket_id": "43210",
+    "customer": "Jefferson County PSAP",
+    "subject": "Audio quality degradation after firmware upgrade",
+    "symptom": "Intermittent audio drops on all consoles after overnight firmware upgrade",
+    "assessment": "Root cause was OPUS codec sample-rate mismatch introduced in firmware v4.1.2. APEX defaulted to 48 kHz but the updated gateway expected 16 kHz, causing fallback to G.711 and brief RTP re-negotiation gaps.",
+    "resolution": "Carbyne engineering pushed a corrective codec profile config. Vendor confirmed the regression. Forked A (Engineering Jira REP-8812)."
+  },
+  {
+    "ticket_id": "50192",
+    "customer": "Riverside County 911",
+    "subject": "Intermittent dead air on 911 calls after APEX update",
+    "symptom": "Callers hearing 2-4 seconds of silence before audio reconnects; issue site-wide",
+    "assessment": "SRTP key exchange timing regression in APEX 5.2.0. Logs showed renegotiation events on every call open. Not a network issue — Datadog showed zero packet loss at the site level.",
+    "resolution": "Hotfix applied by engineering (REP-9001). Forked A."
+  }
+]

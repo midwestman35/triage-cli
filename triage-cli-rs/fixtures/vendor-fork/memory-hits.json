@@ -1,0 +1,10 @@
+[
+  {
+    "ticket_id": "49801",
+    "customer": "Summit County 911",
+    "subject": "All console Network Error banners — switch replacement",
+    "symptom": "All consoles offline with Network Error; correlated to customer network change",
+    "assessment": "Switch misconfiguration during maintenance window broke VLAN carrying APEX console traffic. No APEX software defect.",
+    "resolution": "Customer IT corrected switch config. Forked B (Vendor/Internal IT). Linked to site master ticket SCO-APEX-NET."
+  }
+]

@@ -6,6 +6,7 @@ pub mod build_map;
 pub mod cli;
 pub mod datadog;
 pub mod extract;
+pub mod fixture;
 pub mod interactive;
 pub mod investigation;
 pub mod llm;

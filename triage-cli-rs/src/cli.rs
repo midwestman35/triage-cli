@@ -10,8 +10,9 @@ use clap::{Args, Parser, Subcommand};
 use owo_colors::OwoColorize;
 
 use crate::build_map;
-use crate::datadog::DatadogClient;
+use crate::datadog::{DatadogClient, DatadogSource};
 use crate::extract;
+use crate::fixture::{self, FixtureDatadogClient, FixtureLoader};
 use crate::interactive;
 use crate::investigation;
 use crate::pipeline::{self, InvestigateOptions, StderrReporter};
@@ -50,6 +51,9 @@ enum Cmd {
     BuildMap,
     /// Interactive first-run setup; writes `.env`.
     Setup,
+    /// Run a canned demo fixture without credentials. Lists available fixtures
+    /// when called without a name.
+    Demo(DemoCmd),
 }
 
 #[derive(Debug, Args)]
@@ -91,6 +95,17 @@ struct InvestigateCmd {
     /// (fallback: `diff -u` printed to stderr).
     #[arg(long, default_value_t = false)]
     diff: bool,
+    /// Load ticket/logs from a fixture directory instead of Zendesk/Datadog.
+    #[arg(long)]
+    fixture: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct DemoCmd {
+    /// Name of the built-in fixture to run (e.g. `audio-drop`). Omit to list available fixtures.
+    name: Option<String>,
+    #[arg(short, long, default_value_t = false)]
+    verbose: bool,
 }
 
 #[derive(Debug, Args)]
@@ -122,6 +137,9 @@ struct TriageCmd {
     /// (fallback: `diff -u` printed to stderr).
     #[arg(long, default_value_t = false)]
     diff: bool,
+    /// Load ticket/logs from a fixture directory instead of Zendesk/Datadog.
+    #[arg(long)]
+    fixture: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -175,6 +193,7 @@ pub fn run() -> ExitCode {
         Cmd::Investigate(c) => async_run(|| cmd_investigate(c)),
         Cmd::Watch(c) => async_run(|| cmd_watch(c)),
         Cmd::Inbox(c) => async_run(|| cmd_inbox(c)),
+        Cmd::Demo(c) => async_run(|| cmd_demo(c)),
     }
 }
 
@@ -289,12 +308,91 @@ fn cmd_build_map() -> ExitCode {
 }
 
 async fn cmd_triage(c: TriageCmd) -> ExitCode {
+    let at_dt = c.at.as_deref().map(parse_at);
+    let levels = parse_levels(&c.levels);
+
+    if c.tui {
+        die("`--tui` was removed in the v1 reframe; the inbox TUI \
+             (`triage-cli inbox`) is now the only TUI surface. Run \
+             without `--tui` to produce the ticket folder.");
+    }
+
+    // Fixture mode: bypass Zendesk and Datadog entirely.
+    if let Some(fixture_path) = c.fixture {
+        let loader = match FixtureLoader::new(&fixture_path) {
+            Ok(l) => l,
+            Err(e) => die(&format!("fixture: {e}")),
+        };
+        let ticket = match loader.load_ticket() {
+            Ok(t) => t,
+            Err(e) => die(&format!("fixture ticket: {e}")),
+        };
+        let logs = match loader.load_datadog_logs() {
+            Ok(l) => l,
+            Err(e) => die(&format!("fixture logs: {e}")),
+        };
+        let memory_hits = match loader.load_memory_hits() {
+            Ok(h) => h,
+            Err(e) => die(&format!("fixture memory-hits: {e}")),
+        };
+        if c.verbose {
+            eprintln!(
+                "Fixture mode: ticket #{} — {} — {} log line(s) — {} memory hit(s)",
+                ticket.id,
+                ticket.subject,
+                logs.len(),
+                memory_hits.len()
+            );
+        }
+        let mut session = investigation::create_session(ticket.clone());
+        let fixture_dd = FixtureDatadogClient::new(logs);
+        let opts = InvestigateOptions {
+            interactive: false,
+            workspace: None,
+            cnc_override: c.cnc,
+            site_override: c.site,
+            anchor_override: at_dt,
+            window_minutes: c.window_minutes,
+            levels,
+            verbose: c.verbose,
+            redact_enabled: true,
+            no_llm: c.no_llm,
+            force: c.force,
+            customer_history_override: None,
+            memory_hits_override: Some(memory_hits),
+        };
+        let rubric = load_rubric_or_die();
+        let reporter = StderrReporter { verbose: c.verbose };
+        let outcome = match pipeline::investigate_one_structured(
+            ticket,
+            &mut session,
+            Some(&fixture_dd as &dyn DatadogSource),
+            &rubric,
+            &reporter,
+            &opts,
+        )
+        .await
+        {
+            Ok(o) => o,
+            Err(e) => return handle_pipeline_error(e, c.diff),
+        };
+        print_fork_packet_to_stdout(&outcome.paths.fork_packet);
+        surface_validator_warnings(&outcome.validator_warnings);
+        if c.verbose {
+            eprintln!(
+                "Ticket folder: {} (fork={}, confidence={})",
+                outcome.paths.folder.display(),
+                outcome.report.fork_packet.commitment.fork_letter.as_str(),
+                outcome.report.fork_packet.commitment.confidence.as_str(),
+            );
+        }
+        return ExitCode::SUCCESS;
+    }
+
     let ticket_id = match extract::parse_ticket_id(&c.ticket) {
         Ok(id) => id,
         Err(e) => die(&e.to_string()),
     };
-    let at_dt = c.at.as_deref().map(parse_at);
-    let levels = parse_levels(&c.levels);
 
     let zd = match ZendeskClient::from_env() {
         Ok(c) => c,
@@ -344,19 +442,16 @@ async fn cmd_triage(c: TriageCmd) -> ExitCode {
         redact_enabled: true,
         no_llm: c.no_llm,
         force: c.force,
+        customer_history_override: None,
+        memory_hits_override: None,
     };
 
-    if c.tui {
-        die("`--tui` was removed in the v1 reframe; the inbox TUI \
-             (`triage-cli inbox`) is now the only TUI surface. Run \
-             without `--tui` to produce the ticket folder.");
-    }
     let rubric = load_rubric_or_die();
     let reporter = StderrReporter { verbose: c.verbose };
     let outcome = match pipeline::investigate_one_structured(
         ticket,
         &mut session,
-        dd.as_ref(),
+        dd.as_ref().map(|d| d as &dyn DatadogSource),
         &rubric,
         &reporter,
         &opts,
@@ -460,6 +555,31 @@ async fn cmd_investigate(c: InvestigateCmd) -> ExitCode {
     } else {
         DatadogClient::from_env().ok()
     };
+
+    // Fixture mode: also load fixture logs if --fixture is set.
+    let fixture_dd = if let Some(ref fixture_path) = c.fixture {
+        match FixtureLoader::new(fixture_path) {
+            Ok(loader) => match loader.load_datadog_logs() {
+                Ok(logs) => Some(FixtureDatadogClient::new(logs)),
+                Err(e) => die(&format!("fixture logs: {e}")),
+            },
+            Err(e) => die(&format!("fixture: {e}")),
+        }
+    } else {
+        None
+    };
+    let fixture_memory = if let Some(ref fixture_path) = c.fixture {
+        match FixtureLoader::new(fixture_path) {
+            Ok(loader) => match loader.load_memory_hits() {
+                Ok(hits) => Some(hits),
+                Err(e) => die(&format!("fixture memory-hits: {e}")),
+            },
+            Err(e) => die(&format!("fixture: {e}")),
+        }
+    } else {
+        None
+    };
+
     let opts = InvestigateOptions {
         interactive: true,
         workspace: Some(workspace.root.clone()),
@@ -472,6 +592,8 @@ async fn cmd_investigate(c: InvestigateCmd) -> ExitCode {
         redact_enabled: true,
         no_llm: c.no_llm,
         force: c.force,
+        customer_history_override: None,
+        memory_hits_override: fixture_memory,
     };
 
     if c.tui {
@@ -481,10 +603,14 @@ async fn cmd_investigate(c: InvestigateCmd) -> ExitCode {
     }
     let rubric = load_rubric_or_die();
     let reporter = StderrReporter { verbose: c.verbose };
+    let effective_dd: Option<&dyn DatadogSource> = fixture_dd
+        .as_ref()
+        .map(|d| d as &dyn DatadogSource)
+        .or_else(|| dd.as_ref().map(|d| d as &dyn DatadogSource));
     let outcome = match pipeline::investigate_one_structured(
         ticket,
         &mut session,
-        dd.as_ref(),
+        effective_dd,
         &rubric,
         &reporter,
         &opts,
@@ -497,6 +623,95 @@ async fn cmd_investigate(c: InvestigateCmd) -> ExitCode {
     print_fork_packet_to_stdout(&outcome.paths.fork_packet);
     surface_validator_warnings(&outcome.validator_warnings);
     eprintln!("Ticket folder ready: {}", outcome.paths.folder.display());
+    ExitCode::SUCCESS
+}
+
+async fn cmd_demo(c: DemoCmd) -> ExitCode {
+    let Some(name) = c.name else {
+        eprintln!("Available demo fixtures:");
+        let root = fixture::fixtures_root();
+        for &n in fixture::NAMED_FIXTURES {
+            let path = root.join(n);
+            let mark = if path.is_dir() { "✓" } else { "✗" };
+            eprintln!("  {mark} {n}");
+        }
+        eprintln!();
+        eprintln!("Usage: triage-cli demo <name>");
+        eprintln!("       triage-cli triage --fixture <path> [--no-llm]");
+        return ExitCode::SUCCESS;
+    };
+
+    let fixture_path = fixture::resolve_named(&name);
+    let loader = match FixtureLoader::new(&fixture_path) {
+        Ok(l) => l,
+        Err(e) => die(&format!("demo fixture '{name}': {e}")),
+    };
+    let ticket = match loader.load_ticket() {
+        Ok(t) => t,
+        Err(e) => die(&format!("demo fixture '{name}' ticket: {e}")),
+    };
+    let logs = match loader.load_datadog_logs() {
+        Ok(l) => l,
+        Err(e) => die(&format!("demo fixture '{name}' logs: {e}")),
+    };
+    let memory_hits = match loader.load_memory_hits() {
+        Ok(h) => h,
+        Err(e) => die(&format!("demo fixture '{name}' memory-hits: {e}")),
+    };
+
+    eprintln!(
+        "Demo: fixture '{name}' — ticket #{} «{}»",
+        ticket.id, ticket.subject
+    );
+    if c.verbose {
+        eprintln!(
+            "  {} log line(s), {} memory hit(s)",
+            logs.len(),
+            memory_hits.len()
+        );
+    }
+
+    let mut session = investigation::create_session(ticket.clone());
+    let fixture_dd = FixtureDatadogClient::new(logs);
+    let opts = InvestigateOptions {
+        interactive: false,
+        workspace: None,
+        cnc_override: None,
+        site_override: None,
+        anchor_override: None,
+        window_minutes: 30,
+        levels: vec!["error".into(), "warn".into(), "info".into()],
+        verbose: c.verbose,
+        redact_enabled: true,
+        no_llm: true,
+        force: false,
+        customer_history_override: None,
+        memory_hits_override: Some(memory_hits),
+    };
+    let rubric = load_rubric_or_die();
+    let reporter = StderrReporter { verbose: c.verbose };
+    let outcome = match pipeline::investigate_one_structured(
+        ticket,
+        &mut session,
+        Some(&fixture_dd as &dyn DatadogSource),
+        &rubric,
+        &reporter,
+        &opts,
+    )
+    .await
+    {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    print_fork_packet_to_stdout(&outcome.paths.fork_packet);
+    surface_validator_warnings(&outcome.validator_warnings);
+    eprintln!(
+        "Demo complete. Ticket folder: {}",
+        outcome.paths.folder.display()
+    );
     ExitCode::SUCCESS
 }
 

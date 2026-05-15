@@ -1,0 +1,11 @@
+{
+  "id": 55003,
+  "subject": "Occasional call drops reported by supervisor",
+  "description": "One of our supervisors mentioned that she heard from a dispatcher that calls might be dropping sometimes. We're not sure which station or how often. It might have started last week or maybe the week before. No logs available on our end.",
+  "requester_org": "Tri-County 911 Center",
+  "requester_email": "admin@tricounty911.org",
+  "tags": ["apex-ng911", "call-drop"],
+  "created_at": "2026-05-14T09:15:00Z",
+  "updated_at": "2026-05-14T09:15:00Z",
+  "comments": []
+}

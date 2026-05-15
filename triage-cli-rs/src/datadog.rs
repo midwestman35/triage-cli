@@ -123,6 +123,16 @@ impl DatadogClient {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
     ) -> Result<(Vec<LogLine>, bool), DatadogError> {
+        self.get_logs_inner(site_name, levels, start, end).await
+    }
+
+    async fn get_logs_inner(
+        &self,
+        site_name: &str,
+        levels: &[String],
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<(Vec<LogLine>, bool), DatadogError> {
         if levels.is_empty() {
             return Err(DatadogError::EmptyLevels);
         }
@@ -245,5 +255,37 @@ fn to_log_line(item: &Value) -> LogLine {
         level,
         message,
         attributes,
+    }
+}
+
+/// Boxed future returned by [`DatadogSource::get_logs`].
+pub type LogsFuture<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<(Vec<LogLine>, bool), DatadogError>> + Send + 'a>,
+>;
+
+/// Abstracts over the real Datadog client and the fixture stub so the pipeline
+/// can be wired with either without knowing which it has.
+///
+/// Uses the explicit `Pin<Box<dyn Future>>` form (rather than `async fn`) to
+/// remain dyn-compatible, following the same pattern as `LlmProvider`.
+pub trait DatadogSource: Send + Sync {
+    fn get_logs<'a>(
+        &'a self,
+        site_name: &'a str,
+        levels: &'a [String],
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> LogsFuture<'a>;
+}
+
+impl DatadogSource for DatadogClient {
+    fn get_logs<'a>(
+        &'a self,
+        site_name: &'a str,
+        levels: &'a [String],
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> LogsFuture<'a> {
+        Box::pin(self.get_logs_inner(site_name, levels, start, end))
     }
 }
