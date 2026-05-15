@@ -3,8 +3,10 @@
 //! from orchestration: `StderrReporter` (default), `SilentReporter`
 //! (tests/watcher), `ChannelReporter` (TUI).
 
+use std::collections::HashMap;
 use std::path::Path;
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -41,6 +43,17 @@ pub enum PipelineError {
     TicketFolder(#[from] TicketFolderError),
 }
 
+/// Typed value emitted via `Reporter::record_metric`. Kept simple — the only
+/// consumers today are `MetricsReporter` (captures for JSON) and the default
+/// no-op on all other implementations.
+#[derive(Debug, Clone)]
+pub enum MetricValue {
+    Float(f64),
+    Int(i64),
+    Bool(bool),
+    Str(String),
+}
+
 /// Progress reporter: decouples display from orchestration. The structured
 /// pipeline does not emit a terminal "done" payload through this trait — the
 /// caller of `investigate_one_structured` receives the `StructuredInvestigation`
@@ -49,6 +62,10 @@ pub trait Reporter: Send + Sync {
     fn phase_started(&self, phase: &str, detail: &str);
     fn phase_done(&self, phase: &str, detail: &str);
     fn phase_failed(&self, phase: &str, err: &str);
+    /// Record a named metric for observability. Default is a no-op so existing
+    /// reporters (`StderrReporter`, `SilentReporter`, `ChannelReporter`) need
+    /// no changes. Only `MetricsReporter` captures these.
+    fn record_metric(&self, _key: &str, _value: MetricValue) {}
 }
 
 #[derive(Default)]
@@ -263,12 +280,34 @@ pub async fn investigate_one_structured(
         reporter.phase_done("enrichment", "skipped (no Datadog client)");
     }
 
+    // Record evidence counts before the LLM call (available regardless of --no-llm).
+    reporter.record_metric(
+        "evidence.comments",
+        MetricValue::Int(ticket.comments.len() as i64),
+    );
+    reporter.record_metric(
+        "evidence.attachments",
+        MetricValue::Int(
+            (session.evidence.attachments.len()
+                + session.evidence.local_files.len()
+                + session.evidence.pasted_logs.len()) as i64,
+        ),
+    );
+    reporter.record_metric(
+        "evidence.datadog_lines",
+        MetricValue::Int(log_lines.len() as i64),
+    );
+    reporter.record_metric(
+        "evidence.memory_hits",
+        MetricValue::Int(prior.len() as i64),
+    );
+
     // Phase: llm_call (structured)
     reporter.phase_started("llm_call", "generating structured assessment");
-    let (report, validator_warnings) = if opts.no_llm {
+    let (report, validator_warnings, llm_call_metrics) = if opts.no_llm {
         let r = stub_assess_structured(&ticket, rubric.version());
         reporter.phase_done("llm_call", "stub (--no-llm)");
-        (r, Vec::new())
+        (r, Vec::new(), None)
     } else {
         let bundle = TriageBundle {
             ticket: ticket.clone(),
@@ -326,8 +365,22 @@ pub async fn investigate_one_structured(
                 outcome.report.fork_packet.commitment.confidence.as_str(),
             ),
         );
-        (outcome.report, outcome.validator_warnings)
+        let metrics = outcome.llm_metrics.clone();
+        (outcome.report, outcome.validator_warnings, Some(metrics))
     };
+
+    // Forward LLM call metrics through the reporter so MetricsReporter can capture them.
+    if let Some(ref m) = llm_call_metrics {
+        reporter.record_metric("llm.provider", MetricValue::Str(m.provider.clone()));
+        reporter.record_metric("llm.model", MetricValue::Str(m.model.clone()));
+        reporter.record_metric("llm.retried", MetricValue::Bool(m.retried));
+        if let Some(ti) = m.tokens_in {
+            reporter.record_metric("llm.tokens_in", MetricValue::Int(ti as i64));
+        }
+        if let Some(to) = m.tokens_out {
+            reporter.record_metric("llm.tokens_out", MetricValue::Int(to as i64));
+        }
+    }
 
     // Phase: save (five-markdown ticket folder)
     reporter.phase_started("save", "");
@@ -498,5 +551,84 @@ impl Reporter for ChannelReporter {
             phase: phase.into(),
             err: err.into(),
         });
+    }
+}
+
+/// Wraps another reporter and captures phase timings plus named metrics.
+/// Pass `&MetricsReporter` as the `&dyn Reporter` to the pipeline; after the
+/// call returns, read collected data via `phase_timings()` and `named_metrics()`.
+pub struct MetricsReporter {
+    inner: Box<dyn Reporter>,
+    phase_starts: Mutex<HashMap<String, Instant>>,
+    phase_timings: Mutex<HashMap<String, f64>>,
+    named: Mutex<Vec<(String, MetricValue)>>,
+}
+
+impl MetricsReporter {
+    pub fn new(inner: Box<dyn Reporter>) -> Self {
+        Self {
+            inner,
+            phase_starts: Mutex::new(HashMap::new()),
+            phase_timings: Mutex::new(HashMap::new()),
+            named: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Wall-clock seconds per phase (keyed by phase name).
+    pub fn phase_timings(&self) -> HashMap<String, f64> {
+        self.phase_timings.lock().unwrap().clone()
+    }
+
+    /// Ordered list of (key, value) pairs recorded via `record_metric`.
+    pub fn named_metrics(&self) -> Vec<(String, MetricValue)> {
+        self.named.lock().unwrap().clone()
+    }
+}
+
+impl Reporter for MetricsReporter {
+    fn phase_started(&self, phase: &str, detail: &str) {
+        self.phase_starts
+            .lock()
+            .unwrap()
+            .insert(phase.to_string(), Instant::now());
+        self.inner.phase_started(phase, detail);
+    }
+
+    fn phase_done(&self, phase: &str, detail: &str) {
+        let elapsed = self
+            .phase_starts
+            .lock()
+            .unwrap()
+            .remove(phase)
+            .map(|t| t.elapsed().as_secs_f64())
+            .unwrap_or(0.0);
+        self.phase_timings
+            .lock()
+            .unwrap()
+            .insert(phase.to_string(), elapsed);
+        self.inner.phase_done(phase, detail);
+    }
+
+    fn phase_failed(&self, phase: &str, err: &str) {
+        let elapsed = self
+            .phase_starts
+            .lock()
+            .unwrap()
+            .remove(phase)
+            .map(|t| t.elapsed().as_secs_f64())
+            .unwrap_or(0.0);
+        self.phase_timings
+            .lock()
+            .unwrap()
+            .insert(phase.to_string(), elapsed);
+        self.inner.phase_failed(phase, err);
+    }
+
+    fn record_metric(&self, key: &str, value: MetricValue) {
+        self.named
+            .lock()
+            .unwrap()
+            .push((key.to_string(), value.clone()));
+        self.inner.record_metric(key, value);
     }
 }

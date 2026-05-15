@@ -14,7 +14,7 @@ use crate::datadog::DatadogClient;
 use crate::extract;
 use crate::interactive;
 use crate::investigation;
-use crate::pipeline::{self, InvestigateOptions, StderrReporter};
+use crate::pipeline::{self, InvestigateOptions, MetricValue, MetricsReporter, StderrReporter};
 use crate::playbook::Rubric;
 use crate::setup;
 use crate::tui;
@@ -91,6 +91,9 @@ struct InvestigateCmd {
     /// (fallback: `diff -u` printed to stderr).
     #[arg(long, default_value_t = false)]
     diff: bool,
+    /// Write a JSON run-metrics record to this path on success.
+    #[arg(long)]
+    metrics_out: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -122,6 +125,9 @@ struct TriageCmd {
     /// (fallback: `diff -u` printed to stderr).
     #[arg(long, default_value_t = false)]
     diff: bool,
+    /// Write a JSON run-metrics record to this path on success.
+    #[arg(long)]
+    metrics_out: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -352,9 +358,9 @@ async fn cmd_triage(c: TriageCmd) -> ExitCode {
              without `--tui` to produce the ticket folder.");
     }
     let rubric = load_rubric_or_die();
-    let reporter = StderrReporter { verbose: c.verbose };
+    let reporter = MetricsReporter::new(Box::new(StderrReporter { verbose: c.verbose }));
     let outcome = match pipeline::investigate_one_structured(
-        ticket,
+        ticket.clone(),
         &mut session,
         dd.as_ref(),
         &rubric,
@@ -375,6 +381,9 @@ async fn cmd_triage(c: TriageCmd) -> ExitCode {
             outcome.report.fork_packet.commitment.fork_letter.as_str(),
             outcome.report.fork_packet.commitment.confidence.as_str(),
         );
+    }
+    if let Some(path) = c.metrics_out {
+        write_metrics_file(&path, ticket.id, &reporter, &outcome);
     }
     ExitCode::SUCCESS
 }
@@ -480,9 +489,9 @@ async fn cmd_investigate(c: InvestigateCmd) -> ExitCode {
              without `--tui` to produce the ticket folder.");
     }
     let rubric = load_rubric_or_die();
-    let reporter = StderrReporter { verbose: c.verbose };
+    let reporter = MetricsReporter::new(Box::new(StderrReporter { verbose: c.verbose }));
     let outcome = match pipeline::investigate_one_structured(
-        ticket,
+        ticket.clone(),
         &mut session,
         dd.as_ref(),
         &rubric,
@@ -497,6 +506,9 @@ async fn cmd_investigate(c: InvestigateCmd) -> ExitCode {
     print_fork_packet_to_stdout(&outcome.paths.fork_packet);
     surface_validator_warnings(&outcome.validator_warnings);
     eprintln!("Ticket folder ready: {}", outcome.paths.folder.display());
+    if let Some(path) = c.metrics_out {
+        write_metrics_file(&path, ticket.id, &reporter, &outcome);
+    }
     ExitCode::SUCCESS
 }
 
@@ -504,6 +516,79 @@ fn load_rubric_or_die() -> Rubric {
     match Rubric::load() {
         Ok(r) => r,
         Err(e) => die(&format!("failed to load fork rubric: {e}")),
+    }
+}
+
+/// Build and write the JSON metrics record to `path`. Errors are printed to
+/// stderr but do not affect the exit code — metrics emission is best-effort.
+fn write_metrics_file(
+    path: &Path,
+    ticket_id: u64,
+    reporter: &MetricsReporter,
+    outcome: &pipeline::StructuredInvestigation,
+) {
+    let phases = reporter.phase_timings();
+    let named = reporter.named_metrics();
+
+    // Collect evidence counts.
+    let mut evidence_counts = serde_json::Map::new();
+    let mut llm_obj = serde_json::Map::new();
+    for (key, val) in &named {
+        let jval = match val {
+            MetricValue::Int(n) => serde_json::Value::Number(serde_json::Number::from(*n)),
+            MetricValue::Float(f) => serde_json::json!(f),
+            MetricValue::Bool(b) => serde_json::Value::Bool(*b),
+            MetricValue::Str(s) => serde_json::Value::String(s.clone()),
+        };
+        if let Some(suffix) = key.strip_prefix("evidence.") {
+            evidence_counts.insert(suffix.to_string(), jval);
+        } else if let Some(suffix) = key.strip_prefix("llm.") {
+            llm_obj.insert(suffix.to_string(), jval);
+        }
+    }
+
+    let phases_json: serde_json::Map<String, serde_json::Value> = phases
+        .into_iter()
+        .map(|(k, v)| {
+            let rounded = (v * 1000.0).round() / 1000.0;
+            (k, serde_json::json!(rounded))
+        })
+        .collect();
+
+    let record = serde_json::json!({
+        "ticket_id": ticket_id,
+        "phases": phases_json,
+        "evidence_counts": evidence_counts,
+        "llm": llm_obj,
+        "validator_warnings": outcome.validator_warnings,
+        "fork": outcome.report.fork_packet.commitment.fork_letter.as_str(),
+        "confidence": outcome.report.fork_packet.commitment.confidence.as_str(),
+        "exit_code": 0,
+    });
+
+    let text = match serde_json::to_string_pretty(&record) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!(
+                "{}: could not serialize metrics: {e}",
+                "warning".yellow().bold()
+            );
+            return;
+        }
+    };
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+    }
+    if let Err(e) = std::fs::write(path, &text) {
+        eprintln!(
+            "{}: could not write metrics to {}: {e}",
+            "warning".yellow().bold(),
+            path.display()
+        );
+    } else {
+        eprintln!("Metrics written to {}", path.display());
     }
 }
 
