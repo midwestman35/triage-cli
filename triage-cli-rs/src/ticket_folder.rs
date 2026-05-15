@@ -300,13 +300,15 @@ fn render_evidence_preflight_md(b: &PreflightBlock) -> String {
     out.push_str("# EVIDENCE PREFLIGHT\n\n");
 
     out.push_str("## Gathered\n\n");
-    out.push_str("| Evidence type | Source | Time window | Summary |\n|---|---|---|---|\n");
+    out.push_str("| ID | Evidence type | Source | Time window | Summary |\n|---|---|---|---|---|\n");
     if b.gathered.is_empty() {
-        out.push_str("| _(none)_ | _(none)_ | _(none)_ | _(none)_ |\n");
+        out.push_str("| _(none)_ | _(none)_ | _(none)_ | _(none)_ | _(none)_ |\n");
     } else {
         for g in &b.gathered {
+            let id_cell = if g.id.is_empty() { "-".into() } else { g.id.clone() };
             out.push_str(&format!(
-                "| {} | {} | {} | {} |\n",
+                "| {} | {} | {} | {} | {} |\n",
+                id_cell,
                 escape_pipe(&g.evidence_type),
                 escape_pipe(&g.source),
                 escape_pipe(&g.time_window),
@@ -757,6 +759,7 @@ mod tests {
             },
             evidence_preflight: PreflightBlock {
                 gathered: vec![GatheredEvidence {
+                    id: String::new(),
                     evidence_type: "station log".into(),
                     source: "Jeffcom-74".into(),
                     time_window: "06:30 UTC".into(),
@@ -908,7 +911,7 @@ mod tests {
     fn evidence_preflight_md_renders_gathered_table() {
         let r = sample_report();
         let md = render_evidence_preflight_md(&r.evidence_preflight);
-        assert!(md.contains("| station log | Jeffcom-74 |"));
+        assert!(md.contains("| - | station log | Jeffcom-74 |"));
         assert!(md.contains("Multi-station flip"));
         assert!(md.contains("No AWS Health event"));
     }

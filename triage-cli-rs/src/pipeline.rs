@@ -270,7 +270,7 @@ pub async fn investigate_one_structured(
         reporter.phase_done("llm_call", "stub (--no-llm)");
         (r, Vec::new())
     } else {
-        let bundle = TriageBundle {
+        let mut bundle = TriageBundle {
             ticket: ticket.clone(),
             site_entry: site_entry.clone(),
             log_lines: log_lines.clone(),
@@ -288,7 +288,9 @@ pub async fn investigate_one_structured(
             pasted_logs: session.evidence.pasted_logs.clone(),
             customer_history: session.evidence.customer_history.clone(),
             memory_context: session.memory_context.clone(),
+            evidence_index: Vec::new(),
         };
+        bundle.evidence_index = crate::models::assign_evidence_ids(&bundle);
         let outcome =
             match llm::triage_structured(&bundle, rubric, None, opts.verbose, opts.redact_enabled)
                 .await
