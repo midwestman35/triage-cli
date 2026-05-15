@@ -574,6 +574,64 @@ impl Reporter for ChannelReporter {
     }
 }
 
+/// Shows a braille spinner on stderr while each pipeline phase is running.
+/// TTY-gated: falls back to inner `phase_started` when stderr is not a terminal
+/// so tests, the watcher, and piped runs are unaffected.
+pub struct SpinnerReporter {
+    inner: Box<dyn Reporter>,
+    current: Mutex<Option<ProgressBar>>,
+}
+
+impl SpinnerReporter {
+    pub fn new(inner: Box<dyn Reporter>) -> Self {
+        Self {
+            inner,
+            current: Mutex::new(None),
+        }
+    }
+
+    fn clear_current(&self) {
+        if let Some(pb) = self.current.lock().unwrap().take() {
+            pb.finish_and_clear();
+        }
+    }
+}
+
+impl Reporter for SpinnerReporter {
+    fn phase_started(&self, phase: &str, detail: &str) {
+        use std::io::IsTerminal;
+        self.clear_current();
+        if !std::io::stderr().is_terminal() {
+            self.inner.phase_started(phase, detail);
+            return;
+        }
+        let pb = ProgressBar::new_spinner();
+        pb.set_style(
+            ProgressStyle::with_template("{spinner:.cyan} {msg}")
+                .unwrap()
+                .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ "),
+        );
+        let msg = if detail.is_empty() {
+            phase.to_string()
+        } else {
+            format!("{phase}: {detail}")
+        };
+        pb.set_message(msg);
+        pb.enable_steady_tick(Duration::from_millis(80));
+        *self.current.lock().unwrap() = Some(pb);
+    }
+
+    fn phase_done(&self, phase: &str, detail: &str) {
+        self.clear_current();
+        self.inner.phase_done(phase, detail);
+    }
+
+    fn phase_failed(&self, phase: &str, err: &str) {
+        self.clear_current();
+        self.inner.phase_failed(phase, err);
+    }
+}
+
 /// Wraps another reporter and captures phase timings plus named metrics.
 /// Pass `&MetricsReporter` as the `&dyn Reporter` to the pipeline; after the
 /// call returns, read collected data via `phase_timings()` and `named_metrics()`.
