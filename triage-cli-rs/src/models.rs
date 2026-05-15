@@ -216,6 +216,19 @@ pub struct MemoryContext {
     pub query_tokens: Vec<String>,
 }
 
+/// A single indexed piece of evidence with a stable `E-NNN` ID.
+/// Built by `assign_evidence_ids` from a `TriageBundle` after bundle assembly,
+/// before the LLM call. Stored in `TriageBundle::evidence_index`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EvidenceItem {
+    pub id: String,
+    pub kind: String,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_time: Option<DateTime<Utc>>,
+    pub source_path: String,
+}
+
 /// All evidence gathered for an investigation session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InvestigationEvidence {
@@ -305,6 +318,8 @@ pub struct TriageBundle {
     pub customer_history: Option<CustomerHistoryEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_context: Option<MemoryContext>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_index: Vec<EvidenceItem>,
 }
 
 impl TriageBundle {
@@ -461,8 +476,165 @@ impl TriageBundle {
             }
         }
 
+        // Evidence index — appended last so the LLM can reference IDs while writing the report.
+        if !self.evidence_index.is_empty() {
+            lines.push(String::new());
+            lines.push("## Evidence Index".into());
+            lines.push(
+                "(Cite `E-NNN` IDs in `gathered[*].id`, `evidence_summary`, \
+                 and `decisive_evidence` bullets)"
+                    .into(),
+            );
+            lines.push(String::new());
+            lines.push("| ID | Type | Label | Time |".into());
+            lines.push("|---|---|---|---|".into());
+            for item in &self.evidence_index {
+                let ts = item
+                    .source_time
+                    .as_ref()
+                    .map(|t| fmt_ts(t))
+                    .unwrap_or_else(|| "-".into());
+                let label = item.label.replace('|', "\\|").replace('\n', " ");
+                lines.push(format!(
+                    "| {} | {} | {} | {} |",
+                    item.id, item.kind, label, ts
+                ));
+            }
+        }
+
         lines.join("\n")
     }
+}
+
+/// Build a deterministically ordered, zero-padded evidence index from a bundle.
+///
+/// Sort key: `(kind_order, source_time, source_path)` so the same inputs always
+/// produce the same `E-NNN` IDs. Callers should populate `bundle.evidence_index`
+/// with the result before passing the bundle to the LLM.
+pub fn assign_evidence_ids(bundle: &TriageBundle) -> Vec<EvidenceItem> {
+    let mut items: Vec<EvidenceItem> = Vec::new();
+
+    // Zendesk comments (one item per comment, sorted by created_at).
+    for c in &bundle.ticket.comments {
+        let label = format!("{} — {}", fmt_ts(&c.created_at), c.author);
+        items.push(EvidenceItem {
+            id: String::new(),
+            kind: "zendesk_comment".into(),
+            label,
+            source_time: Some(c.created_at),
+            source_path: format!("comment:{}", fmt_ts(&c.created_at)),
+        });
+    }
+
+    // Downloaded attachments.
+    for a in &bundle.downloaded_attachments {
+        items.push(EvidenceItem {
+            id: String::new(),
+            kind: "attachment".into(),
+            label: a.filename.clone(),
+            source_time: None,
+            source_path: format!("attachment:{}", a.filename),
+        });
+    }
+
+    // Datadog log window (single item).
+    if !bundle.log_lines.is_empty() || bundle.window_start.is_some() {
+        let label = match (&bundle.site_entry, &bundle.window_start, &bundle.window_end) {
+            (Some(s), Some(start), Some(end)) => {
+                format!("{} {} to {}", s.site_name, fmt_ts(start), fmt_ts(end))
+            }
+            (Some(s), _, _) => format!("{} log window", s.site_name),
+            _ => "Datadog log window".into(),
+        };
+        items.push(EvidenceItem {
+            id: String::new(),
+            kind: "datadog_log_window".into(),
+            label,
+            source_time: bundle.window_start,
+            source_path: "datadog:log_window".into(),
+        });
+    }
+
+    // Local files (analyst-supplied).
+    for lf in &bundle.local_files {
+        let name = lf
+            .path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| lf.path.display().to_string());
+        items.push(EvidenceItem {
+            id: String::new(),
+            kind: "local_file".into(),
+            label: name.clone(),
+            source_time: None,
+            source_path: format!("local:{name}"),
+        });
+    }
+
+    // Pasted evidence.
+    for p in &bundle.pasted_logs {
+        items.push(EvidenceItem {
+            id: String::new(),
+            kind: "pasted_note".into(),
+            label: p.label.clone(),
+            source_time: None,
+            source_path: format!("pasted:{}", p.label),
+        });
+    }
+
+    // Customer ticket history (one item if present).
+    if let Some(h) = &bundle.customer_history {
+        if !h.tickets.is_empty() {
+            items.push(EvidenceItem {
+                id: String::new(),
+                kind: "customer_history".into(),
+                label: format!("{} prior ticket(s)", h.tickets.len()),
+                source_time: None,
+                source_path: "customer_history".into(),
+            });
+        }
+    }
+
+    // Memory hits (one item per prior investigation).
+    if let Some(ctx) = &bundle.memory_context {
+        for e in &ctx.entries {
+            items.push(EvidenceItem {
+                id: String::new(),
+                kind: "memory_hit".into(),
+                label: format!("{} — {}", e.ticket_id, e.subject),
+                source_time: None,
+                source_path: format!("memory:{}", e.ticket_id),
+            });
+        }
+    }
+
+    // Sort: kind-order first, then source_time (None sorts last), then source_path.
+    fn kind_order(kind: &str) -> u8 {
+        match kind {
+            "zendesk_comment" => 0,
+            "attachment" => 1,
+            "datadog_log_window" => 2,
+            "local_file" => 3,
+            "pasted_note" => 4,
+            "customer_history" => 5,
+            "memory_hit" => 6,
+            _ => 7,
+        }
+    }
+
+    items.sort_by(|a, b| {
+        kind_order(&a.kind)
+            .cmp(&kind_order(&b.kind))
+            .then(a.source_time.cmp(&b.source_time))
+            .then(a.source_path.cmp(&b.source_path))
+    });
+
+    // Assign zero-padded IDs.
+    for (i, item) in items.iter_mut().enumerate() {
+        item.id = format!("E-{:03}", i + 1);
+    }
+
+    items
 }
 
 fn fmt_size(size_bytes: Option<u64>) -> String {
@@ -751,6 +923,8 @@ pub struct IntakeBlock {
 /// One row of the EVIDENCE_PREFLIGHT gathered-evidence table.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GatheredEvidence {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
     pub evidence_type: String,
     pub source: String,
     pub time_window: String,
@@ -843,6 +1017,137 @@ mod tests {
         assert!(out.starts_with("xxxx"));
         assert!(out.ends_with("xxxx"));
         assert!(out.contains("[truncated"));
+    }
+
+    #[test]
+    fn assign_evidence_ids_empty_bundle() {
+        use chrono::TimeZone;
+        let ticket = Ticket {
+            id: 1,
+            subject: "test".into(),
+            description: "test".into(),
+            requester_org: None,
+            requester_email: None,
+            tags: vec![],
+            created_at: Utc.with_ymd_and_hms(2026, 5, 12, 0, 0, 0).unwrap(),
+            updated_at: None,
+            comments: vec![],
+        };
+        let bundle = TriageBundle {
+            ticket,
+            site_entry: None,
+            log_lines: vec![],
+            log_truncated: false,
+            anchor: None,
+            anchor_source: None,
+            window_start: None,
+            window_end: None,
+            downloaded_attachments: vec![],
+            local_files: vec![],
+            pasted_logs: vec![],
+            customer_history: None,
+            memory_context: None,
+            evidence_index: vec![],
+        };
+        let ids = assign_evidence_ids(&bundle);
+        assert!(ids.is_empty(), "empty bundle should produce no evidence items");
+    }
+
+    #[test]
+    fn assign_evidence_ids_comments_sorted_chronologically() {
+        use chrono::TimeZone;
+        let t1 = Utc.with_ymd_and_hms(2026, 5, 12, 13, 30, 0).unwrap();
+        let t2 = Utc.with_ymd_and_hms(2026, 5, 12, 14, 0, 0).unwrap();
+        let comment = |author: &str, ts: DateTime<Utc>| Comment {
+            author: author.into(),
+            body: "body".into(),
+            created_at: ts,
+            is_public: true,
+            attachments: vec![],
+        };
+        let ticket = Ticket {
+            id: 2,
+            subject: "test".into(),
+            description: "d".into(),
+            requester_org: None,
+            requester_email: None,
+            tags: vec![],
+            created_at: t1,
+            updated_at: None,
+            comments: vec![comment("Bob", t2), comment("Alice", t1)],
+        };
+        let bundle = TriageBundle {
+            ticket,
+            site_entry: None,
+            log_lines: vec![],
+            log_truncated: false,
+            anchor: None,
+            anchor_source: None,
+            window_start: None,
+            window_end: None,
+            downloaded_attachments: vec![],
+            local_files: vec![],
+            pasted_logs: vec![],
+            customer_history: None,
+            memory_context: None,
+            evidence_index: vec![],
+        };
+        let ids = assign_evidence_ids(&bundle);
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ids[0].id, "E-001");
+        assert_eq!(ids[1].id, "E-002");
+        // E-001 should be Alice (earlier timestamp), E-002 Bob.
+        assert!(ids[0].label.contains("Alice"), "E-001 should be Alice; got {:?}", ids[0].label);
+        assert!(ids[1].label.contains("Bob"), "E-002 should be Bob; got {:?}", ids[1].label);
+    }
+
+    #[test]
+    fn assign_evidence_ids_stable_determinism() {
+        use chrono::TimeZone;
+        let t = Utc.with_ymd_and_hms(2026, 5, 12, 0, 0, 0).unwrap();
+        let ticket = Ticket {
+            id: 3,
+            subject: "test".into(),
+            description: "d".into(),
+            requester_org: None,
+            requester_email: None,
+            tags: vec![],
+            created_at: t,
+            updated_at: None,
+            comments: vec![Comment {
+                author: "Alice".into(),
+                body: "b".into(),
+                created_at: t,
+                is_public: true,
+                attachments: vec![],
+            }],
+        };
+        let bundle = TriageBundle {
+            ticket,
+            site_entry: None,
+            log_lines: vec![],
+            log_truncated: false,
+            anchor: None,
+            anchor_source: None,
+            window_start: None,
+            window_end: None,
+            downloaded_attachments: vec![AttachmentEvidence {
+                filename: "station.log".into(),
+                ..Default::default()
+            }],
+            local_files: vec![],
+            pasted_logs: vec![],
+            customer_history: None,
+            memory_context: None,
+            evidence_index: vec![],
+        };
+        let first = assign_evidence_ids(&bundle);
+        let second = assign_evidence_ids(&bundle);
+        assert_eq!(first, second, "assign_evidence_ids must be deterministic");
+        assert_eq!(first[0].kind, "zendesk_comment");
+        assert_eq!(first[0].id, "E-001");
+        assert_eq!(first[1].kind, "attachment");
+        assert_eq!(first[1].id, "E-002");
     }
 }
 
