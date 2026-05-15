@@ -63,8 +63,7 @@ pub struct StructuredOutcome {
 static FENCE_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"(?is)^\s*```(?:json)?\s*(.*?)\s*```\s*$").unwrap());
 
-static FENCE_RE_EVIDENCE_ID: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"E-\d{3}").unwrap());
+static FENCE_RE_EVIDENCE_ID: Lazy<Regex> = Lazy::new(|| Regex::new(r"E-\d{3}").unwrap());
 
 /// Extract a JSON object payload from an LLM response.
 ///

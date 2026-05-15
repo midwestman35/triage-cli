@@ -59,7 +59,11 @@ impl LlmProvider for CodexSubprocessProvider {
             }
             let text = String::from_utf8_lossy(&output.stdout).into_owned();
             // Codex subprocess does not expose token counts.
-            Ok(CompletionResult { text, tokens_in: None, tokens_out: None })
+            Ok(CompletionResult {
+                text,
+                tokens_in: None,
+                tokens_out: None,
+            })
         })
     }
 }

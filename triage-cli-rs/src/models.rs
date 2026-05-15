@@ -492,7 +492,7 @@ impl TriageBundle {
                 let ts = item
                     .source_time
                     .as_ref()
-                    .map(|t| fmt_ts(t))
+                    .map(fmt_ts)
                     .unwrap_or_else(|| "-".into());
                 let label = item.label.replace('|', "\\|").replace('\n', " ");
                 lines.push(format!(
@@ -1050,7 +1050,10 @@ mod tests {
             evidence_index: vec![],
         };
         let ids = assign_evidence_ids(&bundle);
-        assert!(ids.is_empty(), "empty bundle should produce no evidence items");
+        assert!(
+            ids.is_empty(),
+            "empty bundle should produce no evidence items"
+        );
     }
 
     #[test]
@@ -1097,8 +1100,16 @@ mod tests {
         assert_eq!(ids[0].id, "E-001");
         assert_eq!(ids[1].id, "E-002");
         // E-001 should be Alice (earlier timestamp), E-002 Bob.
-        assert!(ids[0].label.contains("Alice"), "E-001 should be Alice; got {:?}", ids[0].label);
-        assert!(ids[1].label.contains("Bob"), "E-002 should be Bob; got {:?}", ids[1].label);
+        assert!(
+            ids[0].label.contains("Alice"),
+            "E-001 should be Alice; got {:?}",
+            ids[0].label
+        );
+        assert!(
+            ids[1].label.contains("Bob"),
+            "E-002 should be Bob; got {:?}",
+            ids[1].label
+        );
     }
 
     #[test]

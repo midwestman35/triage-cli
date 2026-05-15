@@ -318,10 +318,7 @@ pub async fn investigate_one_structured(
         "evidence.datadog_lines",
         MetricValue::Int(log_lines.len() as i64),
     );
-    reporter.record_metric(
-        "evidence.memory_hits",
-        MetricValue::Int(prior.len() as i64),
-    );
+    reporter.record_metric("evidence.memory_hits", MetricValue::Int(prior.len() as i64));
 
     // Phase: llm_call (structured)
     reporter.phase_started("llm_call", "generating structured assessment");

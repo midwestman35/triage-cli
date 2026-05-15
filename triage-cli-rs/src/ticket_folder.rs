@@ -300,12 +300,18 @@ fn render_evidence_preflight_md(b: &PreflightBlock) -> String {
     out.push_str("# EVIDENCE PREFLIGHT\n\n");
 
     out.push_str("## Gathered\n\n");
-    out.push_str("| ID | Evidence type | Source | Time window | Summary |\n|---|---|---|---|---|\n");
+    out.push_str(
+        "| ID | Evidence type | Source | Time window | Summary |\n|---|---|---|---|---|\n",
+    );
     if b.gathered.is_empty() {
         out.push_str("| _(none)_ | _(none)_ | _(none)_ | _(none)_ | _(none)_ |\n");
     } else {
         for g in &b.gathered {
-            let id_cell = if g.id.is_empty() { "-".into() } else { g.id.clone() };
+            let id_cell = if g.id.is_empty() {
+                "-".into()
+            } else {
+                g.id.clone()
+            };
             out.push_str(&format!(
                 "| {} | {} | {} | {} | {} |\n",
                 id_cell,

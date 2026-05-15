@@ -48,7 +48,11 @@ impl LlmProvider for UnleashProvider {
                 return Err(ProviderError::NoText("Unleash", rid));
             }
             let (tokens_in, tokens_out) = unleash_token_counts(&data);
-            Ok(CompletionResult { text, tokens_in, tokens_out })
+            Ok(CompletionResult {
+                text,
+                tokens_in,
+                tokens_out,
+            })
         })
     }
 }
