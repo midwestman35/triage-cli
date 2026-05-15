@@ -13,6 +13,15 @@ use std::pin::Pin;
 
 use thiserror::Error;
 
+/// Returned by `LlmProvider::complete`. Carries the assistant text and, when
+/// the provider exposes it, the token counts for the call.
+#[derive(Debug, Clone, Default)]
+pub struct CompletionResult {
+    pub text: String,
+    pub tokens_in: Option<u32>,
+    pub tokens_out: Option<u32>,
+}
+
 /// Single-turn LLM completion contract. Mirrors Python `LLMProvider.complete`.
 ///
 /// Rust 1.95 supports `async fn` in traits natively. We use the explicit
@@ -26,7 +35,7 @@ pub trait LlmProvider: Send + Sync {
         prompt: &'a str,
         system_prompt: &'a str,
         model: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<String, ProviderError>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<CompletionResult, ProviderError>> + Send + 'a>>;
 }
 
 #[derive(Debug, Error)]

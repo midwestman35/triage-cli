@@ -35,6 +35,19 @@ pub enum LlmError {
     },
 }
 
+/// Token and retry metrics captured during a `triage_structured` call.
+/// Token counts are `None` when the provider does not expose them (codex).
+/// When the call retried, `tokens_in`/`tokens_out` are the **sum** of both
+/// attempts so the caller gets the true cost of the run.
+#[derive(Debug, Clone, Default)]
+pub struct LlmCallMetrics {
+    pub provider: String,
+    pub model: String,
+    pub tokens_in: Option<u32>,
+    pub tokens_out: Option<u32>,
+    pub retried: bool,
+}
+
 /// Successful outcome of a `triage_structured` call.
 ///
 /// `validator_warnings` are soft-warn issues (e.g. rubric-row miss) that were
@@ -44,6 +57,7 @@ pub struct StructuredOutcome {
     pub report: StructuredTriageReport,
     pub redaction_counts: Option<RedactionCounts>,
     pub validator_warnings: Vec<String>,
+    pub llm_metrics: LlmCallMetrics,
 }
 
 static FENCE_RE: Lazy<Regex> =
@@ -316,11 +330,13 @@ pub async fn triage_structured(
         (raw_user, None)
     };
 
+    let provider_name = provider.name().to_string();
+
     // First attempt.
-    let first_raw = provider
+    let first_result = provider
         .complete(&user_prompt, &system_prompt, &resolved_model)
         .await?;
-    let first_attempt = try_parse_and_validate(&first_raw, rubric);
+    let first_attempt = try_parse_and_validate(&first_result.text, rubric);
 
     if let TryOutcome::Ok { report, warnings } = first_attempt {
         let mut all_warnings = warnings;
@@ -333,6 +349,13 @@ pub async fn triage_structured(
             report,
             redaction_counts,
             validator_warnings: all_warnings,
+            llm_metrics: LlmCallMetrics {
+                provider: provider_name,
+                model: resolved_model,
+                tokens_in: first_result.tokens_in,
+                tokens_out: first_result.tokens_out,
+                retried: false,
+            },
         });
     }
 
@@ -343,7 +366,7 @@ pub async fn triage_structured(
         );
         eprintln!(
             "triage_structured: raw response (truncated):\n{}",
-            response_preview(&first_raw)
+            response_preview(&first_result.text)
         );
     }
 
@@ -354,11 +377,13 @@ pub async fn triage_structured(
     };
     let retry_prompt = build_corrective_user_message(&user_prompt, parse_err, val_errs);
 
-    // Second attempt.
-    let second_raw = provider
+    // Second attempt. Accumulate token counts from both attempts.
+    let second_result = provider
         .complete(&retry_prompt, &system_prompt, &resolved_model)
         .await?;
-    match try_parse_and_validate(&second_raw, rubric) {
+    let combined_tokens_in = add_option_u32(first_result.tokens_in, second_result.tokens_in);
+    let combined_tokens_out = add_option_u32(first_result.tokens_out, second_result.tokens_out);
+    match try_parse_and_validate(&second_result.text, rubric) {
         TryOutcome::Ok { report, warnings } => {
             let mut all_warnings = warnings;
             if !bundle.evidence_index.is_empty() {
@@ -370,18 +395,25 @@ pub async fn triage_structured(
                 report,
                 redaction_counts,
                 validator_warnings: all_warnings,
+                llm_metrics: LlmCallMetrics {
+                    provider: provider_name,
+                    model: resolved_model,
+                    tokens_in: combined_tokens_in,
+                    tokens_out: combined_tokens_out,
+                    retried: true,
+                },
             })
         }
         TryOutcome::ParseError(e) => {
             if verbose {
                 eprintln!(
                     "triage_structured: retry response (truncated):\n{}",
-                    response_preview(&second_raw)
+                    response_preview(&second_result.text)
                 );
             }
             Err(LlmError::StructuredAfterRetry {
                 message: format!("parse error after retry: {e}"),
-                raw_response: second_raw,
+                raw_response: second_result.text,
                 validation_errors: Vec::new(),
             })
         }
@@ -389,15 +421,24 @@ pub async fn triage_structured(
             if verbose {
                 eprintln!(
                     "triage_structured: retry validation failed: {errs:?}\n{}",
-                    response_preview(&second_raw)
+                    response_preview(&second_result.text)
                 );
             }
             Err(LlmError::StructuredAfterRetry {
                 message: "validation failed after retry".into(),
-                raw_response: second_raw,
+                raw_response: second_result.text,
                 validation_errors: errs,
             })
         }
+    }
+}
+
+fn add_option_u32(a: Option<u32>, b: Option<u32>) -> Option<u32> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.saturating_add(y)),
+        (Some(x), None) => Some(x),
+        (None, Some(y)) => Some(y),
+        (None, None) => None,
     }
 }
 
@@ -467,10 +508,10 @@ pub async fn extract_site(
         ticket.requester_org.as_deref().unwrap_or("(none)"),
         desc_head
     );
-    let raw = provider
+    let result = provider
         .complete(&prompt, SITE_EXTRACTION_PROMPT, &resolved_model)
         .await?;
-    let payload = extract_json_object(&raw);
+    let payload = extract_json_object(&result.text);
     let Ok(data) = serde_json::from_str::<Value>(payload) else {
         return Ok(None);
     };
@@ -496,10 +537,10 @@ pub async fn extract_anchor(
         .map(str::to_string)
         .unwrap_or_else(|| model_for_provider(provider.name()));
     let prompt = ticket_for_anchor(ticket);
-    let raw = provider
+    let result = provider
         .complete(&prompt, ANCHOR_EXTRACTION_PROMPT, &resolved_model)
         .await?;
-    let payload = extract_json_object(&raw);
+    let payload = extract_json_object(&result.text);
     let Ok(data) = serde_json::from_str::<Value>(payload) else {
         return Ok(None);
     };

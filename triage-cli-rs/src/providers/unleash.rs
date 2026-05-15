@@ -8,7 +8,7 @@ use std::time::Duration;
 use reqwest::Client;
 use serde_json::{json, Value};
 
-use super::{base_url, required_env, LlmProvider, ProviderError};
+use super::{base_url, required_env, CompletionResult, LlmProvider, ProviderError};
 
 const DEFAULT_BASE_URL: &str = "https://e-api.unleash.so";
 const LLM_TIMEOUT_SECS: u64 = 90;
@@ -25,7 +25,7 @@ impl LlmProvider for UnleashProvider {
         prompt: &'a str,
         system_prompt: &'a str,
         _model: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<String, ProviderError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<CompletionResult, ProviderError>> + Send + 'a>> {
         Box::pin(async move {
             let endpoint = format!("{}/chats", base_url("UNLEASH_BASE_URL", DEFAULT_BASE_URL));
             let headers = unleash_headers()?;
@@ -47,7 +47,8 @@ impl LlmProvider for UnleashProvider {
                     .unwrap_or_default();
                 return Err(ProviderError::NoText("Unleash", rid));
             }
-            Ok(text)
+            let (tokens_in, tokens_out) = unleash_token_counts(&data);
+            Ok(CompletionResult { text, tokens_in, tokens_out })
         })
     }
 }
@@ -98,6 +99,45 @@ fn unleash_text_from_response(data: &Value) -> String {
         }
         _ => String::new(),
     }
+}
+
+/// Extract token usage counts from the Unleash response when present.
+/// Tries common field paths used by LLM gateway APIs; returns `(None, None)`
+/// if the fields are absent (non-fatal — token counts are best-effort).
+fn unleash_token_counts(data: &Value) -> (Option<u32>, Option<u32>) {
+    // Try top-level `usage` object (e.g. { "usage": { "input_tokens": N, "output_tokens": N } })
+    if let Some(usage) = data.get("usage") {
+        let tin = usage
+            .get("input_tokens")
+            .or_else(|| usage.get("prompt_tokens"))
+            .and_then(Value::as_u64)
+            .map(|n| n as u32);
+        let tout = usage
+            .get("output_tokens")
+            .or_else(|| usage.get("completion_tokens"))
+            .and_then(Value::as_u64)
+            .map(|n| n as u32);
+        if tin.is_some() || tout.is_some() {
+            return (tin, tout);
+        }
+    }
+    // Try `message.usage` (some gateway shapes nest it there)
+    if let Some(msg_usage) = data.get("message").and_then(|m| m.get("usage")) {
+        let tin = msg_usage
+            .get("input_tokens")
+            .or_else(|| msg_usage.get("prompt_tokens"))
+            .and_then(Value::as_u64)
+            .map(|n| n as u32);
+        let tout = msg_usage
+            .get("output_tokens")
+            .or_else(|| msg_usage.get("completion_tokens"))
+            .and_then(Value::as_u64)
+            .map(|n| n as u32);
+        if tin.is_some() || tout.is_some() {
+            return (tin, tout);
+        }
+    }
+    (None, None)
 }
 
 fn request_id_from_payload(data: &Value) -> Option<String> {
