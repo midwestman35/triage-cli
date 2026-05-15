@@ -39,10 +39,7 @@ static STREET_SUFFIXES: &str = concat!(
 );
 
 static ADDRESS_PATTERN: Lazy<Regex> = Lazy::new(|| {
-    let pattern = format!(
-        r"\b\d+\s+(?:[A-Z][A-Za-z'-]*\s+)+(?:{})\b",
-        STREET_SUFFIXES
-    );
+    let pattern = format!(r"\b\d+\s+(?:[A-Z][A-Za-z'-]*\s+)+(?:{})\b", STREET_SUFFIXES);
     Regex::new(&pattern).expect("address regex")
 });
 
@@ -87,14 +84,15 @@ pub fn redact(text: &str) -> (String, RedactionCounts) {
         "<PHONE>".to_string()
     });
 
-    let address_replaced = ADDRESS_PATTERN.replace_all(&phone_replaced, |caps: &regex::Captures| {
-        let matched = &caps[0];
-        if is_pre_redacted(matched) {
-            return matched.to_string();
-        }
-        counts.addresses += 1;
-        "<ADDR>".to_string()
-    });
+    let address_replaced =
+        ADDRESS_PATTERN.replace_all(&phone_replaced, |caps: &regex::Captures| {
+            let matched = &caps[0];
+            if is_pre_redacted(matched) {
+                return matched.to_string();
+            }
+            counts.addresses += 1;
+            "<ADDR>".to_string()
+        });
 
     let coord_replaced = COORD_PATTERN.replace_all(&address_replaced, |caps: &regex::Captures| {
         let matched = &caps[0];

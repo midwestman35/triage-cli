@@ -31,12 +31,10 @@ cp .env.example .env
 # 4. Fill in:
 #    ZENDESK_SUBDOMAIN, ZENDESK_EMAIL, ZENDESK_API_TOKEN
 #    DD_API_KEY, DD_APP_KEY only if using Datadog enrichment
-#    (DD_SITE, DD_CALL_CENTER_TAG, ANTHROPIC_MODEL have working defaults)
+#    (DD_SITE, DD_CALL_CENTER_TAG have working defaults)
+#    LLM_PROVIDER defaults to unleash (HTTP); UNLEASH_API_KEY + UNLEASH_ASSISTANT_ID required.
 
-# 5. Authenticate Claude CLI once if using triage/watch reports
-claude   # type a message, confirm OAuth, exit
-
-# 6. Build the site map if using triage/watch site resolution
+# 5. Build the site map if using triage/watch site resolution
 triage-cli build-map
 ```
 
@@ -148,11 +146,10 @@ ZENDESK_SUBDOMAIN          # required — the part before .zendesk.com
 ZENDESK_EMAIL              # required — the agent email used as Basic-auth user
 ZENDESK_API_TOKEN          # required — Zendesk API token (NOT a password)
 
-LLM_PROVIDER               # default unleash — options: unleash, claude, openai
+LLM_PROVIDER               # default unleash — options: unleash, codex
 UNLEASH_API_KEY            # required when LLM_PROVIDER=unleash
-UNLEASH_ASSISTANT_ID       # required when LLM_PROVIDER=unleash
-OPENAI_API_KEY             # required when LLM_PROVIDER=openai
-ANTHROPIC_MODEL            # default claude-sonnet-4-6 (used when LLM_PROVIDER=claude)
+UNLEASH_ASSISTANT_ID       # required when LLM_PROVIDER=unleash (selects model server-side)
+CODEX_MODEL                # default gpt-5-codex (used when LLM_PROVIDER=codex)
 
 DD_API_KEY                 # optional — Datadog API key for triage/watch enrichment
 DD_APP_KEY                 # optional — Datadog application key for triage/watch enrichment
@@ -161,7 +158,9 @@ DD_CALL_CENTER_TAG         # default @log.machineData.callCenterName
 DD_STATION_TAG             # reserved for v2 station-level filtering; unused today
 ```
 
-When `LLM_PROVIDER=claude`, the Agent SDK reuses Claude CLI's OAuth session — no `ANTHROPIC_API_KEY` needed.
+When `LLM_PROVIDER=codex`, the `codex` CLI inherits the operator's existing
+codex OAuth session — no extra API key needed. The `claude` and `openai`
+providers were removed 2026-05-14; see `docs/adr/0002-prune-claude-openai-providers.md`.
 
 ## Common workflows
 

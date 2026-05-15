@@ -107,24 +107,21 @@ cp .env.example .env
 | `DD_SITE` | Datadog site host. Default `datadoghq.com`. |
 | `DD_CALL_CENTER_TAG` | Datadog tag key for the call-center filter. Default `@log.machineData.callCenterName`. |
 | `DD_STATION_TAG` | Reserved for future station-level filtering. Currently unused. |
-| `LLM_PROVIDER` | `unleash` (default), `claude`, `codex`, or `openai`. |
+| `LLM_PROVIDER` | `unleash` (default) or `codex`. |
 | `UNLEASH_API_KEY` | Required when `LLM_PROVIDER=unleash`. |
-| `UNLEASH_ASSISTANT_ID` | Required when `LLM_PROVIDER=unleash`. |
-| `OPENAI_API_KEY` | Required when `LLM_PROVIDER=openai`. |
-| `ANTHROPIC_MODEL` | Model identifier for the Claude / Codex providers. |
-| `OPENAI_MODEL` | Model identifier for the OpenAI Responses API. |
+| `UNLEASH_ASSISTANT_ID` | Required when `LLM_PROVIDER=unleash`. The model is selected server-side by the assistant; the CLI does not pass a model parameter. |
+| `CODEX_MODEL` | Model identifier passed to `codex exec` when `LLM_PROVIDER=codex`. Default `gpt-5-codex`. |
 
 ## LLM providers
 
 | Value | Mechanism | Auth | Notes |
 |---|---|---|---|
-| `unleash` *(default)* | HTTP to `/chats` | `UNLEASH_API_KEY` + `UNLEASH_ASSISTANT_ID` | Internal Axon gateway |
-| `claude` | Subprocess to `claude --print` | Inherits Claude Code OAuth | `claude` must be on PATH |
-| `codex` | Subprocess to `codex exec` | Inherits codex OAuth | `codex` must be on PATH (untested; see `triage-cli-rs/REGRESSIONS.md` R2) |
-| `openai` | HTTP to `/responses` | `OPENAI_API_KEY` | |
+| `unleash` *(default)* | HTTP to `/chats` | `UNLEASH_API_KEY` + `UNLEASH_ASSISTANT_ID` | Internal Axon gateway. Model is chosen server-side by the assistant ID. |
+| `codex` | Subprocess to `codex exec` | Inherits codex OAuth | `codex` must be on PATH. Default model `gpt-5-codex`, override with `CODEX_MODEL`. |
 
-When `LLM_PROVIDER=claude`, no `ANTHROPIC_API_KEY` is needed — the subprocess
-inherits Claude Code's OAuth session.
+`unleash` is the production path; `codex` is the dev escape hatch when the
+gateway is unreachable. The `claude` and `openai` providers were removed
+2026-05-14 — see `docs/adr/0002-prune-claude-openai-providers.md`.
 
 ## Building the site map
 
@@ -140,8 +137,8 @@ triage-cli build-map
 
 This rewrites `data/cnc-map.json` and `data/cnc-map-gaps.md` (the latter
 records inventory rows missing a CNC UUID or `site_name`). When the upstream
-Confluence inventory changes, refresh `apex-cnc-inventory.md` out-of-band —
-re-run the Claude Confluence connector against the source page, then re-run
+Confluence inventory changes, refresh `apex-cnc-inventory.md` out-of-band
+(e.g. via the operator's Confluence-connected chat client), then re-run
 `build-map`. There is no Confluence module in this repo by design.
 
 ## Usage
@@ -336,7 +333,7 @@ triage-cli/
         ├── zendesk.rs              # Zendesk HTTP client
         ├── datadog.rs              # Datadog Logs v2 HTTP client
         ├── llm.rs                  # provider dispatch + structured output + retry
-        ├── providers/              # unleash, openai, claude, codex
+        ├── providers/              # mod, unleash, codex
         ├── tui/                    # inbox ratatui app
         ├── models.rs               # serde data models
         ├── memory.rs               # MEMORY.md + FTS5 (schema v2)

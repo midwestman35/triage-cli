@@ -14,7 +14,7 @@ use crate::models::{
 
 /// Create a guided investigation session from a fetched Zendesk ticket.
 pub fn create_session(ticket: Ticket) -> InvestigationSession {
-    let comments: Vec<Comment> = ticket.comments.iter().cloned().collect();
+    let comments: Vec<Comment> = ticket.comments.to_vec();
     let evidence = InvestigationEvidence {
         ticket_id: ticket.id,
         comments: comments.clone(),
@@ -36,7 +36,11 @@ pub fn create_session(ticket: Ticket) -> InvestigationSession {
     for (index, comment) in comments.iter().enumerate() {
         timeline.push(comment_event(comment, index));
         for (a_idx, _att) in comment.attachments.iter().enumerate() {
-            timeline.push(attachment_event_from_comment(comment, &comment.attachments[a_idx], a_idx));
+            timeline.push(attachment_event_from_comment(
+                comment,
+                &comment.attachments[a_idx],
+                a_idx,
+            ));
         }
     }
     sort_timeline(&mut timeline);
@@ -94,7 +98,11 @@ pub fn add_pasted_evidence(
 }
 
 fn comment_event(comment: &Comment, index: usize) -> TimelineEvent {
-    let visibility = if comment.is_public { "public" } else { "internal" };
+    let visibility = if comment.is_public {
+        "public"
+    } else {
+        "internal"
+    };
     let first_line = first_line(&comment.body);
     TimelineEvent {
         timestamp: Some(comment.created_at),
@@ -172,11 +180,13 @@ fn first_line(text: &str) -> String {
     line.chars().take(160).collect()
 }
 
-fn sort_timeline(events: &mut Vec<TimelineEvent>) {
-    events.sort_by_key(|e| e.timestamp.unwrap_or_else(|| DateTime::<Utc>::MAX_UTC));
+fn sort_timeline(events: &mut [TimelineEvent]) {
+    events.sort_by_key(|e| e.timestamp.unwrap_or(DateTime::<Utc>::MAX_UTC));
 }
 
 #[allow(dead_code)]
 fn _file_basename(p: &Path) -> PathBuf {
-    p.file_name().map(PathBuf::from).unwrap_or_else(|| p.to_path_buf())
+    p.file_name()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| p.to_path_buf())
 }

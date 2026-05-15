@@ -154,9 +154,7 @@ pub fn stash_debug_response(
 ) -> Result<PathBuf, TicketFolderError> {
     let folder = root.join(ticket_id.to_string()).join(".debug");
     std::fs::create_dir_all(&folder)?;
-    let stamp = Utc::now()
-        .format("%Y%m%dT%H%M%SZ")
-        .to_string();
+    let stamp = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
     let path = folder.join(format!("llm-response-{stamp}.json"));
     atomic_write(&path, raw_response)?;
     Ok(path)
@@ -175,7 +173,8 @@ fn atomic_write(target: &Path, contents: &str) -> Result<(), TicketFolderError> 
         tmp.write_all(b"\n")?;
     }
     tmp.flush()?;
-    tmp.persist(target).map_err(|e| TicketFolderError::Io(e.error))?;
+    tmp.persist(target)
+        .map_err(|e| TicketFolderError::Io(e.error))?;
     Ok(())
 }
 
@@ -190,24 +189,48 @@ fn render_intake_md(b: &IntakeBlock) -> String {
     out.push_str("## Housekeeping\n\n");
     let mark = if b.housekeeping_complete { "x" } else { " " };
     out.push_str(&format!("- [{mark}] Ticket directory created.\n"));
-    out.push_str(&format!("- [{mark}] Artifacts grouped under the ticket folder.\n"));
-    out.push_str(&format!("- [{mark}] No new investigation files left loose.\n\n"));
+    out.push_str(&format!(
+        "- [{mark}] Artifacts grouped under the ticket folder.\n"
+    ));
+    out.push_str(&format!(
+        "- [{mark}] No new investigation files left loose.\n\n"
+    ));
 
     let t = &b.ticket;
     out.push_str("## Ticket\n\n");
     out.push_str(&format!("- Zendesk ticket: {}\n", t.zendesk_id));
     out.push_str(&format!("- URL: {}\n", t.url));
-    out.push_str(&format!("- Status / priority: {} / {}\n", non_empty(&t.status), non_empty(&t.priority)));
+    out.push_str(&format!(
+        "- Status / priority: {} / {}\n",
+        non_empty(&t.status),
+        non_empty(&t.priority)
+    ));
     out.push_str(&format!("- Tags: {}\n", join_or_dash(&t.tags)));
     out.push_str(&format!("- Requester: {}\n", non_empty(&t.requester)));
     out.push_str(&format!("- Organization: {}\n", non_empty(&t.organization)));
-    out.push_str(&format!("- Site / CNC: {} / {}\n", opt(&t.site), opt(&t.cnc)));
+    out.push_str(&format!(
+        "- Site / CNC: {} / {}\n",
+        opt(&t.site),
+        opt(&t.cnc)
+    ));
     out.push_str(&format!("- Region: {}\n", opt(&t.region)));
-    out.push_str(&format!("- Affected station(s): {}\n", join_or_dash(&t.affected_stations)));
-    out.push_str(&format!("- Affected agent(s): {}\n", join_or_dash(&t.affected_agents)));
+    out.push_str(&format!(
+        "- Affected station(s): {}\n",
+        join_or_dash(&t.affected_stations)
+    ));
+    out.push_str(&format!(
+        "- Affected agent(s): {}\n",
+        join_or_dash(&t.affected_agents)
+    ));
     out.push_str(&format!("- Call ID: {}\n", opt(&t.call_id)));
-    out.push_str(&format!("- Incident window: {}\n", non_empty(&t.incident_window)));
-    out.push_str(&format!("- Reported symptom: {}\n\n", non_empty(&t.reported_symptom)));
+    out.push_str(&format!(
+        "- Incident window: {}\n",
+        non_empty(&t.incident_window)
+    ));
+    out.push_str(&format!(
+        "- Reported symptom: {}\n\n",
+        non_empty(&t.reported_symptom)
+    ));
 
     out.push_str("## One-Line Fingerprint\n\n");
     out.push_str(&format!("`{}`\n\n", non_empty(&b.one_line_fingerprint)));
@@ -239,7 +262,10 @@ fn render_intake_md(b: &IntakeBlock) -> String {
     out.push('\n');
 
     out.push_str("## Initial Route\n\n");
-    out.push_str(&format!("- Hypothesis: {}\n", non_empty(&b.initial_route.hypothesis)));
+    out.push_str(&format!(
+        "- Hypothesis: {}\n",
+        non_empty(&b.initial_route.hypothesis)
+    ));
     out.push_str(&format!(
         "- Justification: {}\n\n",
         non_empty(&b.initial_route.justification)
@@ -297,10 +323,7 @@ fn render_evidence_preflight_md(b: &PreflightBlock) -> String {
     write_bullets_or_none(&mut out, &b.missing_or_non_decisive);
 
     let _ = &PreflightBlock::default(); // ensure trait import used; cheap
-    let _ = (
-        GatheredEvidence::default(),
-        ContextPull::default(),
-    );
+    let _ = (GatheredEvidence::default(), ContextPull::default());
 
     out
 }
@@ -356,7 +379,9 @@ fn render_fork_packet_md(p: &ForkPacket) -> String {
     out.push_str(&format!("- Jira: {jira}\n"));
     out.push_str(&format!(
         "- Master ticket: {}\n",
-        r.master.map(|i| i.to_string()).unwrap_or_else(|| "(none)".into())
+        r.master
+            .map(|i| i.to_string())
+            .unwrap_or_else(|| "(none)".into())
     ));
     out.push_str(&format!(
         "- Cluster: {}\n\n",
@@ -364,10 +389,22 @@ fn render_fork_packet_md(p: &ForkPacket) -> String {
     ));
 
     out.push_str("## Handoff\n\n");
-    out.push_str(&handoff_line("Engineering Jira", &p.handoff.engineering_jira_needed));
-    out.push_str(&handoff_line("Vendor / Internal IT", &p.handoff.vendor_or_it_needed));
-    out.push_str(&handoff_line("Customer note", &p.handoff.customer_note_needed));
-    out.push_str(&handoff_line("Internal Zendesk note", &p.handoff.internal_note_needed));
+    out.push_str(&handoff_line(
+        "Engineering Jira",
+        &p.handoff.engineering_jira_needed,
+    ));
+    out.push_str(&handoff_line(
+        "Vendor / Internal IT",
+        &p.handoff.vendor_or_it_needed,
+    ));
+    out.push_str(&handoff_line(
+        "Customer note",
+        &p.handoff.customer_note_needed,
+    ));
+    out.push_str(&handoff_line(
+        "Internal Zendesk note",
+        &p.handoff.internal_note_needed,
+    ));
 
     out
 }
@@ -461,7 +498,10 @@ fn render_state_md(
         "quoted_rubric_row: {}\n",
         yaml_scalar(&c.quoted_rubric_row)
     ));
-    out.push_str(&format!("rubric_version: {}\n", yaml_scalar(&report.rubric_version)));
+    out.push_str(&format!(
+        "rubric_version: {}\n",
+        yaml_scalar(&report.rubric_version)
+    ));
     out.push_str(&format!("owner: {}\n", yaml_scalar(owner)));
     out.push_str(&format!("created_at: {now}\n"));
     out.push_str(&format!("updated_at: {now}\n"));
@@ -471,11 +511,16 @@ fn render_state_md(
     out.push_str(&format!("  jira: {}\n", yaml_str_list(&r.jira)));
     out.push_str(&format!(
         "  master: {}\n",
-        r.master.map(|i| i.to_string()).unwrap_or_else(|| "null".into())
+        r.master
+            .map(|i| i.to_string())
+            .unwrap_or_else(|| "null".into())
     ));
     out.push_str(&format!(
         "cluster: {}\n",
-        r.cluster.as_deref().map(yaml_scalar).unwrap_or_else(|| "null".into())
+        r.cluster
+            .as_deref()
+            .map(yaml_scalar)
+            .unwrap_or_else(|| "null".into())
     ));
     out.push_str(&format!(
         "validator_warnings: {}\n",
@@ -517,7 +562,9 @@ fn non_empty_block(s: &str) -> String {
 }
 
 fn opt(o: &Option<String>) -> String {
-    o.as_deref().map(non_empty).unwrap_or_else(|| "_(unset)_".into())
+    o.as_deref()
+        .map(non_empty)
+        .unwrap_or_else(|| "_(unset)_".into())
 }
 
 fn join_or_dash(items: &[String]) -> String {
@@ -667,9 +714,9 @@ const _UNUSED: fn(ForkLetter, &ForkPacket) = |_, _| {};
 mod tests {
     use super::*;
     use crate::models::{
-        Confidence, DraftsBlock, ForkCommitment, ForkPacket, GatheredEvidence,
-        HandoffBlock, HandoffItem, InitialRoute, IntakeBlock, IntakeDecision,
-        IntakeTicketFacts, JiraDraft, PreflightBlock, RelatedWork,
+        Confidence, DraftsBlock, ForkCommitment, ForkPacket, GatheredEvidence, HandoffBlock,
+        HandoffItem, InitialRoute, IntakeBlock, IntakeDecision, IntakeTicketFacts, JiraDraft,
+        PreflightBlock, RelatedWork,
     };
     use tempfile::TempDir;
 
@@ -694,7 +741,8 @@ mod tests {
                     incident_window: "2026-05-12 06:30:30-06:31:10 UTC".into(),
                     reported_symptom: "All consoles flickered black".into(),
                 },
-                one_line_fingerprint: "JeffCom / us-co-jeffcom-apex / network error / 06:30 UTC".into(),
+                one_line_fingerprint: "JeffCom / us-co-jeffcom-apex / network error / 06:30 UTC"
+                    .into(),
                 ticket_summary: vec!["Brief multi-console outage".into()],
                 context_pulls: vec![ContextPull {
                     pull: "Last related tickets".into(),
@@ -721,7 +769,8 @@ mod tests {
                 commitment: ForkCommitment {
                     fork_letter: ForkLetter::B,
                     confidence: Confidence::Medium,
-                    quoted_rubric_row: "customer LAN, switch, or SDWAN. Link to site master ticket".into(),
+                    quoted_rubric_row: "customer LAN, switch, or SDWAN. Link to site master ticket"
+                        .into(),
                     rubric_class: "Symptom Class 3".into(),
                     reasoning: "Multi-station signal is Class 3 (b)".into(),
                 },
@@ -734,7 +783,10 @@ mod tests {
                     cluster: Some("jeffcom-network-error".into()),
                 },
                 handoff: HandoffBlock {
-                    engineering_jira_needed: HandoffItem { needed: false, reason: "".into() },
+                    engineering_jira_needed: HandoffItem {
+                        needed: false,
+                        reason: "".into(),
+                    },
                     vendor_or_it_needed: HandoffItem {
                         needed: true,
                         reason: "Request RCA".into(),
@@ -762,8 +814,7 @@ mod tests {
     fn writes_five_files() {
         let tmp = TempDir::new().unwrap();
         let r = sample_report();
-        let paths =
-            write_ticket_folder(&r, tmp.path(), "test.user@axon.com", &[], false).unwrap();
+        let paths = write_ticket_folder(&r, tmp.path(), "test.user@axon.com", &[], false).unwrap();
         for p in [
             &paths.intake,
             &paths.evidence_preflight,
@@ -885,7 +936,11 @@ mod tests {
         let p = stash_debug_response(tmp.path(), 44671, "{\"oops\":true}").unwrap();
         assert!(p.exists());
         assert!(p.starts_with(tmp.path().join("44671").join(".debug")));
-        assert!(p.file_name().unwrap().to_string_lossy().starts_with("llm-response-"));
+        assert!(p
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("llm-response-"));
     }
 
     #[test]
@@ -909,8 +964,7 @@ mod tests {
         // Mutate the report so Bob's would-be INTAKE.md differs byte-for-byte.
         r.intake.one_line_fingerprint = "BOB-OVERWRITE-ATTEMPT".into();
         // Bob attempts to overwrite without --force.
-        let err =
-            write_ticket_folder(&r, tmp.path(), "bob@example.com", &[], false).unwrap_err();
+        let err = write_ticket_folder(&r, tmp.path(), "bob@example.com", &[], false).unwrap_err();
         match err {
             TicketFolderError::SoftLockConflict {
                 existing_owner,
@@ -941,8 +995,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let r = sample_report();
         write_ticket_folder(&r, tmp.path(), "alice@example.com", &[], false).unwrap();
-        let paths =
-            write_ticket_folder(&r, tmp.path(), "alice@example.com", &[], false).unwrap();
+        let paths = write_ticket_folder(&r, tmp.path(), "alice@example.com", &[], false).unwrap();
         assert!(paths.state.exists());
         let owner = read_state_owner(&paths.state).unwrap();
         assert_eq!(owner, "alice@example.com");
@@ -954,8 +1007,7 @@ mod tests {
         let r = sample_report();
         write_ticket_folder(&r, tmp.path(), "alice@example.com", &[], false).unwrap();
         // Bob takes over with force=true.
-        let paths =
-            write_ticket_folder(&r, tmp.path(), "bob@example.com", &[], true).unwrap();
+        let paths = write_ticket_folder(&r, tmp.path(), "bob@example.com", &[], true).unwrap();
         let owner = read_state_owner(&paths.state).unwrap();
         assert_eq!(owner, "bob@example.com");
     }
@@ -965,8 +1017,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let r = sample_report();
         // No prior STATE.md. force=false is fine.
-        let paths =
-            write_ticket_folder(&r, tmp.path(), "alice@example.com", &[], false).unwrap();
+        let paths = write_ticket_folder(&r, tmp.path(), "alice@example.com", &[], false).unwrap();
         assert!(paths.state.exists());
     }
 
@@ -985,7 +1036,11 @@ mod tests {
         // Sanity: report fork is B in the sample.
         assert_eq!(r.fork_packet.commitment.fork_letter.as_str(), "B");
         let diff = compute_state_diff(&existing, &r, "alice@example.com");
-        assert_eq!(diff.len(), 1, "expected only `fork` to differ, got {diff:?}");
+        assert_eq!(
+            diff.len(),
+            1,
+            "expected only `fork` to differ, got {diff:?}"
+        );
         assert_eq!(diff[0].0, "fork");
         assert_eq!(diff[0].1, "A");
         assert_eq!(diff[0].2, "B");
@@ -1003,8 +1058,7 @@ mod tests {
     fn read_existing_state_parses_all_fields() {
         let tmp = TempDir::new().unwrap();
         let r = sample_report();
-        let paths =
-            write_ticket_folder(&r, tmp.path(), "alice@example.com", &[], false).unwrap();
+        let paths = write_ticket_folder(&r, tmp.path(), "alice@example.com", &[], false).unwrap();
         let parsed = read_existing_state(&paths.state).unwrap();
         assert_eq!(parsed.owner.as_deref(), Some("alice@example.com"));
         assert_eq!(parsed.fork.as_deref(), Some("B"));

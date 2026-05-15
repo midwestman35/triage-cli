@@ -15,8 +15,7 @@ use crate::models::{AnchorSource, SiteEntry, Ticket};
 static TICKET_URL_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"/(?:agent/)?tickets/(\d+)(?:[/?#].*)?$").unwrap());
 static RAW_ID_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^\d+$").unwrap());
-static SUBJECT_BRACKET_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(?i)\[([a-z0-9_]+)\]").unwrap());
+static SUBJECT_BRACKET_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)\[([a-z0-9_]+)\]").unwrap());
 
 #[derive(Debug, Error)]
 pub enum ExtractError {
@@ -36,9 +35,7 @@ pub enum ExtractError {
     EmptySiteOverride,
     #[error("--cnc cannot be empty")]
     EmptyCncOverride,
-    #[error(
-        "CNC override {0} not found in site map; run 'triage-cli build-map' to refresh"
-    )]
+    #[error("CNC override {0} not found in site map; run 'triage-cli build-map' to refresh")]
     CncOverrideNotFound(String),
     #[error("window minutes must be positive, got {0}")]
     NonPositiveWindow(i32),
@@ -94,9 +91,8 @@ pub fn load_site_map(path: &Path) -> Result<Vec<SiteEntry>, ExtractError> {
     if !path.exists() {
         return Err(ExtractError::SiteMapNotFound(path.display().to_string()));
     }
-    let raw = std::fs::read_to_string(path).map_err(|e| {
-        ExtractError::InvalidSiteMapJson(serde_json::Error::io(e))
-    })?;
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| ExtractError::InvalidSiteMapJson(serde_json::Error::io(e)))?;
     let json: serde_json::Value =
         serde_json::from_str(&raw).map_err(ExtractError::InvalidSiteMapJson)?;
     let arr = json.as_array().ok_or(ExtractError::SiteMapNotArray)?;
@@ -195,7 +191,7 @@ pub fn lookup_site(
         let sn = entry.site_name.to_ascii_lowercase();
         if !sn.is_empty()
             && haystack.contains(&sn)
-            && best_site.map_or(true, |b| entry.site_name.len() > b.site_name.len())
+            && best_site.is_none_or(|b| entry.site_name.len() > b.site_name.len())
         {
             best_site = Some(entry);
         }
@@ -209,7 +205,7 @@ pub fn lookup_site(
         let fn_lc = entry.friendly_name.to_ascii_lowercase();
         if !fn_lc.is_empty()
             && haystack.contains(&fn_lc)
-            && best_friendly.map_or(true, |b| entry.friendly_name.len() > b.friendly_name.len())
+            && best_friendly.is_none_or(|b| entry.friendly_name.len() > b.friendly_name.len())
         {
             best_friendly = Some(entry);
         }

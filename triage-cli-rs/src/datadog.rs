@@ -103,7 +103,10 @@ impl DatadogClient {
         Self::new(
             api_key,
             app_key,
-            env::var("DD_SITE").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| DEFAULT_SITE.into()),
+            env::var("DD_SITE")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| DEFAULT_SITE.into()),
             env::var("DD_CALL_CENTER_TAG")
                 .ok()
                 .filter(|s| !s.is_empty())
@@ -163,8 +166,14 @@ impl DatadogClient {
             .header(reqwest::header::ACCEPT, "application/json")
             .query(&[
                 ("filter[query]", query.as_str()),
-                ("filter[from]", &start.to_rfc3339_opts(SecondsFormat::Millis, true)),
-                ("filter[to]", &end.to_rfc3339_opts(SecondsFormat::Millis, true)),
+                (
+                    "filter[from]",
+                    &start.to_rfc3339_opts(SecondsFormat::Millis, true),
+                ),
+                (
+                    "filter[to]",
+                    &end.to_rfc3339_opts(SecondsFormat::Millis, true),
+                ),
                 ("sort", "timestamp"),
                 ("page[limit]", &self.max_lines.to_string()),
             ])
@@ -211,7 +220,7 @@ fn to_log_line(item: &Value) -> LogLine {
             .unwrap_or_else(|_| Utc::now()),
         Value::Number(n) => n
             .as_i64()
-            .and_then(|ms| DateTime::<Utc>::from_timestamp_millis(ms))
+            .and_then(DateTime::<Utc>::from_timestamp_millis)
             .unwrap_or_else(Utc::now),
         _ => Utc::now(),
     };
@@ -229,10 +238,7 @@ fn to_log_line(item: &Value) -> LogLine {
         .unwrap_or("")
         .to_string();
 
-    let attributes = inner
-        .as_object()
-        .cloned()
-        .unwrap_or_else(Map::new);
+    let attributes = inner.as_object().cloned().unwrap_or_else(Map::new);
 
     LogLine {
         timestamp,

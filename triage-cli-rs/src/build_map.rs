@@ -313,15 +313,8 @@ pub fn run() -> ExitCode {
         return ExitCode::FAILURE;
     }
     let gap_total = gaps.blank.len() + gaps.unparseable_label.len();
-    println!(
-        "Wrote {} entries to {}",
-        entries.len(),
-        map_path.display()
-    );
-    println!(
-        "Logged {gap_total} gaps to {}",
-        gaps_path.display()
-    );
+    println!("Wrote {} entries to {}", entries.len(), map_path.display());
+    println!("Logged {gap_total} gaps to {}", gaps_path.display());
     ExitCode::SUCCESS
 }
 

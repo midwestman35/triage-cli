@@ -1,15 +1,13 @@
 # Switch the LLM provider or model
 
-> **When to use this:** you want to move `triage`/watcher LLM calls between Unleash, Claude Code, and OpenAI/Codex HTTP, or pin a different provider model.
+> **When to use this:** you want to move `triage`/`investigate`/`watch` LLM calls between the internal Unleash gateway and a local `codex` CLI subprocess, or pin a different codex model.
 
-`triage_cli/llm.py` reads `LLM_PROVIDER` and dispatches through a small provider protocol. Supported values:
+`src/llm.rs` reads `LLM_PROVIDER` and dispatches through the provider trait in `src/providers/mod.rs`. As of 2026-05-14 only two values are accepted:
 
-| Provider | Env value | Required configuration |
-| --- | --- | --- |
-| Unleash | `unleash` | `UNLEASH_API_KEY`, `UNLEASH_ASSISTANT_ID`, optional `UNLEASH_BASE_URL`, optional `UNLEASH_ACCOUNT` |
-| Claude Code | `claude` | optional `ANTHROPIC_MODEL`; install `python -m pip install -e ".[claude]"` |
-| OpenAI Responses API | `openai` | `OPENAI_API_KEY`, optional `OPENAI_BASE_URL`, optional `OPENAI_MODEL` |
-| Codex HTTP alias | `codex` | same as `openai` |
+| Provider | Env value | Required configuration | Default model |
+| --- | --- | --- | --- |
+| Unleash (default) | `unleash` | `UNLEASH_API_KEY`, `UNLEASH_ASSISTANT_ID`; optional `UNLEASH_BASE_URL`, `UNLEASH_ACCOUNT` | Selected server-side by the assistant ID — the CLI does not pass a model parameter. |
+| Codex CLI | `codex` | `codex` binary on `PATH` + an existing codex OAuth session; optional `CODEX_MODEL` | `gpt-5-codex` |
 
 ## Steps
 
@@ -19,19 +17,19 @@
    $EDITOR .env
    ```
 
-   Examples:
+   Pick one of:
 
    ```dotenv
+   # Production path — HTTP to the internal Axon gateway.
    LLM_PROVIDER=unleash
    UNLEASH_API_KEY=...
    UNLEASH_ASSISTANT_ID=...
+   ```
 
-   LLM_PROVIDER=claude
-   ANTHROPIC_MODEL=claude-sonnet-4-6
-
-   LLM_PROVIDER=openai
-   OPENAI_API_KEY=...
-   OPENAI_MODEL=gpt-5.5
+   ```dotenv
+   # Dev escape hatch — subprocess to the local codex CLI.
+   LLM_PROVIDER=codex
+   CODEX_MODEL=gpt-5-codex   # optional; this is the default
    ```
 
 2. **Run a cheap triage smoke:**
@@ -42,21 +40,28 @@
 
    `--no-logs` confirms the provider call without spending Datadog quota.
 
-3. **If using Claude fallback, verify the local seat:**
+3. **If switching to codex, verify the local seat once:**
 
    ```bash
-   claude --print "ping" --model claude-sonnet-4-6
+   codex exec --model gpt-5-codex "ping"
    ```
+
+   You should see a non-empty response. If it fails, run `codex` once interactively to refresh the OAuth session.
 
 ## Verification
 
-- The triage command exits `0` and prints a four-section markdown note.
-- Provider-specific missing-env errors mention the missing variable before any network request is attempted.
-- Output style and length should match expectations for the selected provider/model.
+- The triage command exits `0` and writes the five-markdown ticket folder under `${TRIAGE_TICKETS_ROOT:-./Tickets}/<id>/`; `FORK_PACKET.md` also streams to stdout.
+- Missing-env errors mention the missing variable before any network request is attempted (`UNLEASH_API_KEY must be set`, `codex CLI not found on PATH`, etc.).
+- `triage-cli doctor` shows a green check for the selected provider.
 
 ## Troubleshooting
 
-- **`UNLEASH_API_KEY must be set` / `UNLEASH_ASSISTANT_ID must be set`** — fill in Unleash credentials or choose another provider.
-- **`OPENAI_API_KEY must be set`** — fill in an OpenAI key for `LLM_PROVIDER=openai` or `LLM_PROVIDER=codex`.
-- **`claude-agent-sdk is not installed`** — install the optional Claude fallback extra with `python -m pip install -e ".[claude]"`.
-- **"Model not found" or 404** — typo in the provider model ID, or that model is unavailable for the account. Cross-check provider access before changing prompts.
+- **`UNLEASH_API_KEY must be set` / `UNLEASH_ASSISTANT_ID must be set`** — fill in Unleash credentials, or switch to `LLM_PROVIDER=codex`.
+- **`codex CLI not found on PATH`** — install the `codex` CLI and ensure the binary is reachable. Confirm with `which codex`.
+- **`codex exec` returns an OAuth error** — run `codex` interactively in the same shell to refresh the OAuth session, then retry the triage.
+- **"Model not found" or 404** — typo in `CODEX_MODEL`, or the model is unavailable for the account. Cross-check with `codex exec --model <m> "ping"` directly before changing prompts.
+- **Unknown `LLM_PROVIDER` value** — only `unleash` and `codex` are accepted; `doctor` will reject anything else.
+
+## What was removed in 2026-05-14
+
+The `claude` and `openai` providers were deleted. See `docs/adr/0002-prune-claude-openai-providers.md` for the rationale, the consequences, and the reversal path if either provider needs to be reintroduced.

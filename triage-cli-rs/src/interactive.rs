@@ -133,10 +133,7 @@ pub fn resolve_destination(
         }
         if stored.is_some() && stored != Some(remote) {
             let mut n = 2;
-            while attachments_dir
-                .join(format!("{filename}.{n}"))
-                .exists()
-            {
+            while attachments_dir.join(format!("{filename}.{n}")).exists() {
                 n += 1;
             }
             return DownloadDecision {
@@ -208,7 +205,11 @@ pub async fn download_attachments(
         if decision.action == DownloadAction::Skip {
             eprintln!(
                 "  reused {} (manifest match)",
-                decision.path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()
+                decision
+                    .path
+                    .file_name()
+                    .map(|n| n.to_string_lossy())
+                    .unwrap_or_default()
             );
             let mut updated = a;
             updated.local_path = Some(decision.path);
@@ -217,14 +218,22 @@ pub async fn download_attachments(
         }
         eprint!(
             "  downloading {}... ",
-            decision.path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()
+            decision
+                .path
+                .file_name()
+                .map(|n| n.to_string_lossy())
+                .unwrap_or_default()
         );
         match zd.download_attachment(url, &decision.path, max_bytes).await {
             Ok((bytes_written, sha)) => {
                 eprintln!("done ({bytes_written} bytes)");
                 let _ = write_manifest_entry(
                     &workspace.attachments_dir,
-                    &decision.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                    &decision
+                        .path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
                     bytes_written,
                     &sha,
                 );

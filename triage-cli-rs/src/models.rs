@@ -423,7 +423,11 @@ impl TriageBundle {
         } else {
             for log in &self.log_lines {
                 let msg = indent_continuations(&log.message);
-                lines.push(format!("- {} [{}] {msg}", fmt_ts(&log.timestamp), log.level));
+                lines.push(format!(
+                    "- {} [{}] {msg}",
+                    fmt_ts(&log.timestamp),
+                    log.level
+                ));
             }
         }
 
@@ -470,12 +474,14 @@ fn fmt_size(size_bytes: Option<u64>) -> String {
 
 fn extend_with_attachment(out: &mut Vec<String>, a: &AttachmentEvidence) {
     let size = fmt_size(a.size_bytes);
-    let ctype = a.content_type.clone().unwrap_or_else(|| "unknown type".into());
+    let ctype = a
+        .content_type
+        .clone()
+        .unwrap_or_else(|| "unknown type".into());
     out.push(format!("- {} ({ctype}, {size})", a.filename));
     match &a.extracted_text {
         Some(text) => {
-            let truncated =
-                truncate_head_tail(text, EVIDENCE_HEAD_BYTES, EVIDENCE_TAIL_BYTES);
+            let truncated = truncate_head_tail(text, EVIDENCE_HEAD_BYTES, EVIDENCE_TAIL_BYTES);
             let trimmed = truncated.trim_end_matches('\n').to_string();
             out.push(indent_continuations(&format!("  {trimmed}")));
         }
@@ -497,8 +503,7 @@ fn extend_with_local_file(out: &mut Vec<String>, lf: &LocalFileEvidence) {
     out.push(format!("- {name} ({dtype}, {size})"));
     match &lf.extracted_text {
         Some(text) => {
-            let truncated =
-                truncate_head_tail(text, EVIDENCE_HEAD_BYTES, EVIDENCE_TAIL_BYTES);
+            let truncated = truncate_head_tail(text, EVIDENCE_HEAD_BYTES, EVIDENCE_TAIL_BYTES);
             let trimmed = truncated.trim_end_matches('\n').to_string();
             out.push(indent_continuations(&format!("  {trimmed}")));
         }
@@ -645,12 +650,9 @@ impl ForkPacket {
         }
 
         // Hard: D requires non-empty missing_evidence.
-        if self.commitment.fork_letter == ForkLetter::D && self.missing_evidence.is_empty()
-        {
-            out.errors.push(
-                "fork_letter is D (cannot fork yet) but missing_evidence is empty"
-                    .into(),
-            );
+        if self.commitment.fork_letter == ForkLetter::D && self.missing_evidence.is_empty() {
+            out.errors
+                .push("fork_letter is D (cannot fork yet) but missing_evidence is empty".into());
         }
 
         // Hard: D + high confidence is incoherent.
@@ -907,7 +909,10 @@ mod v1_reframe_tests {
         );
         assert!(outcome.has_warnings());
         assert!(
-            outcome.warnings.iter().any(|w| w.contains("not found verbatim")),
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.contains("not found verbatim")),
             "expected rubric-miss warning, got: {:?}",
             outcome.warnings,
         );
@@ -925,7 +930,10 @@ mod v1_reframe_tests {
         let outcome = packet.validate(&rubric);
         assert!(!outcome.is_acceptable());
         assert!(
-            outcome.errors.iter().any(|e| e.contains("missing_evidence is empty")),
+            outcome
+                .errors
+                .iter()
+                .any(|e| e.contains("missing_evidence is empty")),
             "expected D+empty-missing error, got: {:?}",
             outcome.errors,
         );
@@ -981,9 +989,11 @@ mod v1_reframe_tests {
                     affected_agents: vec!["Kyler Cook".into()],
                     call_id: None,
                     incident_window: "2026-05-12 06:30:30-06:31:10 UTC".into(),
-                    reported_symptom: "All consoles flickered black then showed Network Error Resolved".into(),
+                    reported_symptom:
+                        "All consoles flickered black then showed Network Error Resolved".into(),
                 },
-                one_line_fingerprint: "JeffCom / us-co-jeffcom-apex / all-console Network Error".into(),
+                one_line_fingerprint: "JeffCom / us-co-jeffcom-apex / all-console Network Error"
+                    .into(),
                 ticket_summary: vec!["Customer reports brief all-console outage".into()],
                 context_pulls: vec![ContextPull {
                     pull: "Last related Zendesk tickets".into(),
@@ -1022,7 +1032,10 @@ mod v1_reframe_tests {
         let outcome = report.validate(&rubric);
         assert!(outcome.is_acceptable());
         assert!(
-            outcome.warnings.iter().any(|w| w.contains("rubric_version")),
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.contains("rubric_version")),
             "expected version-drift warning, got: {:?}",
             outcome.warnings,
         );

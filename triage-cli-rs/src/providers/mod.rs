@@ -1,14 +1,10 @@
 //! LLM provider abstraction. Variant selected via `LLM_PROVIDER` env var.
 //!
 //! - `unleash` (default): HTTP to Unleash gateway (`/chats`)
-//! - `openai`: HTTP to OpenAI Responses API (`/responses`)
-//! - `claude`: subprocess to the `claude` CLI (inherits Claude Code OAuth)
 //! - `codex`: subprocess to `codex exec` (new — no Python equivalent; see
 //!   `REGRESSIONS.md` R2)
 
-pub mod claude;
 pub mod codex;
-pub mod openai;
 pub mod unleash;
 
 use std::env;
@@ -49,7 +45,7 @@ pub enum ProviderError {
     },
     #[error("{0} provider response did not include any assistant text.{1}")]
     NoText(&'static str, String),
-    #[error("Unknown LLM_PROVIDER: {0:?}. Valid: unleash, claude, openai, codex")]
+    #[error("Unknown LLM_PROVIDER: {0:?}. Valid: unleash, codex")]
     Unknown(String),
     #[error("subprocess {0} not found on PATH")]
     SubprocessMissing(&'static str),
@@ -62,14 +58,15 @@ pub fn get_provider() -> Result<Box<dyn LlmProvider>, ProviderError> {
     let raw = env::var("LLM_PROVIDER").unwrap_or_else(|_| "unleash".into());
     match raw.to_ascii_lowercase().as_str() {
         "unleash" => Ok(Box::new(unleash::UnleashProvider)),
-        "openai" => Ok(Box::new(openai::OpenAiProvider)),
-        "claude" => Ok(Box::new(claude::ClaudeSubprocessProvider)),
         "codex" => Ok(Box::new(codex::CodexSubprocessProvider)),
         _ => Err(ProviderError::Unknown(raw)),
     }
 }
 
-pub(crate) fn required_env(name: &'static str, provider: &'static str) -> Result<String, ProviderError> {
+pub(crate) fn required_env(
+    name: &'static str,
+    provider: &'static str,
+) -> Result<String, ProviderError> {
     let v = env::var(name).unwrap_or_default();
     let trimmed = v.trim();
     if trimmed.is_empty() {
