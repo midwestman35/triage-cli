@@ -194,6 +194,17 @@ Logging during the TUI run is redirected to a per-view file printed at startup s
 - Edition `2021`, MSRV `1.95`. Lint with `cargo clippy --all-targets -- -D warnings`; format with `cargo fmt --all`.
 - Architecture decisions are recorded in `docs/adr/`. Look there before proposing structural changes; if you make one, add an ADR.
 
+## Code philosophy — lessons learned
+
+Distilled from a bug-TODO sweep (2026-05-16). The meta-lesson: **a flagged TODO is a hypothesis, not a work order.** Validate each against the actual code and this architecture before changing anything; "this is a false positive, no change" is a legitimate and expected resolution. Roughly a third of an automated nitpick list is noise or net-negative here.
+
+- **Build a string with `write!`, not `push_str(&format!(...))`.** The latter allocates a throwaway `String` per call. Use `use std::fmt::Write as _;` and `let _ = writeln!(out, ...)` (writing to a `String` is infallible; `let _ =` over `.unwrap()` keeps the no-panic path). This is the standing convention for `ticket_folder.rs` and any other markdown/YAML renderer.
+- **Shell out with positional parameters, never interpolate paths into the script string.** `Command::new("sh").arg("-c").arg(format!("{cmd} \"$1\" \"$2\"")).arg("sh").arg(p1).arg(p2)` — paths arrive as `$1`/`$2` and cannot break out, so no hand-rolled quoting/escaping helper is needed (we deleted `shell_escape`). A `$DIFF_VIEWER`-style env command **is** intentionally evaluated as shell code: that is the operator's own environment (same trust model as `$PAGER`/`$GIT_EDITOR`), not an injection vuln. Say so in a comment instead of "hardening" it away.
+- **"Sync I/O in an async fn" is not automatically a defect.** Weigh frequency and blast radius against the cost of the fix. The watcher state file is ~1 KB written at most once per multi-second poll interval; making `load_state`/`save_state` async cascades into the deliberately-synchronous inbox TUI event handler (`tui/inbox.rs::handle_event`). Fighting an intentional architectural boundary for unmeasurable latency is the wrong trade — validated non-issue, left sync.
+- **Most "redundant clone" reports are necessary clones.** A clone that supplies both a map key *and* an owned struct field, one on a matched-once early-return path, or one that owns data borrowed from a longer-lived value, is not redundant. Only the genuinely free wins (e.g. `Option::as_deref()` instead of `Option::clone()` before formatting) are worth taking; skip the rest rather than churning the diff.
+- **Output-preserving refactors must stay byte-identical.** The five-markdown writer is covered by golden tests; the `write!` migration was verified to change zero bytes of output. When rewriting a renderer, lean on existing snapshot tests rather than eyeballing.
+- **Untested pure helpers are the cheapest, safest place to add value.** `parse_ticket_id`, `truncate_head_tail`, `indent_continuations`, `detect_file_type` — edge-case tests (overflow, exact-boundary, multibyte split, NUL/invalid-UTF-8) have no churn risk and document intent; prefer these over speculative perf edits.
+
 ## Environment variables (v1-specific)
 
 | Variable | Purpose |

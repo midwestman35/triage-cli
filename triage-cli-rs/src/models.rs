@@ -1020,6 +1020,69 @@ mod tests {
     }
 
     #[test]
+    fn indent_empty_string_is_empty() {
+        assert_eq!(indent_continuations(""), "");
+    }
+
+    #[test]
+    fn indent_no_newline_is_unchanged() {
+        assert_eq!(indent_continuations("single line"), "single line");
+    }
+
+    #[test]
+    fn indent_trailing_and_consecutive_newlines() {
+        // A trailing newline produces a trailing indent.
+        assert_eq!(indent_continuations("a\n"), "a\n  ");
+        // Blank lines between content are themselves indented.
+        assert_eq!(indent_continuations("a\n\nb"), "a\n  \n  b");
+        assert_eq!(indent_continuations("\n"), "\n  ");
+    }
+
+    #[test]
+    fn truncate_shorter_than_budget_is_unchanged() {
+        let s = "short";
+        assert_eq!(truncate_head_tail(s, 4, 4), s);
+        assert_eq!(truncate_head_tail("", 4, 4), "");
+    }
+
+    #[test]
+    fn truncate_at_exact_budget_boundary_is_unchanged() {
+        // len == head + tail must NOT truncate (the guard is `<=`).
+        let s = "abcdefgh"; // 8 bytes
+        assert_eq!(truncate_head_tail(s, 4, 4), s);
+        // One byte over the budget triggers truncation.
+        let over = "abcdefghi"; // 9 bytes
+        let out = truncate_head_tail(over, 4, 4);
+        assert_eq!(out, "abcd\n\n[truncated 1 bytes]\n\nfghi");
+    }
+
+    #[test]
+    fn truncate_zero_head_and_tail() {
+        let out = truncate_head_tail("abcde", 0, 0);
+        assert_eq!(out, "\n\n[truncated 5 bytes]\n\n");
+    }
+
+    #[test]
+    fn truncate_reports_byte_count_not_char_count() {
+        // Each "é" is 2 bytes in UTF-8; 10 chars = 20 bytes.
+        let s = "é".repeat(10);
+        assert_eq!(s.len(), 20);
+        let out = truncate_head_tail(&s, 4, 4);
+        // 20 - 4 - 4 = 12 bytes elided.
+        assert!(out.contains("[truncated 12 bytes]"), "got: {out}");
+    }
+
+    #[test]
+    fn truncate_splitting_multibyte_char_is_lossy_not_panic() {
+        // Slicing on raw byte boundaries can cut a multibyte char in half;
+        // decode_lossy must yield a replacement char rather than panicking.
+        let s = "ééééééééé"; // 9 × 2 = 18 bytes
+        let out = truncate_head_tail(s, 3, 3); // both cuts land mid-char
+        assert!(out.contains("[truncated 12 bytes]"), "got: {out}");
+        assert!(out.contains('\u{FFFD}'), "expected replacement char: {out}");
+    }
+
+    #[test]
     fn assign_evidence_ids_empty_bundle() {
         use chrono::TimeZone;
         let ticket = Ticket {

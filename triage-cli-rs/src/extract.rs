@@ -289,6 +289,74 @@ mod tests {
     }
 
     #[test]
+    fn parse_id_empty_string_is_empty_error() {
+        assert!(matches!(
+            parse_ticket_id(""),
+            Err(ExtractError::EmptyTicketId)
+        ));
+        assert!(matches!(
+            parse_ticket_id("\t \n"),
+            Err(ExtractError::EmptyTicketId)
+        ));
+    }
+
+    #[test]
+    fn parse_id_trims_surrounding_whitespace() {
+        assert_eq!(parse_ticket_id("  42  ").unwrap(), 42);
+        assert_eq!(parse_ticket_id("\t007\n").unwrap(), 7);
+    }
+
+    #[test]
+    fn parse_id_url_without_agent_prefix() {
+        assert_eq!(
+            parse_ticket_id("https://acme.zendesk.com/tickets/555").unwrap(),
+            555
+        );
+    }
+
+    #[test]
+    fn parse_id_url_with_fragment_or_trailing_slash() {
+        assert_eq!(
+            parse_ticket_id("https://acme.zendesk.com/agent/tickets/777#note-1").unwrap(),
+            777
+        );
+        assert_eq!(
+            parse_ticket_id("https://acme.zendesk.com/agent/tickets/888/").unwrap(),
+            888
+        );
+    }
+
+    #[test]
+    fn parse_id_non_numeric_is_unparseable() {
+        assert!(matches!(
+            parse_ticket_id("not-a-ticket"),
+            Err(ExtractError::UnparseableTicketId(_))
+        ));
+        // URL-shaped but the id segment is non-numeric: no regex match.
+        assert!(matches!(
+            parse_ticket_id("https://acme.zendesk.com/agent/tickets/abc"),
+            Err(ExtractError::UnparseableTicketId(_))
+        ));
+    }
+
+    #[test]
+    fn parse_id_overflow_is_unparseable_not_panic() {
+        // All-digits so RAW_ID_RE matches, but the value exceeds u64::MAX,
+        // so the u64 parse must fail gracefully rather than panic.
+        let huge = "99999999999999999999999999999999";
+        match parse_ticket_id(huge) {
+            Err(ExtractError::UnparseableTicketId(v)) => assert_eq!(v, huge),
+            other => panic!("expected UnparseableTicketId, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_id_u64_max_boundary() {
+        let max = u64::MAX.to_string();
+        assert_eq!(parse_ticket_id(&max).unwrap(), u64::MAX);
+    }
+
+    #[test]
     fn lookup_site_flag_overrides_all() {
         let sites = vec![make_site("Acme", "us-nv-acme", "u1")];
         let t = make_ticket("subj", "desc", Some("Acme"));

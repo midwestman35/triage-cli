@@ -908,15 +908,19 @@ fn show_full_state_diff(existing_path: &Path, new_content: &str) -> std::io::Res
         let trimmed = viewer.trim();
         if !trimmed.is_empty() {
             // Honor shell-style commands by going through `sh -c` so users
-            // can set things like `DIFF_VIEWER='code --diff'`.
+            // can set things like `DIFF_VIEWER='code --diff'`. The two paths
+            // are passed as positional parameters ($1, $2) rather than
+            // interpolated into the script string, so a path containing
+            // shell metacharacters can never break out into a command. The
+            // `DIFF_VIEWER` value itself is intentionally executed as shell
+            // code (same trust model as $PAGER / $GIT_EDITOR): it is the
+            // operator's own environment, not attacker-controlled input.
             let status = Command::new("sh")
                 .arg("-c")
-                .arg(format!(
-                    "{} {} {}",
-                    trimmed,
-                    shell_escape(&existing_path.to_string_lossy()),
-                    shell_escape(&new_path.to_string_lossy()),
-                ))
+                .arg(format!("{trimmed} \"$1\" \"$2\""))
+                .arg("sh") // $0
+                .arg(existing_path)
+                .arg(new_path)
                 .status()?;
             if !status.success() {
                 eprintln!(
@@ -948,12 +952,6 @@ fn show_full_state_diff(existing_path: &Path, new_content: &str) -> std::io::Res
     eprintln!("--- full STATE.md diff ---");
     eprintln!("{}", String::from_utf8_lossy(&output.stdout));
     Ok(())
-}
-
-fn shell_escape(s: &str) -> String {
-    // Minimal single-quote escape sufficient for filesystem paths handed
-    // to `sh -c`. Wraps in single quotes and escapes embedded single quotes.
-    format!("'{}'", s.replace('\'', r#"'\''"#))
 }
 
 async fn cmd_watch(c: WatchCmd) -> ExitCode {

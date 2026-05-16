@@ -190,3 +190,109 @@ fn _file_basename(p: &Path) -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| p.to_path_buf())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::FileType;
+    use std::io::Write;
+
+    fn write_file(dir: &std::path::Path, name: &str, bytes: &[u8]) -> PathBuf {
+        let p = dir.join(name);
+        let mut f = fs::File::create(&p).unwrap();
+        f.write_all(bytes).unwrap();
+        p
+    }
+
+    #[test]
+    fn detect_by_extension_wins() {
+        let d = tempfile::tempdir().unwrap();
+        assert_eq!(
+            detect_file_type(&write_file(d.path(), "a.log", b"anything here")),
+            FileType::Log
+        );
+        assert_eq!(
+            detect_file_type(&write_file(d.path(), "a.json", b"not really json")),
+            FileType::Json
+        );
+        for ext in ["txt", "text", "md", "csv"] {
+            let p = write_file(d.path(), &format!("a.{ext}"), b"plain");
+            assert_eq!(detect_file_type(&p), FileType::Text, "ext {ext}");
+        }
+    }
+
+    #[test]
+    fn detect_extension_is_case_insensitive() {
+        let d = tempfile::tempdir().unwrap();
+        assert_eq!(
+            detect_file_type(&write_file(d.path(), "A.LOG", b"x")),
+            FileType::Log
+        );
+    }
+
+    #[test]
+    fn detect_json_by_content_sniff() {
+        let d = tempfile::tempdir().unwrap();
+        assert_eq!(
+            detect_file_type(&write_file(d.path(), "noext", b"  {\"k\": 1}\n")),
+            FileType::Json
+        );
+        assert_eq!(
+            detect_file_type(&write_file(d.path(), "arr", b"[1, 2, 3]")),
+            FileType::Json
+        );
+    }
+
+    #[test]
+    fn detect_brace_prefix_but_invalid_json_is_text() {
+        let d = tempfile::tempdir().unwrap();
+        assert_eq!(
+            detect_file_type(&write_file(d.path(), "bad", b"{ not valid json")),
+            FileType::Text
+        );
+    }
+
+    #[test]
+    fn detect_plain_text_without_extension() {
+        let d = tempfile::tempdir().unwrap();
+        assert_eq!(
+            detect_file_type(&write_file(d.path(), "plain", b"hello world")),
+            FileType::Text
+        );
+    }
+
+    #[test]
+    fn detect_empty_file_is_unknown() {
+        let d = tempfile::tempdir().unwrap();
+        assert_eq!(
+            detect_file_type(&write_file(d.path(), "empty", b"")),
+            FileType::Unknown
+        );
+    }
+
+    #[test]
+    fn detect_binary_with_nul_is_unknown() {
+        let d = tempfile::tempdir().unwrap();
+        assert_eq!(
+            detect_file_type(&write_file(d.path(), "bin.log", b"abc\0def")),
+            FileType::Unknown
+        );
+    }
+
+    #[test]
+    fn detect_invalid_utf8_is_unknown() {
+        let d = tempfile::tempdir().unwrap();
+        assert_eq!(
+            detect_file_type(&write_file(d.path(), "bad.txt", &[0xff, 0xfe, 0xfd])),
+            FileType::Unknown
+        );
+    }
+
+    #[test]
+    fn detect_missing_path_is_unknown() {
+        assert_eq!(
+            detect_file_type(Path::new("/no/such/file/here.log")),
+            FileType::Unknown
+        );
+    }
+}

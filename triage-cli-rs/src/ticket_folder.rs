@@ -12,6 +12,7 @@
 //! Soft-lock semantics (Anchor C, spec § 7) are handled by task #5; this
 //! module only writes — the caller decides whether overwriting is OK.
 
+use std::fmt::Write as _;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -188,59 +189,52 @@ fn render_intake_md(b: &IntakeBlock) -> String {
 
     out.push_str("## Housekeeping\n\n");
     let mark = if b.housekeeping_complete { "x" } else { " " };
-    out.push_str(&format!("- [{mark}] Ticket directory created.\n"));
-    out.push_str(&format!(
-        "- [{mark}] Artifacts grouped under the ticket folder.\n"
-    ));
-    out.push_str(&format!(
-        "- [{mark}] No new investigation files left loose.\n\n"
-    ));
+    let _ = writeln!(out, "- [{mark}] Ticket directory created.");
+    let _ = writeln!(out, "- [{mark}] Artifacts grouped under the ticket folder.");
+    let _ = writeln!(out, "- [{mark}] No new investigation files left loose.\n");
 
     let t = &b.ticket;
     out.push_str("## Ticket\n\n");
-    out.push_str(&format!("- Zendesk ticket: {}\n", t.zendesk_id));
-    out.push_str(&format!("- URL: {}\n", t.url));
-    out.push_str(&format!(
-        "- Status / priority: {} / {}\n",
+    let _ = writeln!(out, "- Zendesk ticket: {}", t.zendesk_id);
+    let _ = writeln!(out, "- URL: {}", t.url);
+    let _ = writeln!(
+        out,
+        "- Status / priority: {} / {}",
         non_empty(&t.status),
         non_empty(&t.priority)
-    ));
-    out.push_str(&format!("- Tags: {}\n", join_or_dash(&t.tags)));
-    out.push_str(&format!("- Requester: {}\n", non_empty(&t.requester)));
-    out.push_str(&format!("- Organization: {}\n", non_empty(&t.organization)));
-    out.push_str(&format!(
-        "- Site / CNC: {} / {}\n",
-        opt(&t.site),
-        opt(&t.cnc)
-    ));
-    out.push_str(&format!("- Region: {}\n", opt(&t.region)));
-    out.push_str(&format!(
-        "- Affected station(s): {}\n",
+    );
+    let _ = writeln!(out, "- Tags: {}", join_or_dash(&t.tags));
+    let _ = writeln!(out, "- Requester: {}", non_empty(&t.requester));
+    let _ = writeln!(out, "- Organization: {}", non_empty(&t.organization));
+    let _ = writeln!(out, "- Site / CNC: {} / {}", opt(&t.site), opt(&t.cnc));
+    let _ = writeln!(out, "- Region: {}", opt(&t.region));
+    let _ = writeln!(
+        out,
+        "- Affected station(s): {}",
         join_or_dash(&t.affected_stations)
-    ));
-    out.push_str(&format!(
-        "- Affected agent(s): {}\n",
+    );
+    let _ = writeln!(
+        out,
+        "- Affected agent(s): {}",
         join_or_dash(&t.affected_agents)
-    ));
-    out.push_str(&format!("- Call ID: {}\n", opt(&t.call_id)));
-    out.push_str(&format!(
-        "- Incident window: {}\n",
-        non_empty(&t.incident_window)
-    ));
-    out.push_str(&format!(
-        "- Reported symptom: {}\n\n",
+    );
+    let _ = writeln!(out, "- Call ID: {}", opt(&t.call_id));
+    let _ = writeln!(out, "- Incident window: {}", non_empty(&t.incident_window));
+    let _ = writeln!(
+        out,
+        "- Reported symptom: {}\n",
         non_empty(&t.reported_symptom)
-    ));
+    );
 
     out.push_str("## One-Line Fingerprint\n\n");
-    out.push_str(&format!("`{}`\n\n", non_empty(&b.one_line_fingerprint)));
+    let _ = writeln!(out, "`{}`\n", non_empty(&b.one_line_fingerprint));
 
     out.push_str("## Ticket Summary\n\n");
     if b.ticket_summary.is_empty() {
         out.push_str("_(no summary)_\n\n");
     } else {
         for line in &b.ticket_summary {
-            out.push_str(&format!("- {line}\n"));
+            let _ = writeln!(out, "- {line}");
         }
         out.push('\n');
     }
@@ -251,25 +245,28 @@ fn render_intake_md(b: &IntakeBlock) -> String {
         out.push_str("| _(none)_ | _(none)_ | _(none)_ |\n");
     } else {
         for p in &b.context_pulls {
-            out.push_str(&format!(
-                "| {} | {} | {} |\n",
+            let _ = writeln!(
+                out,
+                "| {} | {} | {} |",
                 escape_pipe(&p.pull),
                 escape_pipe(&p.result),
                 escape_pipe(&p.source),
-            ));
+            );
         }
     }
     out.push('\n');
 
     out.push_str("## Initial Route\n\n");
-    out.push_str(&format!(
-        "- Hypothesis: {}\n",
+    let _ = writeln!(
+        out,
+        "- Hypothesis: {}",
         non_empty(&b.initial_route.hypothesis)
-    ));
-    out.push_str(&format!(
-        "- Justification: {}\n\n",
+    );
+    let _ = writeln!(
+        out,
+        "- Justification: {}\n",
         non_empty(&b.initial_route.justification)
-    ));
+    );
 
     out.push_str("## Intake Decision\n\n");
     out.push_str(&intake_decision_checklist(b.intake_decision));
@@ -312,14 +309,15 @@ fn render_evidence_preflight_md(b: &PreflightBlock) -> String {
             } else {
                 g.id.clone()
             };
-            out.push_str(&format!(
-                "| {} | {} | {} | {} | {} |\n",
+            let _ = writeln!(
+                out,
+                "| {} | {} | {} | {} | {} |",
                 id_cell,
                 escape_pipe(&g.evidence_type),
                 escape_pipe(&g.source),
                 escape_pipe(&g.time_window),
                 escape_pipe(&g.summary),
-            ));
+            );
         }
     }
     out.push('\n');
@@ -346,20 +344,22 @@ fn render_fork_packet_md(p: &ForkPacket) -> String {
 
     let c = &p.commitment;
     out.push_str("## Recommendation\n\n");
-    out.push_str(&format!(
-        "- Fork: {} — {}\n",
+    let _ = writeln!(
+        out,
+        "- Fork: {} — {}",
         c.fork_letter.as_str(),
         c.fork_letter.description()
-    ));
-    out.push_str(&format!("- Confidence: {}\n", c.confidence.as_str()));
-    out.push_str(&format!("- Reasoning: {}\n\n", non_empty(&c.reasoning)));
+    );
+    let _ = writeln!(out, "- Confidence: {}", c.confidence.as_str());
+    let _ = writeln!(out, "- Reasoning: {}\n", non_empty(&c.reasoning));
 
     out.push_str("## Decision Signal\n\n");
-    out.push_str(&format!("- Rubric class: {}\n", non_empty(&c.rubric_class)));
-    out.push_str(&format!(
-        "- Rubric row: \"{}\"\n\n",
+    let _ = writeln!(out, "- Rubric class: {}", non_empty(&c.rubric_class));
+    let _ = writeln!(
+        out,
+        "- Rubric row: \"{}\"\n",
         non_empty(&c.quoted_rubric_row)
-    ));
+    );
 
     out.push_str("## Evidence Summary\n\n");
     write_bullets_or_none(&mut out, &p.evidence_summary);
@@ -383,18 +383,20 @@ fn render_fork_packet_md(p: &ForkPacket) -> String {
     } else {
         r.jira.join(", ")
     };
-    out.push_str(&format!("- Zendesk: {zd}\n"));
-    out.push_str(&format!("- Jira: {jira}\n"));
-    out.push_str(&format!(
-        "- Master ticket: {}\n",
+    let _ = writeln!(out, "- Zendesk: {zd}");
+    let _ = writeln!(out, "- Jira: {jira}");
+    let _ = writeln!(
+        out,
+        "- Master ticket: {}",
         r.master
             .map(|i| i.to_string())
             .unwrap_or_else(|| "(none)".into())
-    ));
-    out.push_str(&format!(
-        "- Cluster: {}\n\n",
-        r.cluster.clone().unwrap_or_else(|| "(none)".into())
-    ));
+    );
+    let _ = writeln!(
+        out,
+        "- Cluster: {}\n",
+        r.cluster.as_deref().unwrap_or("(none)")
+    );
 
     out.push_str("## Handoff\n\n");
     out.push_str(&handoff_line(
@@ -464,13 +466,13 @@ fn render_drafts_md(d: &DraftsBlock) -> String {
 
 fn render_jira_draft(j: &JiraDraft) -> String {
     let mut s = String::new();
-    s.push_str(&format!("- **Project:** {}\n", non_empty(&j.project)));
-    s.push_str(&format!("- **Title:** {}\n", non_empty(&j.title)));
+    let _ = writeln!(s, "- **Project:** {}", non_empty(&j.project));
+    let _ = writeln!(s, "- **Title:** {}", non_empty(&j.title));
     if let Some(c) = &j.affected_component {
-        s.push_str(&format!("- **Affected component:** {}\n", c));
+        let _ = writeln!(s, "- **Affected component:** {c}");
     }
     if let Some(a) = &j.suspected_area {
-        s.push_str(&format!("- **Suspected area:** {}\n", a));
+        let _ = writeln!(s, "- **Suspected area:** {a}");
     }
     s.push_str("\n**Description:**\n\n");
     s.push_str(&non_empty_block(&j.description));
@@ -478,7 +480,7 @@ fn render_jira_draft(j: &JiraDraft) -> String {
     if !j.repro_steps.is_empty() {
         s.push_str("\n**Repro steps:**\n\n");
         for (i, step) in j.repro_steps.iter().enumerate() {
-            s.push_str(&format!("{}. {step}\n", i + 1));
+            let _ = writeln!(s, "{}. {step}", i + 1);
         }
     }
     s
@@ -499,41 +501,46 @@ fn render_state_md(
 
     let mut out = String::new();
     out.push_str("---\n");
-    out.push_str(&format!("ticket_id: {}\n", report.intake.ticket.zendesk_id));
-    out.push_str(&format!("fork: {}\n", c.fork_letter.as_str()));
-    out.push_str(&format!("confidence: {}\n", c.confidence.as_str()));
-    out.push_str(&format!(
-        "quoted_rubric_row: {}\n",
+    let _ = writeln!(out, "ticket_id: {}", report.intake.ticket.zendesk_id);
+    let _ = writeln!(out, "fork: {}", c.fork_letter.as_str());
+    let _ = writeln!(out, "confidence: {}", c.confidence.as_str());
+    let _ = writeln!(
+        out,
+        "quoted_rubric_row: {}",
         yaml_scalar(&c.quoted_rubric_row)
-    ));
-    out.push_str(&format!(
-        "rubric_version: {}\n",
+    );
+    let _ = writeln!(
+        out,
+        "rubric_version: {}",
         yaml_scalar(&report.rubric_version)
-    ));
-    out.push_str(&format!("owner: {}\n", yaml_scalar(owner)));
-    out.push_str(&format!("created_at: {now}\n"));
-    out.push_str(&format!("updated_at: {now}\n"));
+    );
+    let _ = writeln!(out, "owner: {}", yaml_scalar(owner));
+    let _ = writeln!(out, "created_at: {now}");
+    let _ = writeln!(out, "updated_at: {now}");
     out.push_str("status: open\n");
     out.push_str("related:\n");
-    out.push_str(&format!("  zendesk: {}\n", yaml_int_list(&r.zendesk)));
-    out.push_str(&format!("  jira: {}\n", yaml_str_list(&r.jira)));
-    out.push_str(&format!(
-        "  master: {}\n",
+    let _ = writeln!(out, "  zendesk: {}", yaml_int_list(&r.zendesk));
+    let _ = writeln!(out, "  jira: {}", yaml_str_list(&r.jira));
+    let _ = writeln!(
+        out,
+        "  master: {}",
         r.master
             .map(|i| i.to_string())
             .unwrap_or_else(|| "null".into())
-    ));
-    out.push_str(&format!(
-        "cluster: {}\n",
+    );
+    let _ = writeln!(
+        out,
+        "cluster: {}",
         r.cluster
             .as_deref()
             .map(yaml_scalar)
             .unwrap_or_else(|| "null".into())
-    ));
-    out.push_str(&format!(
-        "validator_warnings: {}\n",
+    );
+    let _ = writeln!(
+        out,
+        "validator_warnings: {}",
         yaml_str_list(validator_warnings)
-    ));
+    );
     out.push_str("---\n");
     out
 }
@@ -548,7 +555,7 @@ fn write_bullets_or_none(out: &mut String, items: &[String]) {
         return;
     }
     for item in items {
-        out.push_str(&format!("- {item}\n"));
+        let _ = writeln!(out, "- {item}");
     }
     out.push('\n');
 }
