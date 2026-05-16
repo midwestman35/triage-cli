@@ -114,11 +114,24 @@ pub fn write_manifest_entry(
     Ok(())
 }
 
+/// Reduce an externally supplied attachment name to a single path component,
+/// stripping any directory traversal (`../`) or absolute-path prefix. This is
+/// the Rust equivalent of Python's `Path(filename).name`. Untrusted Zendesk
+/// API data flows in here, so the result must never escape `attachments_dir`.
+fn sanitize_filename(filename: &str) -> &str {
+    Path::new(filename)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| !n.is_empty())
+        .unwrap_or("attachment")
+}
+
 pub fn resolve_destination(
     attachments_dir: &Path,
     filename: &str,
     remote_size: Option<u64>,
 ) -> DownloadDecision {
+    let filename = sanitize_filename(filename);
     let manifest = read_manifest(attachments_dir);
     let entry = manifest.get(filename);
     let target = attachments_dir.join(filename);
@@ -362,4 +375,49 @@ pub fn summarize_workspace(
         parts.extend(skipped);
     }
     parts.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn sanitize_strips_relative_traversal() {
+        assert_eq!(sanitize_filename("../../etc/passwd"), "passwd");
+        assert_eq!(sanitize_filename("foo/../bar.log"), "bar.log");
+        assert_eq!(sanitize_filename("a/b/c/report.txt"), "report.txt");
+    }
+
+    #[test]
+    fn sanitize_strips_absolute_path() {
+        assert_eq!(sanitize_filename("/etc/passwd"), "passwd");
+        assert_eq!(sanitize_filename("/var/log/syslog"), "syslog");
+    }
+
+    #[test]
+    fn sanitize_handles_degenerate_input() {
+        assert_eq!(sanitize_filename(".."), "attachment");
+        assert_eq!(sanitize_filename(""), "attachment");
+        assert_eq!(sanitize_filename("/"), "attachment");
+        assert_eq!(sanitize_filename("normal.pdf"), "normal.pdf");
+    }
+
+    #[test]
+    fn resolve_destination_contains_traversal_within_dir() {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+
+        for malicious in ["../../etc/passwd", "/etc/passwd", "../secret"] {
+            let decision = resolve_destination(dir, malicious, None);
+            // The resolved path must stay inside attachments_dir.
+            assert_eq!(
+                decision.path.parent(),
+                Some(dir),
+                "{malicious} escaped attachments_dir: {:?}",
+                decision.path
+            );
+            assert_eq!(decision.action, DownloadAction::Download);
+        }
+    }
 }
