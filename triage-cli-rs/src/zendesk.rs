@@ -17,6 +17,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::OnceCell;
 
 use crate::models::{AttachmentEvidence, Comment, Ticket, TicketSummary};
 
@@ -66,6 +67,11 @@ pub struct ZendeskClient {
     base_url: String,
     email_username: String,
     api_token: String,
+    /// Memoized `/users/me.json` id. The authenticated user never changes for
+    /// the lifetime of a client, but `list_my_ticket_ids` is on the watcher's
+    /// per-poll hot path — without this it would re-fetch `/users/me.json`
+    /// every iteration.
+    current_user_id: OnceCell<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -91,6 +97,7 @@ impl ZendeskClient {
             base_url: format!("https://{subdomain}.zendesk.com/api/v2"),
             email_username: format!("{email}/token"),
             api_token: api_token.to_string(),
+            current_user_id: OnceCell::new(),
         })
     }
 
@@ -220,16 +227,26 @@ impl ZendeskClient {
         Err(ZendeskError::PaginationLoop(MAX_PAGES))
     }
 
+    /// Resolve the authenticated user's id, fetching `/users/me.json` once and
+    /// memoizing it for the lifetime of the client.
+    async fn current_user_id(&self) -> Result<u64, ZendeskError> {
+        self.current_user_id
+            .get_or_try_init(|| async {
+                let me = self
+                    .get_json("/users/me.json", None, NotFoundKind::Ticket(0))
+                    .await?;
+                me.get("user")
+                    .and_then(|u| u.get("id"))
+                    .and_then(Value::as_u64)
+                    .ok_or(ZendeskError::NoCurrentUser)
+            })
+            .await
+            .copied()
+    }
+
     /// Return IDs of open tickets assigned to the authenticated user.
     pub async fn list_my_ticket_ids(&self) -> Result<Vec<u64>, ZendeskError> {
-        let me = self
-            .get_json("/users/me.json", None, NotFoundKind::Ticket(0))
-            .await?;
-        let user_id = me
-            .get("user")
-            .and_then(|u| u.get("id"))
-            .and_then(Value::as_u64)
-            .ok_or(ZendeskError::NoCurrentUser)?;
+        let user_id = self.current_user_id().await?;
 
         let mut path: Option<String> = Some("/search.json".to_string());
         let query = format!("assignee_id:{user_id} status<closed type:ticket");
