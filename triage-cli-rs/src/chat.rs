@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use fs2::FileExt;
+use serde::{de::DeserializeOwned, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -324,70 +325,86 @@ fn sha256_of_file(path: &Path) -> Result<String, ChatError> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-/// Path helpers. `ticket_dir` is e.g. `Tickets/44776/`.
+// Private JSON helpers: extract common serde + atomic_write pattern.
+fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), ChatError> {
+    let bytes = serde_json::to_vec_pretty(value)?;
+    crate::ticket_folder::atomic_write(path, &bytes).map_err(ChatError::Io)
+}
+
+fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T, ChatError> {
+    let bytes = fs::read(path)?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+/// Path to the per-ticket session state directory.
 pub fn session_dir(ticket_dir: &Path) -> PathBuf {
     ticket_dir.join(".session")
 }
+
+/// Path to the session manifest file at `<ticket_dir>/.session/manifest.json`.
 pub fn manifest_path(ticket_dir: &Path) -> PathBuf {
     session_dir(ticket_dir).join("manifest.json")
 }
+
+/// Path to the durable Ticket snapshot at `<ticket_dir>/.session/base-ticket.json`.
 pub fn base_ticket_path(ticket_dir: &Path) -> PathBuf {
     session_dir(ticket_dir).join("base-ticket.json")
 }
+
+/// Path to the durable evidence manifest at `<ticket_dir>/.session/base-evidence-manifest.json`.
 pub fn base_evidence_path(ticket_dir: &Path) -> PathBuf {
     session_dir(ticket_dir).join("base-evidence-manifest.json")
 }
+
+/// Path to the conversation JSONL log at `<ticket_dir>/CONVERSATION.jsonl`.
 pub fn conversation_jsonl_path(ticket_dir: &Path) -> PathBuf {
     ticket_dir.join("CONVERSATION.jsonl")
 }
+
+/// Path to the derived conversation markdown at `<ticket_dir>/CONVERSATION.md`.
 pub fn conversation_md_path(ticket_dir: &Path) -> PathBuf {
     ticket_dir.join("CONVERSATION.md")
 }
 
+/// Write the session manifest to `<ticket_dir>/.session/manifest.json`.
 pub fn write_session_manifest(ticket_dir: &Path, m: &SessionManifest) -> Result<(), ChatError> {
-    let bytes = serde_json::to_vec_pretty(m)?;
-    crate::ticket_folder::atomic_write(&manifest_path(ticket_dir), &bytes)
-        .map_err(ChatError::Io)?;
-    Ok(())
+    write_json(&manifest_path(ticket_dir), m)
 }
 
+/// Read the session manifest from `<ticket_dir>/.session/manifest.json`.
 pub fn read_session_manifest(ticket_dir: &Path) -> Result<SessionManifest, ChatError> {
-    let bytes = fs::read(manifest_path(ticket_dir))?;
-    Ok(serde_json::from_slice(&bytes)?)
+    read_json(&manifest_path(ticket_dir))
 }
 
+/// Read the session manifest, returning `Ok(None)` if the file is missing.
 pub fn read_session_manifest_opt(ticket_dir: &Path) -> Result<Option<SessionManifest>, ChatError> {
     if !manifest_path(ticket_dir).exists() {
         return Ok(None);
     }
-    read_session_manifest(ticket_dir).map(Some)
+    read_json(&manifest_path(ticket_dir)).map(Some)
 }
 
+/// Write the durable Ticket snapshot to `<ticket_dir>/.session/base-ticket.json`.
 pub fn write_base_ticket(ticket_dir: &Path, t: &Ticket) -> Result<(), ChatError> {
-    let bytes = serde_json::to_vec_pretty(t)?;
-    crate::ticket_folder::atomic_write(&base_ticket_path(ticket_dir), &bytes)
-        .map_err(ChatError::Io)?;
-    Ok(())
+    write_json(&base_ticket_path(ticket_dir), t)
 }
 
+/// Read the durable Ticket snapshot from `<ticket_dir>/.session/base-ticket.json`.
 pub fn read_base_ticket(ticket_dir: &Path) -> Result<Ticket, ChatError> {
-    let bytes = fs::read(base_ticket_path(ticket_dir))?;
-    Ok(serde_json::from_slice(&bytes)?)
+    read_json(&base_ticket_path(ticket_dir))
 }
 
+/// Write the durable evidence manifest to `<ticket_dir>/.session/base-evidence-manifest.json`.
 pub fn write_base_evidence_manifest(
     ticket_dir: &Path,
     m: &BaseEvidenceManifest,
 ) -> Result<(), ChatError> {
-    let bytes = serde_json::to_vec_pretty(m)?;
-    crate::ticket_folder::atomic_write(&base_evidence_path(ticket_dir), &bytes)
-        .map_err(ChatError::Io)?;
-    Ok(())
+    write_json(&base_evidence_path(ticket_dir), m)
 }
 
+/// Read the durable evidence manifest from `<ticket_dir>/.session/base-evidence-manifest.json`.
 pub fn read_base_evidence_manifest(ticket_dir: &Path) -> Result<BaseEvidenceManifest, ChatError> {
-    let bytes = fs::read(base_evidence_path(ticket_dir))?;
-    Ok(serde_json::from_slice(&bytes)?)
+    read_json(&base_evidence_path(ticket_dir))
 }
 
 #[cfg(test)]
