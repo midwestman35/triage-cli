@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
-use crate::models::Turn;
+use crate::models::{EvidenceProvenance, Turn, TurnKind};
 
 #[derive(Debug, Error)]
 pub enum ChatError {
@@ -79,6 +79,103 @@ pub fn append_turn(path: &Path, turn: &Turn) -> Result<(), ChatError> {
     let line = serde_json::to_string(turn)?;
     writeln!(file, "{line}")?;
     file.sync_all()?;
+    Ok(())
+}
+
+/// Render the JSONL turns as the human-readable CONVERSATION.md.
+/// Deterministic and idempotent: same input always produces the same
+/// byte string. The markdown is for human reading only — no parser
+/// in this codebase ever consumes it.
+pub fn render_conversation_md(turns: &[Turn], ticket_id: &str) -> String {
+    let mut out = String::new();
+    out.push_str("<!-- triage-cli conversation v1 -->\n");
+    out.push_str(&format!("<!-- ticket_id: {ticket_id} -->\n\n"));
+    for t in turns {
+        out.push_str(&render_one_turn(t));
+        out.push('\n');
+    }
+    out
+}
+
+fn render_one_turn(t: &Turn) -> String {
+    let kind = match t.turn_kind {
+        TurnKind::Analyst => "analyst",
+        TurnKind::Codex => "codex",
+        TurnKind::System => "system",
+        TurnKind::Automated => "automated",
+    };
+    let mut header = format!(
+        "## turn-{turn:03} {kind} {ts}",
+        turn = t.turn,
+        kind = kind,
+        ts = t.ts.format("%Y-%m-%dT%H:%M:%SZ"),
+    );
+    if let Some(p) = &t.provider {
+        header.push_str(&format!(" provider={p}"));
+    }
+    if let Some(m) = &t.model {
+        header.push_str(&format!(" model={m}"));
+    }
+    if let (Some(ti), Some(to)) = (t.tokens_in, t.tokens_out) {
+        header.push_str(&format!(" tokens={ti}/{to}"));
+    }
+    if let Some(e) = t.elapsed_s {
+        header.push_str(&format!(" elapsed_s={e}"));
+    }
+    if let Some(r) = t.resumed {
+        header.push_str(&format!(" resumed={r}"));
+    }
+    if let Some(a) = &t.action {
+        header.push_str(&format!(" action={a}"));
+    }
+    if let Some(o) = &t.outcome {
+        header.push_str(&format!(" outcome={o}"));
+    }
+    let mut body = String::new();
+    body.push_str(&header);
+    body.push('\n');
+    if let Some(author) = &t.author {
+        body.push_str(&format!("author: {author}\n"));
+    }
+    if !t.evidence.is_empty() {
+        body.push_str("evidence:\n");
+        for ev in &t.evidence {
+            match ev {
+                EvidenceProvenance::File {
+                    basename,
+                    bytes,
+                    sha256,
+                    truncated,
+                    ..
+                } => {
+                    body.push_str(&format!(
+                        "  - file: {basename} ({bytes} bytes, sha256:{}{})\n",
+                        &sha256[..sha256.len().min(8)],
+                        if *truncated { ", truncated" } else { "" },
+                    ));
+                }
+                EvidenceProvenance::Paste { label, bytes, .. } => {
+                    body.push_str(&format!("  - paste: {label} ({bytes} bytes)\n"));
+                }
+            }
+        }
+    }
+    body.push_str("---\n");
+    body.push_str(&t.body);
+    if !t.body.ends_with('\n') {
+        body.push('\n');
+    }
+    body
+}
+
+/// Render the markdown and write atomically.
+pub fn write_conversation_md(
+    path: &Path,
+    turns: &[Turn],
+    ticket_id: &str,
+) -> Result<(), ChatError> {
+    let md = render_conversation_md(turns, ticket_id);
+    crate::ticket_folder::atomic_write(path, md.as_bytes()).map_err(ChatError::Io)?;
     Ok(())
 }
 
@@ -169,5 +266,50 @@ mod tests {
         writeln!(f, "{line}").unwrap();
         let err = parse_conversation_jsonl(&path);
         assert!(matches!(err, Err(ChatError::Json(_))));
+    }
+
+    #[test]
+    fn render_md_is_deterministic_and_idempotent() {
+        let turns = vec![sample_analyst_turn(1), sample_analyst_turn(2)];
+        let md1 = render_conversation_md(&turns, "44776");
+        let md2 = render_conversation_md(&turns, "44776");
+        assert_eq!(md1, md2);
+        assert!(md1.contains("turn-001 analyst"));
+        assert!(md1.contains("turn-002 analyst"));
+        assert!(md1.starts_with("<!-- triage-cli conversation v1 -->"));
+    }
+
+    #[test]
+    fn render_md_includes_codex_turn_metadata() {
+        let mut t = sample_analyst_turn(2);
+        t.turn_kind = TurnKind::Codex;
+        t.author = None;
+        t.provider = Some("codex".into());
+        t.model = Some("gpt-5.5".into());
+        t.tokens_in = Some(4200);
+        t.tokens_out = Some(980);
+        t.elapsed_s = Some(4.1);
+        t.resumed = Some(true);
+        t.body = "the codex response body".into();
+        t.evidence.clear();
+        let md = render_conversation_md(&[t], "44776");
+        assert!(md.contains("turn-002 codex"));
+        assert!(md.contains("provider=codex"));
+        assert!(md.contains("model=gpt-5.5"));
+        assert!(md.contains("tokens=4200/980"));
+        assert!(md.contains("elapsed_s=4.1"));
+        assert!(md.contains("resumed=true"));
+        assert!(md.contains("the codex response body"));
+    }
+
+    #[test]
+    fn write_conversation_md_round_trip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("CONVERSATION.md");
+        let turns = vec![sample_analyst_turn(1)];
+        write_conversation_md(&path, &turns, "44776").unwrap();
+        let on_disk = fs::read_to_string(&path).unwrap();
+        let expected = render_conversation_md(&turns, "44776");
+        assert_eq!(on_disk, expected);
     }
 }
