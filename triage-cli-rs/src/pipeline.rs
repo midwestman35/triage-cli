@@ -782,17 +782,11 @@ pub async fn followup_turn(
     use crate::chat;
     use std::time::Duration;
 
-    // Read existing turns to determine next turn number + session id
+    // Acquire the per-ticket lock BEFORE reading conversation state. Reading
+    // outside the lock allows a concurrent writer to append between our read
+    // and our lock-acquire, yielding a stale `next_turn` and a duplicate turn
+    // number on append.
     let conv = chat::conversation_jsonl_path(ticket_dir);
-    let outcome = chat::parse_conversation_jsonl(&conv).map_err(FollowupError::from)?;
-    let last_codex_session = outcome
-        .turns
-        .iter()
-        .rev()
-        .find_map(|t| t.session_id.clone());
-    let next_turn = outcome.turns.iter().map(|t| t.turn).max().unwrap_or(0) + 1;
-
-    // Acquire lock for the provider call + write sequence
     let session_dir = chat::session_dir(ticket_dir);
     let _guard =
         chat::acquire_session_lock(&session_dir, Duration::from_secs(5)).map_err(|e| match e {
@@ -801,6 +795,15 @@ pub async fn followup_turn(
             }
             other => FollowupError::Chat(other),
         })?;
+
+    // Read existing turns under the lock to determine next turn number + session id.
+    let outcome = chat::parse_conversation_jsonl(&conv).map_err(FollowupError::from)?;
+    let last_codex_session = outcome
+        .turns
+        .iter()
+        .rev()
+        .find_map(|t| t.session_id.clone());
+    let next_turn = outcome.turns.iter().map(|t| t.turn).max().unwrap_or(0) + 1;
 
     // Apply PII redaction at the LLM boundary (spec § 7.1g, § 9.3).
     // The redactor scrubs caller PII (phones, addresses, GPS coords);
@@ -982,11 +985,13 @@ pub async fn revise(
         .map_err(|e| FollowupError::BaseSnapshotMissing(format!("rubric load failed: {e}")))?;
 
     // Build the options for the structured re-emission. followup_mode is always
-    // true on /revise. force is set to avoid a soft-lock conflict since the
-    // revise caller already owns the per-ticket lock.
+    // true on /revise. `force` is propagated from the caller so /revise honors
+    // the STATE.md owner soft-lock (the per-ticket session lock acquired above
+    // is orthogonal — it serializes concurrent writers on this ticket, but
+    // does NOT authorize one analyst to overwrite another's STATE.md).
     let revise_opts = InvestigateOptions {
         followup_mode: true,
-        force: true,
+        force: opts.force,
         no_llm: opts.no_llm,
         redact_enabled: opts.redact_enabled,
         verbose: opts.verbose,
@@ -1577,6 +1582,122 @@ mod tests {
         assert!(
             md.contains("turn-002 system"),
             "CONVERSATION.md missing turn-002 system header"
+        );
+    }
+
+    #[tokio::test]
+    async fn revise_respects_soft_lock_when_force_unset() {
+        // /revise must NOT silently overwrite another analyst's STATE.md.
+        // Pre-seed a STATE.md whose owner differs from the current process
+        // owner, then call revise() with opts.force = false. The pipeline
+        // must surface a SoftLockConflict error and leave the existing
+        // STATE.md intact.
+        let dir = tempfile::tempdir().unwrap();
+        let ticket_dir = dir.path().join("44889");
+        std::fs::create_dir_all(ticket_dir.join(".session")).unwrap();
+
+        let ticket = crate::models::Ticket {
+            id: 44889,
+            subject: "soft-lock guard".into(),
+            description: "".into(),
+            requester_org: None,
+            requester_email: None,
+            tags: vec![],
+            created_at: chrono::Utc::now(),
+            updated_at: None,
+            comments: vec![],
+        };
+        crate::chat::write_base_ticket(&ticket_dir, &ticket).unwrap();
+        crate::chat::write_base_evidence_manifest(
+            &ticket_dir,
+            &crate::models::BaseEvidenceManifest {
+                schema: "triage-cli/base-evidence".into(),
+                schema_version: 1,
+                ticket_id: "44889".into(),
+                captured_at: chrono::Utc::now(),
+                evidence: vec![],
+            },
+        )
+        .unwrap();
+
+        let analyst = crate::models::Turn {
+            schema: "triage-cli/conversation".into(),
+            schema_version: 1,
+            ticket_id: "44889".into(),
+            turn: 1,
+            turn_kind: crate::models::TurnKind::Analyst,
+            ts: chrono::Utc::now(),
+            author: Some("enrique".into()),
+            body: "new evidence: log dump".into(),
+            evidence: vec![crate::models::EvidenceProvenance::Paste {
+                label: "note".into(),
+                body: "fresh evidence".into(),
+                bytes: 14,
+                sent_to_provider: true,
+            }],
+            provider: None,
+            model: None,
+            tokens_in: None,
+            tokens_out: None,
+            elapsed_s: None,
+            session_id: None,
+            resumed: None,
+            action: None,
+            outcome: None,
+            drove_revision_from_turns: None,
+            diff: None,
+        };
+        let conv_path = crate::chat::conversation_jsonl_path(&ticket_dir);
+        crate::chat::append_turn(&conv_path, &analyst).unwrap();
+
+        // Pre-seed STATE.md with a foreign owner. Use a sentinel value that
+        // will never collide with the test machine's $USER.
+        let foreign_state = "---\n\
+ticket_id: 44889\n\
+fork: B\n\
+confidence: low\n\
+quoted_rubric_row: \"\"\n\
+rubric_version: \"2026-04-30\"\n\
+owner: \"foreign-owner-not-this-test@triage.test\"\n\
+created_at: 2026-05-13T07:32:11Z\n\
+updated_at: 2026-05-13T07:32:11Z\n\
+status: open\n\
+related:\n  zendesk: []\n  jira: []\n  master: null\n\
+cluster: null\n\
+validator_warnings: []\n---\n";
+        std::fs::write(ticket_dir.join("STATE.md"), foreign_state).unwrap();
+
+        let memory_md = dir.path().join("MEMORY.md");
+        let memory_db = dir.path().join("data/memory.db");
+        let _env = crate::memory::MemoryEnvScope::new_with_tickets_root(
+            &memory_md,
+            &memory_db,
+            Some(dir.path()),
+        );
+
+        let opts = InvestigateOptions {
+            no_llm: true,
+            force: false,
+            memory_hits_override: Some(vec![]),
+            ..InvestigateOptions::defaults()
+        };
+        let outcome = revise(&ticket_dir, "44889", &opts).await;
+
+        assert!(
+            matches!(
+                outcome,
+                Err(PipelineError::TicketFolder(
+                    TicketFolderError::SoftLockConflict { .. }
+                ))
+            ),
+            "expected SoftLockConflict, got {outcome:?}"
+        );
+
+        // The pre-seeded STATE.md must remain untouched on conflict.
+        let post = std::fs::read_to_string(ticket_dir.join("STATE.md")).unwrap();
+        assert!(
+            post.contains("foreign-owner-not-this-test@triage.test"),
+            "STATE.md was overwritten on soft-lock conflict"
         );
     }
 }

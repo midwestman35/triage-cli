@@ -180,6 +180,7 @@ pub fn read_text_if_supported(path: &Path, detected_type: FileType) -> Option<St
 }
 
 const ZIP_ENTRY_CAP_BYTES: usize = 256 * 1024;
+const ZIP_AGGREGATE_CAP_BYTES: usize = 4 * 1024 * 1024;
 const USEFUL_ZIP_EXTENSIONS: &[&str] = &["log", "txt", "json", "csv", "xml", "sip"];
 
 pub fn extract_zip_text(path: &Path) -> Result<String, std::io::Error> {
@@ -191,6 +192,10 @@ pub fn extract_zip_text(path: &Path) -> Result<String, std::io::Error> {
     let mut output = String::new();
 
     for i in 0..archive.len() {
+        if output.len() >= ZIP_AGGREGATE_CAP_BYTES {
+            output.push_str("\n[zip-aggregate-cap-reached]\n");
+            break;
+        }
         let mut entry = archive
             .by_index(i)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -347,5 +352,37 @@ mod tests {
         assert!(out.contains("=== b.json ==="));
         assert!(out.contains("alpha"));
         assert!(out.contains("\"k\":1"));
+    }
+
+    #[test]
+    fn extract_zip_text_caps_aggregate_output() {
+        // A zip with many small-but-supported entries can grow unbounded if
+        // only per-entry truncation is enforced. Build N entries that each fit
+        // under the per-entry cap but together exceed the aggregate cap, and
+        // verify the output is bounded + carries an aggregate-cap marker.
+        let entry_bytes = 200_000usize; // < ZIP_ENTRY_CAP_BYTES (256 KB)
+        let payload = "x".repeat(entry_bytes);
+        let entry_count = (ZIP_AGGREGATE_CAP_BYTES / entry_bytes) + 4;
+        let owned: Vec<(String, Vec<u8>)> = (0..entry_count)
+            .map(|i| (format!("e{i:03}.log"), payload.as_bytes().to_vec()))
+            .collect();
+        let entries: Vec<(&str, &[u8])> = owned
+            .iter()
+            .map(|(name, body)| (name.as_str(), body.as_slice()))
+            .collect();
+        let zip = build_zip(&entries);
+        let out = extract_zip_text(zip.path()).expect("extraction succeeds");
+        assert!(
+            out.contains("[zip-aggregate-cap-reached]"),
+            "expected aggregate-cap marker; out len = {}",
+            out.len()
+        );
+        // Some slack for the marker + headers; output should not balloon past
+        // the cap by more than a few KB.
+        assert!(
+            out.len() < ZIP_AGGREGATE_CAP_BYTES + 16 * 1024,
+            "output exceeded aggregate cap budget: len = {}",
+            out.len()
+        );
     }
 }

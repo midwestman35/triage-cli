@@ -1892,37 +1892,40 @@ async fn send_analyst_turn(
     input: &mut tui_textarea::TextArea<'_>,
 ) -> anyhow::Result<()> {
     use crate::chat;
-    let next = next_turn_number(ticket_dir)?;
-    let analyst_turn = crate::models::Turn {
-        schema: "triage-cli/conversation".into(),
-        schema_version: 1,
-        ticket_id: ticket_id.to_string(),
-        turn: next,
-        turn_kind: crate::models::TurnKind::Analyst,
-        ts: chrono::Utc::now(),
-        author: std::env::var("TRIAGE_OWNER")
-            .or_else(|_| std::env::var("USER"))
-            .ok(),
-        body: body.to_string(),
-        evidence,
-        provider: None,
-        model: None,
-        tokens_in: None,
-        tokens_out: None,
-        elapsed_s: None,
-        session_id: None,
-        resumed: None,
-        action: None,
-        outcome: None,
-        drove_revision_from_turns: None,
-        diff: None,
-    };
     {
+        // Acquire the lock BEFORE computing `next` so a concurrent writer
+        // can't sneak an append between our read and our own append, which
+        // would collide turn numbers.
         let _guard = chat::acquire_session_lock(
             &chat::session_dir(ticket_dir),
             std::time::Duration::from_secs(5),
         )
         .map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        let next = next_turn_number(ticket_dir)?;
+        let analyst_turn = crate::models::Turn {
+            schema: "triage-cli/conversation".into(),
+            schema_version: 1,
+            ticket_id: ticket_id.to_string(),
+            turn: next,
+            turn_kind: crate::models::TurnKind::Analyst,
+            ts: chrono::Utc::now(),
+            author: std::env::var("TRIAGE_OWNER")
+                .or_else(|_| std::env::var("USER"))
+                .ok(),
+            body: body.to_string(),
+            evidence,
+            provider: None,
+            model: None,
+            tokens_in: None,
+            tokens_out: None,
+            elapsed_s: None,
+            session_id: None,
+            resumed: None,
+            action: None,
+            outcome: None,
+            drove_revision_from_turns: None,
+            diff: None,
+        };
         chat::append_turn(&chat::conversation_jsonl_path(ticket_dir), &analyst_turn)
             .map_err(|e| anyhow::anyhow!("append_turn: {e}"))?;
         let parsed = chat::parse_conversation_jsonl(&chat::conversation_jsonl_path(ticket_dir))

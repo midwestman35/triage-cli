@@ -15,7 +15,7 @@ use super::{CompletionResult, FollowupResult, LlmProvider, ProviderError};
 
 /// Default model passed via `codex exec --model` when `CODEX_MODEL` is unset.
 /// Single source of truth — `llm::model_for_provider` references this.
-pub const DEFAULT_CODEX_MODEL: &str = "gpt-5-codex";
+pub const DEFAULT_CODEX_MODEL: &str = "gpt-5.5";
 
 pub struct CodexSubprocessProvider;
 
@@ -339,5 +339,19 @@ echo '{"type":"agent_message","item":{"text":"replayed response body"}}'
         );
         assert_eq!(r.session_id.as_deref(), Some("01HFRESH00000"));
         assert!(!r.resumed); // fell back to non-resume path
+    }
+}
+
+#[cfg(test)]
+mod default_model_tests {
+    use super::*;
+
+    /// Drift guard: the documented Codex default in README.md and CLAUDE.md is
+    /// `gpt-5.5`. If this const changes without updating the docs (or vice
+    /// versa), `cargo test` fails instead of silently reintroducing the
+    /// `gpt-5-codex` 4xx regression we hit in May 2026.
+    #[test]
+    fn default_codex_model_matches_documented_value() {
+        assert_eq!(DEFAULT_CODEX_MODEL, "gpt-5.5");
     }
 }
