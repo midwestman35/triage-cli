@@ -17,7 +17,10 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::investigation;
-use crate::models::{EvidenceProvenance, ExtractionStatus, Turn, TurnKind};
+use crate::models::{
+    BaseEvidenceManifest, EvidenceProvenance, ExtractionStatus, SessionManifest, Ticket, Turn,
+    TurnKind,
+};
 
 #[derive(Debug, Error)]
 pub enum ChatError {
@@ -321,6 +324,72 @@ fn sha256_of_file(path: &Path) -> Result<String, ChatError> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+/// Path helpers. `ticket_dir` is e.g. `Tickets/44776/`.
+pub fn session_dir(ticket_dir: &Path) -> PathBuf {
+    ticket_dir.join(".session")
+}
+pub fn manifest_path(ticket_dir: &Path) -> PathBuf {
+    session_dir(ticket_dir).join("manifest.json")
+}
+pub fn base_ticket_path(ticket_dir: &Path) -> PathBuf {
+    session_dir(ticket_dir).join("base-ticket.json")
+}
+pub fn base_evidence_path(ticket_dir: &Path) -> PathBuf {
+    session_dir(ticket_dir).join("base-evidence-manifest.json")
+}
+pub fn conversation_jsonl_path(ticket_dir: &Path) -> PathBuf {
+    ticket_dir.join("CONVERSATION.jsonl")
+}
+pub fn conversation_md_path(ticket_dir: &Path) -> PathBuf {
+    ticket_dir.join("CONVERSATION.md")
+}
+
+pub fn write_session_manifest(ticket_dir: &Path, m: &SessionManifest) -> Result<(), ChatError> {
+    let bytes = serde_json::to_vec_pretty(m)?;
+    crate::ticket_folder::atomic_write(&manifest_path(ticket_dir), &bytes)
+        .map_err(ChatError::Io)?;
+    Ok(())
+}
+
+pub fn read_session_manifest(ticket_dir: &Path) -> Result<SessionManifest, ChatError> {
+    let bytes = fs::read(manifest_path(ticket_dir))?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+pub fn read_session_manifest_opt(ticket_dir: &Path) -> Result<Option<SessionManifest>, ChatError> {
+    if !manifest_path(ticket_dir).exists() {
+        return Ok(None);
+    }
+    read_session_manifest(ticket_dir).map(Some)
+}
+
+pub fn write_base_ticket(ticket_dir: &Path, t: &Ticket) -> Result<(), ChatError> {
+    let bytes = serde_json::to_vec_pretty(t)?;
+    crate::ticket_folder::atomic_write(&base_ticket_path(ticket_dir), &bytes)
+        .map_err(ChatError::Io)?;
+    Ok(())
+}
+
+pub fn read_base_ticket(ticket_dir: &Path) -> Result<Ticket, ChatError> {
+    let bytes = fs::read(base_ticket_path(ticket_dir))?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+pub fn write_base_evidence_manifest(
+    ticket_dir: &Path,
+    m: &BaseEvidenceManifest,
+) -> Result<(), ChatError> {
+    let bytes = serde_json::to_vec_pretty(m)?;
+    crate::ticket_folder::atomic_write(&base_evidence_path(ticket_dir), &bytes)
+        .map_err(ChatError::Io)?;
+    Ok(())
+}
+
+pub fn read_base_evidence_manifest(ticket_dir: &Path) -> Result<BaseEvidenceManifest, ChatError> {
+    let bytes = fs::read(base_evidence_path(ticket_dir))?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -549,5 +618,48 @@ mod tests {
             }
             _ => panic!("expected Paste variant"),
         }
+    }
+
+    use crate::models::{BaseEvidenceManifest, SessionManifest};
+
+    #[test]
+    fn manifest_round_trip() {
+        let dir = tempdir().unwrap();
+        let ticket_dir = dir.path().to_path_buf();
+        let m = SessionManifest {
+            version: 1,
+            provider: "codex".into(),
+            model: "gpt-5.5".into(),
+            created_at: Utc::now(),
+            last_resumed_at: None,
+            resume_count: 0,
+            codex_capture_method: Some("stderr_session_id_line".into()),
+        };
+        write_session_manifest(&ticket_dir, &m).unwrap();
+        let back = read_session_manifest(&ticket_dir).unwrap();
+        assert_eq!(back.provider, "codex");
+        assert_eq!(back.resume_count, 0);
+    }
+
+    #[test]
+    fn read_missing_manifest_returns_none() {
+        let dir = tempdir().unwrap();
+        let r = read_session_manifest_opt(dir.path()).unwrap();
+        assert!(r.is_none());
+    }
+
+    #[test]
+    fn base_evidence_manifest_round_trip() {
+        let dir = tempdir().unwrap();
+        let bem = BaseEvidenceManifest {
+            schema: "triage-cli/base-evidence".into(),
+            schema_version: 1,
+            ticket_id: "44776".into(),
+            captured_at: Utc::now(),
+            evidence: Vec::new(),
+        };
+        write_base_evidence_manifest(dir.path(), &bem).unwrap();
+        let back = read_base_evidence_manifest(dir.path()).unwrap();
+        assert_eq!(back.ticket_id, "44776");
     }
 }
