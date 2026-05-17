@@ -1934,7 +1934,8 @@ async fn send_analyst_turn(
         ticket_id,
         body,
         "",
-        &std::env::var("CODEX_MODEL").unwrap_or_else(|_| "gpt-5.5".to_string()),
+        &std::env::var("CODEX_MODEL")
+            .unwrap_or_else(|_| crate::providers::codex::DEFAULT_CODEX_MODEL.to_string()),
         &[],
         provider,
     )
