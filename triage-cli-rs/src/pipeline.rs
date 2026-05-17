@@ -779,6 +779,11 @@ impl Reporter for MetricsReporter {
     }
 }
 
+/// Action value written to the System turn that signals a codex session was
+/// lost (provider failed to resume the prior session and started fresh).
+/// Extracted to a const so implementation and tests stay in sync.
+const SESSION_LOST_ACTION: &str = "session_lost";
+
 /// Append a follow-up turn pair (analyst question + provider response)
 /// to the conversation log under `ticket_dir`. Does NOT mutate the
 /// five-markdown folder — that only happens on /revise (see
@@ -815,11 +820,16 @@ pub async fn followup_turn(
 
     // Read existing turns under the lock to determine next turn number + session id.
     let outcome = chat::parse_conversation_jsonl(&conv).map_err(FollowupError::from)?;
+    // Filter to Codex turns only, then take the most recent one's session_id.
+    // Scanning all turns would pick up a stale session_id from an older codex
+    // turn when the newest codex turn has session_id: None — that stale id
+    // would trigger a spurious session_lost on the next followup.
     let last_codex_session = outcome
         .turns
         .iter()
         .rev()
-        .find_map(|t| t.session_id.clone());
+        .find(|t| matches!(t.turn_kind, crate::models::TurnKind::Codex))
+        .and_then(|t| t.session_id.clone());
     let next_turn = outcome.turns.iter().map(|t| t.turn).max().unwrap_or(0) + 1;
 
     // Apply PII redaction at the LLM boundary (spec § 7.1g, § 9.3).
@@ -865,7 +875,7 @@ pub async fn followup_turn(
             elapsed_s: None,
             session_id: None,
             resumed: None,
-            action: Some("session_lost".to_string()),
+            action: Some(SESSION_LOST_ACTION.to_string()),
             outcome: None,
             drove_revision_from_turns: None,
             diff: None,
@@ -912,7 +922,10 @@ pub async fn followup_turn(
 
     // Update manifest (best-effort — failure here is logged but not fatal)
     if let Ok(Some(mut m)) = chat::read_session_manifest_opt(ticket_dir) {
-        if result.session_id.is_some() {
+        // Only count a real resume: session-lost fallbacks issue a fresh
+        // session_id but resumed=false, so gating on session_id.is_some()
+        // would overcount. result.resumed is the unambiguous signal.
+        if result.resumed {
             m.resume_count = m.resume_count.saturating_add(1);
             m.last_resumed_at = Some(chrono::Utc::now());
             let _ = chat::write_session_manifest(ticket_dir, &m);
@@ -1515,7 +1528,7 @@ mod tests {
             .iter()
             .find(|t| matches!(t.turn_kind, crate::models::TurnKind::System))
             .expect("system turn must be present");
-        assert_eq!(system_turn.action.as_deref(), Some("session_lost"));
+        assert_eq!(system_turn.action.as_deref(), Some(SESSION_LOST_ACTION));
         // The system turn must precede the new codex turn in the JSONL.
         let positions: Vec<(u32, &crate::models::TurnKind)> = parsed
             .turns
@@ -1670,6 +1683,186 @@ mod tests {
                 .iter()
                 .any(|t| matches!(t.turn_kind, crate::models::TurnKind::System)),
             "no System turn expected on first follow-up"
+        );
+    }
+
+    #[tokio::test]
+    async fn followup_turn_no_system_note_when_latest_codex_session_id_is_none() {
+        // Regression: when the most-recent codex turn has session_id=None,
+        // last_codex_session must be None and NO resume is attempted. Because
+        // no resume was attempted, the provider's resumed=false response must
+        // NOT be interpreted as a session-lost event, and no System turn
+        // should be inserted.
+        //
+        // Turn layout seeded:
+        //   turn-1  Analyst
+        //   turn-2  Codex  session_id="01HOLD000000"  (older; must be ignored)
+        //   turn-3  Analyst
+        //   turn-4  Codex  session_id=None             (most recent codex)
+        //   turn-5  Analyst
+        use crate::chat;
+        let dir = tempfile::tempdir().unwrap();
+        let ticket_dir = dir.path().join("44996");
+        std::fs::create_dir_all(&ticket_dir).unwrap();
+
+        let make_analyst = |turn: u32, body: &str| crate::models::Turn {
+            schema: "triage-cli/conversation".into(),
+            schema_version: 1,
+            ticket_id: "44996".into(),
+            turn,
+            turn_kind: crate::models::TurnKind::Analyst,
+            ts: chrono::Utc::now(),
+            author: Some("enrique".into()),
+            body: body.to_string(),
+            evidence: vec![],
+            provider: None,
+            model: None,
+            tokens_in: None,
+            tokens_out: None,
+            elapsed_s: None,
+            session_id: None,
+            resumed: None,
+            action: None,
+            outcome: None,
+            drove_revision_from_turns: None,
+            diff: None,
+        };
+        let make_codex = |turn: u32, sid: Option<&str>| crate::models::Turn {
+            schema: "triage-cli/conversation".into(),
+            schema_version: 1,
+            ticket_id: "44996".into(),
+            turn,
+            turn_kind: crate::models::TurnKind::Codex,
+            ts: chrono::Utc::now(),
+            author: None,
+            body: "codex answer".into(),
+            evidence: vec![],
+            provider: Some("codex".into()),
+            model: Some("gpt-5.5".into()),
+            tokens_in: None,
+            tokens_out: None,
+            elapsed_s: None,
+            session_id: sid.map(str::to_string),
+            resumed: Some(false),
+            action: None,
+            outcome: None,
+            drove_revision_from_turns: None,
+            diff: None,
+        };
+
+        let conv = chat::conversation_jsonl_path(&ticket_dir);
+        {
+            let _g = chat::acquire_session_lock(
+                &chat::session_dir(&ticket_dir),
+                std::time::Duration::from_secs(1),
+            )
+            .unwrap();
+            chat::append_turn(&conv, &make_analyst(1, "question one")).unwrap();
+            chat::append_turn(&conv, &make_codex(2, Some("01HOLD000000"))).unwrap();
+            chat::append_turn(&conv, &make_analyst(3, "question two")).unwrap();
+            chat::append_turn(&conv, &make_codex(4, None)).unwrap(); // most recent codex: no session_id
+            chat::append_turn(&conv, &make_analyst(5, "question three")).unwrap();
+        }
+
+        // Provider always returns resumed=false; if last_codex_session were
+        // mistakenly set to "01HOLD000000" this would be interpreted as
+        // session-lost and a System turn would be inserted.
+        struct ResumedFalseProvider;
+        impl crate::providers::LlmProvider for ResumedFalseProvider {
+            fn name(&self) -> &'static str {
+                "fake-resumed-false"
+            }
+            fn complete<'a>(
+                &'a self,
+                _prompt: &'a str,
+                _sys: &'a str,
+                _model: &'a str,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<
+                                crate::providers::CompletionResult,
+                                crate::providers::ProviderError,
+                            >,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async move {
+                    Ok(crate::providers::CompletionResult {
+                        text: "answer".into(),
+                        tokens_in: None,
+                        tokens_out: None,
+                    })
+                })
+            }
+            fn followup<'a>(
+                &'a self,
+                _session_id: Option<&'a str>,
+                _prompt: &'a str,
+                _sys: &'a str,
+                _model: &'a str,
+                _attachments: &'a [crate::models::Attachment],
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<
+                                crate::providers::FollowupResult,
+                                crate::providers::ProviderError,
+                            >,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async move {
+                    Ok(crate::providers::FollowupResult {
+                        text: "fresh answer".into(),
+                        tokens_in: None,
+                        tokens_out: None,
+                        session_id: Some("01HNEW000001".into()),
+                        resumed: false,
+                    })
+                })
+            }
+        }
+
+        let provider: Box<dyn crate::providers::LlmProvider> = Box::new(ResumedFalseProvider);
+        followup_turn(
+            &ticket_dir,
+            "44996",
+            "follow-up after codex with no session_id",
+            "system",
+            "gpt-5.5",
+            &[],
+            provider.as_ref(),
+        )
+        .await
+        .unwrap();
+
+        let parsed = chat::parse_conversation_jsonl(&conv).unwrap();
+        // Expect: analyst(1)+codex(2)+analyst(3)+codex(4)+analyst(5)+codex(6)
+        // — no System turn because last_codex_session was None.
+        assert!(
+            !parsed
+                .turns
+                .iter()
+                .any(|t| matches!(t.turn_kind, crate::models::TurnKind::System)),
+            "no System turn expected when most recent codex had session_id=None; turns: {:?}",
+            parsed
+                .turns
+                .iter()
+                .map(|t| (t.turn, &t.turn_kind, t.action.as_deref()))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            parsed.turns.len(),
+            6,
+            "expected 6 turns (5 seeded + 1 new codex); got {:?}",
+            parsed
+                .turns
+                .iter()
+                .map(|t| (t.turn, &t.turn_kind))
+                .collect::<Vec<_>>()
         );
     }
 
