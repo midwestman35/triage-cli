@@ -802,12 +802,18 @@ pub async fn followup_turn(
             other => FollowupError::Chat(other),
         })?;
 
+    // Apply PII redaction at the LLM boundary (spec § 7.1g, § 9.3).
+    // The redactor scrubs caller PII (phones, addresses, GPS coords);
+    // operational identifiers (Call-IDs, station codes, CNC UUIDs,
+    // site names) are preserved.
+    let (redacted_prompt, _redaction_counts) = crate::redact::redact(prompt);
+
     // Call provider
     let started = std::time::Instant::now();
     let result = provider
         .followup(
             last_codex_session.as_deref(),
-            prompt,
+            &redacted_prompt,
             system_prompt,
             model,
             attachments,
@@ -1174,6 +1180,122 @@ mod tests {
             parsed.turns[1].turn_kind,
             crate::models::TurnKind::Codex
         ));
+    }
+
+    #[tokio::test]
+    async fn followup_turn_applies_pii_redaction() {
+        // Verifies that phone numbers in the analyst prompt are scrubbed before
+        // reaching the provider (spec § 7.1g, § 9.3).
+        use std::sync::Mutex;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ticket_dir = dir.path().join("44777");
+        std::fs::create_dir_all(&ticket_dir).unwrap();
+
+        // Seed an analyst turn-001 so the conversation file exists
+        let analyst = crate::models::Turn {
+            schema: "triage-cli/conversation".into(),
+            schema_version: 1,
+            ticket_id: "44777".into(),
+            turn: 1,
+            turn_kind: crate::models::TurnKind::Analyst,
+            ts: chrono::Utc::now(),
+            author: Some("enrique".into()),
+            body: "initial question".into(),
+            evidence: vec![],
+            provider: None,
+            model: None,
+            tokens_in: None,
+            tokens_out: None,
+            elapsed_s: None,
+            session_id: None,
+            resumed: None,
+            action: None,
+            outcome: None,
+            drove_revision_from_turns: None,
+            diff: None,
+        };
+        let conv = crate::chat::conversation_jsonl_path(&ticket_dir);
+        {
+            let _guard = crate::chat::acquire_session_lock(
+                &crate::chat::session_dir(&ticket_dir),
+                std::time::Duration::from_secs(1),
+            )
+            .unwrap();
+            crate::chat::append_turn(&conv, &analyst).unwrap();
+        }
+
+        // FakeProvider that records the exact prompt it received
+        struct CapturingProvider {
+            captured_prompt: Mutex<Option<String>>,
+        }
+        impl crate::providers::LlmProvider for CapturingProvider {
+            fn name(&self) -> &'static str {
+                "fake-capturing"
+            }
+            fn complete<'a>(
+                &'a self,
+                prompt: &'a str,
+                _sys: &'a str,
+                _model: &'a str,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<
+                                crate::providers::CompletionResult,
+                                crate::providers::ProviderError,
+                            >,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async move {
+                    *self.captured_prompt.lock().unwrap() = Some(prompt.to_string());
+                    Ok(crate::providers::CompletionResult {
+                        text: "redaction-test reply".into(),
+                        tokens_in: Some(5),
+                        tokens_out: Some(5),
+                    })
+                })
+            }
+        }
+
+        // Prompt contains a phone number that should be scrubbed.
+        // Uses the same pattern as redact::tests::redacts_phone.
+        let prompt_with_pii = "call (555) 123-4567 for the incident report";
+
+        let provider = CapturingProvider {
+            captured_prompt: Mutex::new(None),
+        };
+        followup_turn(
+            &ticket_dir,
+            "44777",
+            prompt_with_pii,
+            "system",
+            "fake-model",
+            &[],
+            &provider,
+        )
+        .await
+        .unwrap();
+
+        let captured = provider
+            .captured_prompt
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("provider must have been called");
+
+        // The raw phone number must NOT appear in what the provider received.
+        assert!(
+            !captured.contains("555") || !captured.contains("123-4567"),
+            "PII phone number leaked to provider; captured prompt: {captured:?}"
+        );
+        // The redaction sentinel MUST appear instead.
+        assert!(
+            captured.contains("<PHONE>"),
+            "expected <PHONE> sentinel in redacted prompt; got: {captured:?}"
+        );
     }
 
     #[tokio::test]
