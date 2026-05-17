@@ -43,7 +43,14 @@ pub fn parse_conversation_jsonl(path: &Path) -> Result<ParseOutcome, ChatError> 
     if !path.exists() {
         return Ok(ParseOutcome::default());
     }
+    // Non-UTF-8 content surfaces as ChatError::Io here, which is intentional:
+    // torn-recovery only applies to UTF-8 prefixes of valid JSON. Binary garbage
+    // is an I/O-level problem, not a JSONL structural one.
     let content = fs::read_to_string(path)?;
+    // Normalize CRLF → LF so that writers emitting Windows line-endings
+    // (or any future Windows host) don't leave \r attached to every line.
+    // Classic \r-only line endings are not handled — they are vanishingly rare.
+    let content = content.replace("\r\n", "\n");
     let ends_with_newline = content.ends_with('\n');
     let lines: Vec<&str> = content.split('\n').collect();
     let last_non_empty_idx = lines.iter().rposition(|l| !l.trim().is_empty());
@@ -518,6 +525,16 @@ mod tests {
         writeln!(f, "{line}").unwrap();
         let err = parse_conversation_jsonl(&path);
         assert!(matches!(err, Err(ChatError::Json(_))));
+    }
+
+    #[test]
+    fn all_blank_lines_returns_empty_parse_outcome() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("CONVERSATION.jsonl");
+        fs::write(&path, b"\n\n\n").unwrap();
+        let out = parse_conversation_jsonl(&path).unwrap();
+        assert!(out.turns.is_empty());
+        assert!(!out.torn_final_line);
     }
 
     #[test]
