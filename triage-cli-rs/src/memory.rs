@@ -403,54 +403,95 @@ fn ensure_memory_md() -> std::io::Result<()> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// Test-isolation helpers (cfg(test) only, pub(crate) so pipeline tests can
+// share the same mutex).
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Env var name for the tickets root dir — overridden in tests.
+#[cfg(test)]
+pub(crate) const TICKETS_ROOT_ENV: &str = "TRIAGE_TICKETS_ROOT";
+
+/// Process-wide mutex that serialises any test mutating
+/// `TRIAGE_MEMORY_MD` / `TRIAGE_MEMORY_DB` / `TRIAGE_TICKETS_ROOT`.
+/// All tests in every module that touch these vars must hold this lock.
+#[cfg(test)]
+pub(crate) static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// RAII guard: locks [`ENV_GUARD`] and overrides the three process-global
+/// env vars used by the memory subsystem (and by `investigate_one_structured`
+/// for the tickets root).  All previous values are restored on drop.
+#[cfg(test)]
+pub(crate) struct MemoryEnvScope {
+    _guard: std::sync::MutexGuard<'static, ()>,
+    prev_md: Option<String>,
+    prev_db: Option<String>,
+    prev_tickets_root: Option<String>,
+}
+
+#[cfg(test)]
+impl MemoryEnvScope {
+    /// Override `TRIAGE_MEMORY_MD` and `TRIAGE_MEMORY_DB` only.
+    /// Use this from pure memory tests that don't touch the tickets root.
+    pub(crate) fn new(md: &std::path::Path, db: &std::path::Path) -> Self {
+        Self::new_with_tickets_root(md, db, None)
+    }
+
+    /// Override all three env vars.  Pass `tickets_root = Some(path)` when
+    /// the caller also needs to isolate `TRIAGE_TICKETS_ROOT`.
+    pub(crate) fn new_with_tickets_root(
+        md: &std::path::Path,
+        db: &std::path::Path,
+        tickets_root: Option<&std::path::Path>,
+    ) -> Self {
+        let guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_md = std::env::var(MEMORY_MD_ENV).ok();
+        let prev_db = std::env::var(MEMORY_DB_ENV).ok();
+        let prev_tickets_root = std::env::var(TICKETS_ROOT_ENV).ok();
+        std::env::set_var(MEMORY_MD_ENV, md);
+        std::env::set_var(MEMORY_DB_ENV, db);
+        if let Some(root) = tickets_root {
+            std::env::set_var(TICKETS_ROOT_ENV, root);
+        }
+        Self {
+            _guard: guard,
+            prev_md,
+            prev_db,
+            prev_tickets_root,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for MemoryEnvScope {
+    fn drop(&mut self) {
+        match &self.prev_md {
+            Some(v) => std::env::set_var(MEMORY_MD_ENV, v),
+            None => std::env::remove_var(MEMORY_MD_ENV),
+        }
+        match &self.prev_db {
+            Some(v) => std::env::set_var(MEMORY_DB_ENV, v),
+            None => std::env::remove_var(MEMORY_DB_ENV),
+        }
+        match &self.prev_tickets_root {
+            Some(v) => std::env::set_var(TICKETS_ROOT_ENV, v),
+            None => std::env::remove_var(TICKETS_ROOT_ENV),
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
     use tempfile::TempDir;
 
-    /// Serializes tests that mutate the `TRIAGE_MEMORY_MD` / `TRIAGE_MEMORY_DB`
-    /// env vars. cargo runs tests in parallel by default, and these env vars
-    /// are process-global.
-    static ENV_GUARD: Mutex<()> = Mutex::new(());
-
-    /// RAII helper: scope MEMORY_MD/MEMORY_DB to a tempdir, restore on drop.
-    struct EnvScope {
-        _guard: std::sync::MutexGuard<'static, ()>,
-        prev_md: Option<String>,
-        prev_db: Option<String>,
-    }
-
-    impl EnvScope {
-        fn new(md: &Path, db: &Path) -> Self {
-            let guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-            let prev_md = std::env::var(MEMORY_MD_ENV).ok();
-            let prev_db = std::env::var(MEMORY_DB_ENV).ok();
-            std::env::set_var(MEMORY_MD_ENV, md);
-            std::env::set_var(MEMORY_DB_ENV, db);
-            Self {
-                _guard: guard,
-                prev_md,
-                prev_db,
-            }
-        }
-    }
-
-    impl Drop for EnvScope {
-        fn drop(&mut self) {
-            match &self.prev_md {
-                Some(v) => std::env::set_var(MEMORY_MD_ENV, v),
-                None => std::env::remove_var(MEMORY_MD_ENV),
-            }
-            match &self.prev_db {
-                Some(v) => std::env::set_var(MEMORY_DB_ENV, v),
-                None => std::env::remove_var(MEMORY_DB_ENV),
-            }
-        }
-    }
+    // Re-export the shared guard type under the legacy local alias so that
+    // all existing `EnvScope::new(...)` call-sites inside this module
+    // continue to compile unchanged.
+    type EnvScope = MemoryEnvScope;
 
     /// Build a fresh legacy-schema database that mimics what a pre-v1
     /// installation would have on disk: six FTS5 columns, no

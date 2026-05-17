@@ -752,6 +752,12 @@ mod tests {
 
     /// Run the pipeline against the audio-drop fixture (ticket #55001) using
     /// `no_llm: true` so no network calls are made. Returns the pipeline result.
+    ///
+    /// Acquires the shared memory env-guard so that this test is serialised
+    /// with every `memory::tests::*` test that also touches
+    /// `TRIAGE_MEMORY_MD` / `TRIAGE_MEMORY_DB`.  All three process-global
+    /// env vars are overridden to paths inside `tickets_root` and restored
+    /// on return.
     async fn run_fixture_pipeline(
         tickets_root: &std::path::Path,
     ) -> Result<StructuredInvestigation, PipelineError> {
@@ -777,8 +783,16 @@ mod tests {
         let rubric = Rubric::load().expect("embedded rubric must parse");
         let reporter = SilentReporter;
 
-        // Override the tickets root for this test run.
-        std::env::set_var("TRIAGE_TICKETS_ROOT", tickets_root);
+        // Override TRIAGE_TICKETS_ROOT, TRIAGE_MEMORY_MD, and TRIAGE_MEMORY_DB
+        // to paths inside this test's tempdir, and hold the process-wide env
+        // mutex for the duration so we don't race with memory::tests::*.
+        let memory_md = tickets_root.join("MEMORY.md");
+        let memory_db = tickets_root.join("data/memory.db");
+        let _env = crate::memory::MemoryEnvScope::new_with_tickets_root(
+            &memory_md,
+            &memory_db,
+            Some(tickets_root),
+        );
 
         investigate_one_structured(
             ticket,
