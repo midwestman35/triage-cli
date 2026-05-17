@@ -50,6 +50,7 @@ crossterm = "0.28"
 # Filesystem + utilities
 which = "6"
 dirs = "5"
+fs2 = "0.4"
 
 [features]
 default = []

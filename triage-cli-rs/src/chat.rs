@@ -10,7 +10,9 @@
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
+use fs2::FileExt;
 use thiserror::Error;
 
 use crate::models::{EvidenceProvenance, Turn, TurnKind};
@@ -23,6 +25,8 @@ pub enum ChatError {
     Json(#[from] serde_json::Error),
     #[error("conversation file path missing parent: {0}")]
     PathMissingParent(PathBuf),
+    #[error("lock contention at {}", lock_path.display())]
+    LockContention { lock_path: PathBuf },
 }
 
 /// Parse `Tickets/<id>/CONVERSATION.jsonl` into the turns it contains.
@@ -179,11 +183,48 @@ pub fn write_conversation_md(
     Ok(())
 }
 
+/// RAII guard that releases the per-ticket lock on drop.
+pub struct SessionLockGuard {
+    _file: fs::File,
+}
+
+/// Acquire the advisory file lock at `<session_dir>/lock`. Retries with
+/// 50ms sleep backoff up to `budget`. The lock is released automatically
+/// when the returned guard is dropped.
+pub fn acquire_session_lock(
+    session_dir: &Path,
+    budget: Duration,
+) -> Result<SessionLockGuard, ChatError> {
+    fs::create_dir_all(session_dir)?;
+    let lock_path = session_dir.join("lock");
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .read(true)
+        .truncate(false)
+        .open(&lock_path)?;
+    let deadline = Instant::now() + budget;
+    loop {
+        match file.try_lock_exclusive() {
+            Ok(()) => return Ok(SessionLockGuard { _file: file }),
+            Err(_) if Instant::now() >= deadline => {
+                return Err(ChatError::LockContention {
+                    lock_path: lock_path.clone(),
+                });
+            }
+            Err(_) => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::models::{EvidenceProvenance, TurnKind};
     use chrono::Utc;
+    use std::time::Duration;
     use tempfile::tempdir;
 
     fn sample_analyst_turn(turn_no: u32) -> Turn {
@@ -311,5 +352,28 @@ mod tests {
         let on_disk = fs::read_to_string(&path).unwrap();
         let expected = render_conversation_md(&turns, "44776");
         assert_eq!(on_disk, expected);
+    }
+
+    #[test]
+    fn lock_acquired_and_released() {
+        let dir = tempdir().unwrap();
+        let session_dir = dir.path().to_path_buf();
+        {
+            let guard = acquire_session_lock(&session_dir, Duration::from_secs(1)).unwrap();
+            drop(guard);
+        }
+        // After drop, lock is releasable — re-acquisition succeeds immediately.
+        let guard2 = acquire_session_lock(&session_dir, Duration::from_secs(1)).unwrap();
+        drop(guard2);
+    }
+
+    #[test]
+    fn lock_contention_times_out() {
+        let dir = tempdir().unwrap();
+        let session_dir = dir.path().to_path_buf();
+        let _held = acquire_session_lock(&session_dir, Duration::from_secs(1)).unwrap();
+        // Second acquisition with a short budget must fail.
+        let r = acquire_session_lock(&session_dir, Duration::from_millis(100));
+        assert!(matches!(r, Err(ChatError::LockContention { .. })));
     }
 }
