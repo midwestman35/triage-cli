@@ -158,6 +158,54 @@ fn header_color(kind: TurnKind) -> Color {
     }
 }
 
+// ──────────────────────────────────────────────────────────────────────
+//   ChatCommand enum + parser
+// ──────────────────────────────────────────────────────────────────────
+
+/// Slash commands recognized by the chat input modal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChatCommand {
+    /// `/file <path>` — attach a file by path.
+    File(std::path::PathBuf),
+    /// `/paste <label>=<body>` — attach a labeled paste.
+    Paste { label: String, body: String },
+    /// `/revise` — re-run the structured pipeline.
+    Revise,
+    /// `/retry` — re-attempt the last failed provider call.
+    Retry,
+    /// `/quit` — close the chat pane.
+    Quit,
+    /// A plain analyst body (no leading slash).
+    Body(String),
+}
+
+/// Parse the analyst's input into a `ChatCommand`. Empty input maps to
+/// `Body("")` so the caller can decide whether to discard it.
+pub fn parse_chat_command(raw: &str) -> ChatCommand {
+    let trimmed = raw.trim();
+    if let Some(rest) = trimmed.strip_prefix("/file ") {
+        return ChatCommand::File(std::path::PathBuf::from(rest.trim()));
+    }
+    if let Some(rest) = trimmed.strip_prefix("/paste ") {
+        if let Some((label, body)) = rest.split_once('=') {
+            return ChatCommand::Paste {
+                label: label.trim().to_string(),
+                body: body.to_string(),
+            };
+        }
+    }
+    if trimmed == "/revise" {
+        return ChatCommand::Revise;
+    }
+    if trimmed == "/retry" {
+        return ChatCommand::Retry;
+    }
+    if trimmed == "/quit" {
+        return ChatCommand::Quit;
+    }
+    ChatCommand::Body(raw.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,5 +280,40 @@ mod tests {
             out.push(row);
         }
         out
+    }
+
+    #[test]
+    fn parse_file_command() {
+        assert_eq!(
+            parse_chat_command("/file ./station.log"),
+            ChatCommand::File(std::path::PathBuf::from("./station.log"))
+        );
+    }
+
+    #[test]
+    fn parse_paste_command() {
+        assert_eq!(
+            parse_chat_command("/paste customer-note=they rebooted"),
+            ChatCommand::Paste {
+                label: "customer-note".into(),
+                body: "they rebooted".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_revise_retry_quit() {
+        assert_eq!(parse_chat_command("/revise"), ChatCommand::Revise);
+        assert_eq!(parse_chat_command("/retry"), ChatCommand::Retry);
+        assert_eq!(parse_chat_command("/quit"), ChatCommand::Quit);
+    }
+
+    #[test]
+    fn parse_plain_body() {
+        let r = parse_chat_command("what happened?");
+        match r {
+            ChatCommand::Body(s) => assert_eq!(s, "what happened?"),
+            _ => panic!("expected Body"),
+        }
     }
 }

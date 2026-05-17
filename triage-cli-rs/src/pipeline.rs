@@ -1251,4 +1251,103 @@ mod tests {
         assert!(matches!(last.turn_kind, crate::models::TurnKind::System));
         assert_eq!(last.action.as_deref(), Some("revise"));
     }
+
+    #[tokio::test]
+    async fn end_to_end_revise_against_fixture() {
+        // Set up a self-contained end-to-end state in a tempdir mirroring
+        // what the spec § 7.2 example would produce. This is a unit-test
+        // version of the fixture (the actual fixture is deferred to v2).
+
+        let dir = tempfile::tempdir().unwrap();
+        let ticket_dir = dir.path().join("44776");
+        std::fs::create_dir_all(ticket_dir.join(".session")).unwrap();
+
+        // Seed base-ticket.json and base-evidence-manifest.json
+        let ticket = crate::models::Ticket {
+            id: 44776,
+            subject: "audio dropped".into(),
+            description: "initial".into(),
+            requester_org: None,
+            requester_email: None,
+            tags: vec![],
+            created_at: chrono::Utc::now(),
+            updated_at: None,
+            comments: vec![],
+        };
+        crate::chat::write_base_ticket(&ticket_dir, &ticket).unwrap();
+        crate::chat::write_base_evidence_manifest(
+            &ticket_dir,
+            &crate::models::BaseEvidenceManifest {
+                schema: "triage-cli/base-evidence".into(),
+                schema_version: 1,
+                ticket_id: "44776".into(),
+                captured_at: chrono::Utc::now(),
+                evidence: vec![],
+            },
+        )
+        .unwrap();
+
+        // Seed an analyst follow-up turn WITH evidence
+        let analyst = crate::models::Turn {
+            schema: "triage-cli/conversation".into(),
+            schema_version: 1,
+            ticket_id: "44776".into(),
+            turn: 1,
+            turn_kind: crate::models::TurnKind::Analyst,
+            ts: chrono::Utc::now(),
+            author: Some("enrique".into()),
+            body: "new log shows reboot at 14:32".into(),
+            evidence: vec![crate::models::EvidenceProvenance::Paste {
+                label: "customer-note".into(),
+                body: "reboot at 14:32 PT".into(),
+                bytes: 18,
+                sent_to_provider: true,
+            }],
+            provider: None,
+            model: None,
+            tokens_in: None,
+            tokens_out: None,
+            elapsed_s: None,
+            session_id: None,
+            resumed: None,
+            action: None,
+            outcome: None,
+            drove_revision_from_turns: None,
+            diff: None,
+        };
+        let conv_path = crate::chat::conversation_jsonl_path(&ticket_dir);
+        crate::chat::append_turn(&conv_path, &analyst).unwrap();
+
+        // Call /revise
+        revise(&ticket_dir, "44776")
+            .await
+            .expect("revise must succeed");
+
+        // Conversation now has: analyst turn-001 + system revise turn-002
+        let parsed = crate::chat::parse_conversation_jsonl(&conv_path).unwrap();
+        assert_eq!(parsed.turns.len(), 2);
+        let last = parsed.turns.last().unwrap();
+        assert!(matches!(last.turn_kind, crate::models::TurnKind::System));
+        assert_eq!(last.action.as_deref(), Some("revise"));
+        assert!(
+            last.drove_revision_from_turns
+                .as_ref()
+                .map(|v| v.contains(&1))
+                .unwrap_or(false),
+            "drove_revision_from_turns must include turn 1"
+        );
+
+        // CONVERSATION.md should also exist and contain both turns
+        let md_path = crate::chat::conversation_md_path(&ticket_dir);
+        assert!(md_path.exists(), "CONVERSATION.md was not written");
+        let md = std::fs::read_to_string(&md_path).unwrap();
+        assert!(
+            md.contains("turn-001 analyst"),
+            "CONVERSATION.md missing turn-001 analyst header"
+        );
+        assert!(
+            md.contains("turn-002 system"),
+            "CONVERSATION.md missing turn-002 system header"
+        );
+    }
 }

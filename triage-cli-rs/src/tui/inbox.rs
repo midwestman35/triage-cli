@@ -222,6 +222,9 @@ struct InboxApp {
     pending_triages: Vec<JoinHandle<()>>,
     event_tx: mpsc::UnboundedSender<InboxEvent>,
     should_exit: bool,
+    /// Set by `action_open_chat`; consumed by the outer async loop which calls
+    /// `run_chat_session` and then clears this field.
+    pending_chat_ticket_id: Option<String>,
 }
 
 /// Public entry point.
@@ -257,6 +260,7 @@ pub async fn run_inbox(opts: WatcherOptions) -> io::Result<()> {
         pending_triages: Vec::new(),
         event_tx: event_tx.clone(),
         should_exit: false,
+        pending_chat_ticket_id: None,
     };
     app.hydrate_from_disk();
 
@@ -307,6 +311,50 @@ pub async fn run_inbox(opts: WatcherOptions) -> io::Result<()> {
 
         if app.should_exit {
             break;
+        }
+
+        // Check if the 'a' keybinding opened a chat session request.
+        if let Some(ticket_id) = app.pending_chat_ticket_id.take() {
+            // Suspend the inbox terminal before starting the chat pane.
+            // We leave the alt-screen and disable mouse capture so the
+            // chat session can take over the terminal cleanly.
+            use crossterm::{
+                event::{DisableMouseCapture, EnableMouseCapture},
+                execute,
+                terminal::{
+                    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+                },
+            };
+            let _ = disable_raw_mode();
+            let _ = execute!(
+                terminal.backend_mut(),
+                LeaveAlternateScreen,
+                DisableMouseCapture
+            );
+            let _ = terminal.show_cursor();
+
+            let chat_result = run_chat_session(&ticket_id).await;
+
+            // Resume the inbox terminal.
+            let _ = enable_raw_mode();
+            let _ = execute!(
+                terminal.backend_mut(),
+                EnterAlternateScreen,
+                EnableMouseCapture
+            );
+            terminal.clear()?;
+
+            match chat_result {
+                Ok(()) => {
+                    app.notify(
+                        format!("Chat session for #{ticket_id} closed"),
+                        NotifyKind::Info,
+                    );
+                }
+                Err(e) => {
+                    app.notify(format!("Chat error: {e}"), NotifyKind::Error);
+                }
+            }
         }
     }
 
@@ -549,6 +597,7 @@ impl InboxApp {
             (KeyCode::Char('r'), _) => self.action_refresh(),
             (KeyCode::Char('y'), _) => self.action_copy_summary(),
             (KeyCode::Char('o'), _) => self.action_open_zendesk(),
+            (KeyCode::Char('a'), _) => self.action_open_chat(),
             (KeyCode::PageDown, _) => self.report_scroll = self.report_scroll.saturating_add(8),
             (KeyCode::PageUp, _) => self.report_scroll = self.report_scroll.saturating_sub(8),
             _ => {}
@@ -667,6 +716,14 @@ impl InboxApp {
         } else {
             self.notify(format!("Could not open: {url}"), NotifyKind::Warning);
         }
+    }
+
+    fn action_open_chat(&mut self) {
+        let Some(row) = self.selected_row() else {
+            self.notify("No ticket selected", NotifyKind::Warning);
+            return;
+        };
+        self.pending_chat_ticket_id = Some(row.ticket_id.to_string());
     }
 
     fn spawn_triage(&mut self, ticket_id: u64, site_override: Option<String>) {
@@ -950,7 +1007,7 @@ impl InboxApp {
 
     fn draw_footer(&self, frame: &mut ratatui::Frame, area: Rect) {
         let hints =
-            "↑/k ↓/j move · enter triage/focus · tab cycle files · esc summary · r refresh · y copy · o open · q quit";
+            "↑/k ↓/j move · enter triage/focus · tab cycle files · esc summary · r refresh · y copy · o open · a chat · q quit";
         let para = Paragraph::new(hints.dim().to_string());
         frame.render_widget(para, area);
     }
@@ -1681,6 +1738,209 @@ fn read_file_for_display(path: &Path) -> String {
 #[allow(dead_code)]
 fn _ticket_folder_anchor() -> std::path::PathBuf {
     ticket_folder::tickets_root()
+}
+
+// ──────────────────────────────────────────────────────────────────────
+//   Chat pane event loop — invoked by the 'a' keybinding
+// ──────────────────────────────────────────────────────────────────────
+
+async fn run_chat_session(ticket_id: &str) -> anyhow::Result<()> {
+    use crate::providers::get_provider;
+    use crate::tui::chat::{parse_chat_command, ChatCommand};
+    use crate::{chat, pipeline};
+    use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+    use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+    use ratatui::backend::CrosstermBackend;
+    use ratatui::Terminal;
+    use std::time::Duration;
+    use tui_textarea::TextArea;
+
+    let ticket_dir = ticket_folder::tickets_root().join(ticket_id);
+    std::fs::create_dir_all(&ticket_dir)?;
+
+    // Create a fresh terminal using stderr so we don't conflict with the
+    // stdout-based inbox terminal that was suspended by the caller.
+    enable_raw_mode()?;
+    let stderr = std::io::stderr();
+    let backend = CrosstermBackend::new(stderr);
+    let mut terminal = Terminal::new(backend)?;
+
+    let mut input = TextArea::default();
+    input.set_block(ratatui::widgets::Block::default());
+
+    let mut pending_evidence: Vec<crate::models::EvidenceProvenance> = Vec::new();
+    let mut in_flight: Option<crate::tui::chat::InFlightState> = None;
+
+    let provider = get_provider().map_err(|e| anyhow::anyhow!("provider unavailable: {e}"))?;
+
+    loop {
+        let outcome = chat::parse_conversation_jsonl(&chat::conversation_jsonl_path(&ticket_dir))?;
+        let pane = crate::tui::chat::ChatPane {
+            turns: &outcome.turns,
+            input: &input,
+            ticket_id,
+            in_flight: in_flight.clone(),
+        };
+        terminal.draw(|f| {
+            let area = f.area();
+            f.render_widget(&pane, area);
+        })?;
+
+        // Tick the throbber if in-flight.
+        if let Some(ref mut s) = in_flight {
+            s.frame_idx = s.frame_idx.wrapping_add(1);
+        }
+
+        if event::poll(Duration::from_millis(80))? {
+            if let Event::Key(key) = event::read()? {
+                match (key.code, key.modifiers) {
+                    (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => break,
+                    (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
+                        let body: String = input.lines().join("\n");
+                        if body.trim().is_empty() {
+                            continue;
+                        }
+                        let cmd = parse_chat_command(&body);
+                        match cmd {
+                            ChatCommand::Body(b) => {
+                                send_analyst_turn(
+                                    &ticket_dir,
+                                    ticket_id,
+                                    &b,
+                                    std::mem::take(&mut pending_evidence),
+                                    provider.as_ref(),
+                                    &mut input,
+                                )
+                                .await?;
+                            }
+                            ChatCommand::File(path) => {
+                                let turn_no = next_turn_number(&ticket_dir)?;
+                                let prov = chat::attach_file(&ticket_dir, turn_no, &path)
+                                    .map_err(|e| anyhow::anyhow!("attach_file: {e}"))?;
+                                pending_evidence.push(prov);
+                                clear_textarea(&mut input);
+                            }
+                            ChatCommand::Paste { label, body } => {
+                                pending_evidence.push(chat::attach_paste(&label, &body));
+                                clear_textarea(&mut input);
+                            }
+                            ChatCommand::Revise => {
+                                pipeline::revise(&ticket_dir, ticket_id).await?;
+                                clear_textarea(&mut input);
+                            }
+                            ChatCommand::Retry => {
+                                let retry_outcome = chat::parse_conversation_jsonl(
+                                    &chat::conversation_jsonl_path(&ticket_dir),
+                                )?;
+                                if let Some(last_analyst) =
+                                    retry_outcome.turns.iter().rev().find(|t| {
+                                        matches!(t.turn_kind, crate::models::TurnKind::Analyst)
+                                    })
+                                {
+                                    let body_clone = last_analyst.body.clone();
+                                    send_analyst_turn(
+                                        &ticket_dir,
+                                        ticket_id,
+                                        &body_clone,
+                                        Vec::new(),
+                                        provider.as_ref(),
+                                        &mut input,
+                                    )
+                                    .await?;
+                                }
+                            }
+                            ChatCommand::Quit => break,
+                        }
+                    }
+                    _ => {
+                        input.input(key);
+                    }
+                }
+            }
+        }
+    }
+
+    // Tear down the chat terminal before handing control back to the inbox.
+    let _ = disable_raw_mode();
+    drop(terminal);
+    Ok(())
+}
+
+fn clear_textarea(input: &mut tui_textarea::TextArea) {
+    *input = tui_textarea::TextArea::default();
+    input.set_block(ratatui::widgets::Block::default());
+}
+
+fn next_turn_number(ticket_dir: &Path) -> anyhow::Result<u32> {
+    let outcome =
+        crate::chat::parse_conversation_jsonl(&crate::chat::conversation_jsonl_path(ticket_dir))
+            .map_err(|e| anyhow::anyhow!("parse_conversation_jsonl: {e}"))?;
+    Ok(outcome.turns.iter().map(|t| t.turn).max().unwrap_or(0) + 1)
+}
+
+async fn send_analyst_turn(
+    ticket_dir: &Path,
+    ticket_id: &str,
+    body: &str,
+    evidence: Vec<crate::models::EvidenceProvenance>,
+    provider: &dyn crate::providers::LlmProvider,
+    input: &mut tui_textarea::TextArea<'_>,
+) -> anyhow::Result<()> {
+    use crate::chat;
+    let next = next_turn_number(ticket_dir)?;
+    let analyst_turn = crate::models::Turn {
+        schema: "triage-cli/conversation".into(),
+        schema_version: 1,
+        ticket_id: ticket_id.to_string(),
+        turn: next,
+        turn_kind: crate::models::TurnKind::Analyst,
+        ts: chrono::Utc::now(),
+        author: std::env::var("TRIAGE_OWNER")
+            .or_else(|_| std::env::var("USER"))
+            .ok(),
+        body: body.to_string(),
+        evidence,
+        provider: None,
+        model: None,
+        tokens_in: None,
+        tokens_out: None,
+        elapsed_s: None,
+        session_id: None,
+        resumed: None,
+        action: None,
+        outcome: None,
+        drove_revision_from_turns: None,
+        diff: None,
+    };
+    {
+        let _guard = chat::acquire_session_lock(
+            &chat::session_dir(ticket_dir),
+            std::time::Duration::from_secs(5),
+        )
+        .map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        chat::append_turn(&chat::conversation_jsonl_path(ticket_dir), &analyst_turn)
+            .map_err(|e| anyhow::anyhow!("append_turn: {e}"))?;
+        let parsed = chat::parse_conversation_jsonl(&chat::conversation_jsonl_path(ticket_dir))
+            .map_err(|e| anyhow::anyhow!("parse: {e}"))?;
+        chat::write_conversation_md(
+            &chat::conversation_md_path(ticket_dir),
+            &parsed.turns,
+            ticket_id,
+        )
+        .map_err(|e| anyhow::anyhow!("write_md: {e}"))?;
+    }
+    let _result = pipeline::followup_turn(
+        ticket_dir,
+        ticket_id,
+        body,
+        "",
+        &std::env::var("CODEX_MODEL").unwrap_or_else(|_| "gpt-5.5".to_string()),
+        &[],
+        provider,
+    )
+    .await?;
+    clear_textarea(input);
+    Ok(())
 }
 
 #[cfg(test)]
