@@ -172,6 +172,12 @@ pub struct InvestigateOptions {
     /// Task 12 sets this flag; all existing call sites leave it at the
     /// `Default::default()` value of `false`.
     pub followup_mode: bool,
+    /// Override for the ticket-folder write destination. When `None`, the
+    /// pipeline falls back to `ticket_folder::tickets_root()` (which reads
+    /// `TRIAGE_TICKETS_ROOT`). When `Some(p)`, the ticket folder is written
+    /// under `p` regardless of the env var. /revise uses this to write under
+    /// the existing ticket_dir's parent without mutating process-global env.
+    pub tickets_root: Option<std::path::PathBuf>,
 }
 
 impl InvestigateOptions {
@@ -191,6 +197,7 @@ impl InvestigateOptions {
             customer_history_override: None,
             memory_hits_override: None,
             followup_mode: false,
+            tickets_root: None,
         }
     }
 }
@@ -386,7 +393,10 @@ pub async fn investigate_one_structured(
                     // On retry-after failure, stash the raw response under
                     // Tickets/<id>/.debug/ before propagating (spec § 6, decision 6).
                     if let LlmError::StructuredAfterRetry { raw_response, .. } = &e {
-                        let root = ticket_folder::tickets_root();
+                        let root = opts
+                            .tickets_root
+                            .clone()
+                            .unwrap_or_else(ticket_folder::tickets_root);
                         match ticket_folder::stash_debug_response(&root, ticket.id, raw_response) {
                             Ok(p) => reporter.phase_failed(
                                 "llm_call",
@@ -433,7 +443,10 @@ pub async fn investigate_one_structured(
 
     // Phase: save (five-markdown ticket folder)
     reporter.phase_started("save", "");
-    let root = ticket_folder::tickets_root();
+    let root = opts
+        .tickets_root
+        .clone()
+        .unwrap_or_else(ticket_folder::tickets_root);
     std::fs::create_dir_all(&root).map_err(TicketFolderError::Io)?;
     let owner = current_owner();
     let paths = ticket_folder::write_ticket_folder(
@@ -459,7 +472,11 @@ pub async fn investigate_one_structured(
     // Base snapshots for the interactive investigation feature
     // (spec § 5.4). Skipped when `followup_mode` is true.
     if !opts.followup_mode {
-        let ticket_dir = ticket_folder::tickets_root().join(ticket.id.to_string());
+        let ticket_dir = opts
+            .tickets_root
+            .clone()
+            .unwrap_or_else(ticket_folder::tickets_root)
+            .join(ticket.id.to_string());
         // Best-effort: snapshot write failure is logged but does not
         // fail the investigation. The /revise path treats missing
         // snapshots as a re-fetch trigger.
@@ -883,6 +900,71 @@ pub async fn followup_turn(
     Ok(result)
 }
 
+/// Build the synthetic `InvestigationSession` that `/revise` feeds into
+/// `investigate_one_structured`. Seeds the session with a catalog summary
+/// of the base evidence (so the LLM is aware of the original signal),
+/// then layers post-base evidence from analyst/automated turns recorded
+/// since `last_revise_turn`.
+///
+/// **Why a catalog summary, not full content:** `BaseEvidenceManifest`
+/// stores `EvidenceItem`s — IDs + kind + label + source pointer — not the
+/// underlying bodies. Datadog log lines, file content, and paste bodies
+/// live in their original sources. We surface the catalog so the
+/// re-emission preserves the original `E-NNN` identifiers and labels;
+/// fully restoring content would require extending the manifest schema to
+/// store body snapshots.
+///
+/// Extracted into a free function so it can be unit-tested directly (the
+/// no-llm pipeline path stubs the output and doesn't reveal what the
+/// session actually contains).
+fn build_revise_session(
+    base_ticket: &crate::models::Ticket,
+    base_evidence: &crate::models::BaseEvidenceManifest,
+    turns: &[crate::models::Turn],
+    last_revise_turn: u32,
+) -> crate::models::InvestigationSession {
+    let mut session = crate::investigation::create_session(base_ticket.clone());
+
+    // 1. Surface base-evidence catalog as a labeled paste so the LLM
+    //    re-emission knows what evidence existed originally.
+    if !base_evidence.evidence.is_empty() {
+        let mut catalog = String::from(
+            "Base-evidence catalog from the original investigation \
+             (bodies live in their original sources — not re-fetched here):\n",
+        );
+        for item in &base_evidence.evidence {
+            catalog.push_str(&format!("- {} [{}] {}\n", item.id, item.kind, item.label));
+        }
+        crate::investigation::add_pasted_evidence(&mut session, "base-evidence-catalog", &catalog);
+    }
+
+    // 2. Layer post-base evidence from turns since the last revise.
+    for t in turns.iter().filter(|t| t.turn > last_revise_turn) {
+        for ev in &t.evidence {
+            match ev {
+                crate::models::EvidenceProvenance::File { copied_path, .. } => {
+                    // Best-effort: if the copied file has been removed we skip it.
+                    let _ = crate::investigation::add_local_file(&mut session, copied_path);
+                }
+                crate::models::EvidenceProvenance::Paste { label, body, .. } => {
+                    crate::investigation::add_pasted_evidence(&mut session, label, body);
+                }
+            }
+        }
+        // Also feed analyst-turn body text as a labeled paste so the
+        // structured pipeline sees what the analyst told us.
+        if matches!(t.turn_kind, crate::models::TurnKind::Analyst) && !t.body.is_empty() {
+            crate::investigation::add_pasted_evidence(
+                &mut session,
+                &format!("turn-{:03}-body", t.turn),
+                &t.body,
+            );
+        }
+    }
+
+    session
+}
+
 /// `/revise` re-entry. Validates that there is new evidence since the
 /// last revise, loads base snapshots, builds a synthetic
 /// `InvestigationSession`, and calls `investigate_one_structured` with
@@ -896,6 +978,7 @@ pub async fn followup_turn(
 pub async fn revise(
     ticket_dir: &std::path::Path,
     ticket_id: &str,
+    dd_client: Option<&dyn DatadogSource>,
     opts: &InvestigateOptions,
 ) -> Result<(), PipelineError> {
     use crate::chat;
@@ -946,40 +1029,21 @@ pub async fn revise(
     // Load base snapshots.
     let base_ticket = chat::read_base_ticket(ticket_dir)
         .map_err(|e| FollowupError::BaseSnapshotMissing(e.to_string()))?;
-    let _base_evidence = chat::read_base_evidence_manifest(ticket_dir)
+    let base_evidence = chat::read_base_evidence_manifest(ticket_dir)
         .map_err(|e| FollowupError::BaseSnapshotMissing(e.to_string()))?;
 
     // --- Structured re-emission (spec § 2.5 V1 ship list) ---
-    // Build a synthetic InvestigationSession from the base ticket plus any new
-    // evidence (file attachments and labeled pastes) extracted from
-    // CONVERSATION.jsonl turns since the last revise.  Then run the structured
-    // pipeline with followup_mode=true so the five-markdown folder is rewritten
-    // while the base snapshots are preserved.
-    let mut session = crate::investigation::create_session(base_ticket.clone());
-
-    // Feed new evidence from turns since last_revise_turn.
-    for t in outcome.turns.iter().filter(|t| t.turn > last_revise_turn) {
-        for ev in &t.evidence {
-            match ev {
-                crate::models::EvidenceProvenance::File { copied_path, .. } => {
-                    // Best-effort: if the copied file has been removed we skip it.
-                    let _ = crate::investigation::add_local_file(&mut session, copied_path);
-                }
-                crate::models::EvidenceProvenance::Paste { label, body, .. } => {
-                    crate::investigation::add_pasted_evidence(&mut session, label, body);
-                }
-            }
-        }
-        // Also feed analyst-turn body text as a labeled paste so the
-        // structured pipeline sees what the analyst told us.
-        if matches!(t.turn_kind, crate::models::TurnKind::Analyst) && !t.body.is_empty() {
-            crate::investigation::add_pasted_evidence(
-                &mut session,
-                &format!("turn-{:03}-body", t.turn),
-                &t.body,
-            );
-        }
-    }
+    // Build a synthetic InvestigationSession from the base ticket, the base
+    // evidence catalog, and any new evidence (file attachments and labeled
+    // pastes) extracted from CONVERSATION.jsonl turns since the last revise.
+    // Then run the structured pipeline with followup_mode=true so the
+    // five-markdown folder is rewritten while the base snapshots are preserved.
+    let mut session = build_revise_session(
+        &base_ticket,
+        &base_evidence,
+        &outcome.turns,
+        last_revise_turn,
+    );
 
     let rubric = crate::playbook::Rubric::load()
         .map_err(|e| FollowupError::BaseSnapshotMissing(format!("rubric load failed: {e}")))?;
@@ -989,9 +1053,18 @@ pub async fn revise(
     // the STATE.md owner soft-lock (the per-ticket session lock acquired above
     // is orthogonal — it serializes concurrent writers on this ticket, but
     // does NOT authorize one analyst to overwrite another's STATE.md).
+    //
+    // `tickets_root` is set to the existing ticket_dir's parent so that the
+    // structured pipeline writes back to the same folder we're revising,
+    // without mutating process-global TRIAGE_TICKETS_ROOT.
+    let tickets_root_parent = ticket_dir
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(ticket_folder::tickets_root);
     let revise_opts = InvestigateOptions {
         followup_mode: true,
         force: opts.force,
+        tickets_root: Some(tickets_root_parent),
         no_llm: opts.no_llm,
         redact_enabled: opts.redact_enabled,
         verbose: opts.verbose,
@@ -1001,30 +1074,19 @@ pub async fn revise(
     };
 
     let reporter = SilentReporter;
-    // Temporarily override TRIAGE_TICKETS_ROOT to the parent of ticket_dir so
-    // investigate_one_structured writes the five-markdown folder in the correct
-    // location regardless of the process-level env var.
-    let tickets_root_parent = ticket_dir
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(ticket_folder::tickets_root);
-    std::env::set_var(ticket_folder::TICKETS_ROOT_ENV, &tickets_root_parent);
-
+    // `dd_client` is forwarded so callers that have a live DatadogSource
+    // (e.g. the inbox /revise handler) can re-fetch logs around the original
+    // anchor. When `None`, the pipeline skips DD entirely and relies on the
+    // base-evidence catalog plus whatever the analyst attached this turn.
     let _structured = investigate_one_structured(
         base_ticket.clone(),
         &mut session,
-        None, // no Datadog re-fetch on /revise; uses base evidence
+        dd_client,
         &rubric,
         &reporter,
         &revise_opts,
     )
     .await?;
-
-    // Restore TRIAGE_TICKETS_ROOT to whatever it was before (best-effort; the
-    // lock already serialises concurrent revise calls on the same ticket).
-    // For production use TRIAGE_TICKETS_ROOT is stable across a process's
-    // lifetime, so no explicit restore is needed — the override above is
-    // idempotent when ticket_dir is already under tickets_root().
 
     let next_turn = outcome.turns.iter().map(|t| t.turn).max().unwrap_or(0) + 1;
     let driving_turns: Vec<u32> = outcome
@@ -1460,7 +1522,7 @@ mod tests {
             memory_hits_override: Some(vec![]),
             ..InvestigateOptions::defaults()
         };
-        let outcome = revise(&ticket_dir, "44776", &no_llm_opts).await;
+        let outcome = revise(&ticket_dir, "44776", None, &no_llm_opts).await;
         assert!(outcome.is_ok(), "revise failed: {:?}", outcome.err());
 
         // Conversation must be preserved + extended with a system revise turn
@@ -1553,7 +1615,7 @@ mod tests {
             memory_hits_override: Some(vec![]),
             ..InvestigateOptions::defaults()
         };
-        revise(&ticket_dir, "44776", &no_llm_opts)
+        revise(&ticket_dir, "44776", None, &no_llm_opts)
             .await
             .expect("revise must succeed");
 
@@ -1681,7 +1743,7 @@ validator_warnings: []\n---\n";
             memory_hits_override: Some(vec![]),
             ..InvestigateOptions::defaults()
         };
-        let outcome = revise(&ticket_dir, "44889", &opts).await;
+        let outcome = revise(&ticket_dir, "44889", None, &opts).await;
 
         assert!(
             matches!(
@@ -1698,6 +1760,215 @@ validator_warnings: []\n---\n";
         assert!(
             post.contains("foreign-owner-not-this-test@triage.test"),
             "STATE.md was overwritten on soft-lock conflict"
+        );
+    }
+
+    #[tokio::test]
+    async fn revise_does_not_mutate_tickets_root_env() {
+        // /revise must not leave TRIAGE_TICKETS_ROOT in a different state than
+        // it found it — that mutation leaks into concurrent inbox/watch work
+        // running in the same process. The fix routes the destination through
+        // `InvestigateOptions::tickets_root` instead of process-global env.
+        let dir = tempfile::tempdir().unwrap();
+        let other_root = tempfile::tempdir().unwrap();
+        let ticket_dir = dir.path().join("44890");
+        std::fs::create_dir_all(ticket_dir.join(".session")).unwrap();
+
+        let ticket = crate::models::Ticket {
+            id: 44890,
+            subject: "tickets-root guard".into(),
+            description: "".into(),
+            requester_org: None,
+            requester_email: None,
+            tags: vec![],
+            created_at: chrono::Utc::now(),
+            updated_at: None,
+            comments: vec![],
+        };
+        crate::chat::write_base_ticket(&ticket_dir, &ticket).unwrap();
+        crate::chat::write_base_evidence_manifest(
+            &ticket_dir,
+            &crate::models::BaseEvidenceManifest {
+                schema: "triage-cli/base-evidence".into(),
+                schema_version: 1,
+                ticket_id: "44890".into(),
+                captured_at: chrono::Utc::now(),
+                evidence: vec![],
+            },
+        )
+        .unwrap();
+
+        let analyst = crate::models::Turn {
+            schema: "triage-cli/conversation".into(),
+            schema_version: 1,
+            ticket_id: "44890".into(),
+            turn: 1,
+            turn_kind: crate::models::TurnKind::Analyst,
+            ts: chrono::Utc::now(),
+            author: Some("enrique".into()),
+            body: "fresh paste".into(),
+            evidence: vec![crate::models::EvidenceProvenance::Paste {
+                label: "note".into(),
+                body: "evidence".into(),
+                bytes: 8,
+                sent_to_provider: true,
+            }],
+            provider: None,
+            model: None,
+            tokens_in: None,
+            tokens_out: None,
+            elapsed_s: None,
+            session_id: None,
+            resumed: None,
+            action: None,
+            outcome: None,
+            drove_revision_from_turns: None,
+            diff: None,
+        };
+        let conv_path = crate::chat::conversation_jsonl_path(&ticket_dir);
+        crate::chat::append_turn(&conv_path, &analyst).unwrap();
+
+        // Set TRIAGE_TICKETS_ROOT to a path that is NOT the ticket's parent.
+        // The mutation bug overwrites this to ticket_dir.parent(); a working
+        // refactor leaves the env untouched.
+        let memory_md = dir.path().join("MEMORY.md");
+        let memory_db = dir.path().join("data/memory.db");
+        let _env = crate::memory::MemoryEnvScope::new_with_tickets_root(
+            &memory_md,
+            &memory_db,
+            Some(other_root.path()),
+        );
+
+        let env_before = std::env::var("TRIAGE_TICKETS_ROOT").unwrap();
+        assert_eq!(
+            env_before,
+            other_root.path().to_string_lossy(),
+            "test setup did not seed the env correctly"
+        );
+
+        let opts = InvestigateOptions {
+            no_llm: true,
+            force: true, // bypass any soft-lock from a prior test
+            tickets_root: Some(ticket_dir.parent().unwrap().to_path_buf()),
+            memory_hits_override: Some(vec![]),
+            ..InvestigateOptions::defaults()
+        };
+        revise(&ticket_dir, "44890", None, &opts)
+            .await
+            .expect("revise must succeed");
+
+        let env_after = std::env::var("TRIAGE_TICKETS_ROOT").unwrap();
+        assert_eq!(
+            env_after, env_before,
+            "revise mutated TRIAGE_TICKETS_ROOT from {env_before:?} to {env_after:?}"
+        );
+
+        // Sanity: writes still landed where requested (ticket_dir.parent()), not
+        // under the env-set other_root.
+        assert!(
+            ticket_dir.join("STATE.md").exists(),
+            "STATE.md was not written at ticket_dir; opts.tickets_root not honored"
+        );
+    }
+
+    #[test]
+    fn build_revise_session_surfaces_base_evidence_catalog() {
+        // /revise must surface the base-evidence catalog (E-NNN ids + labels
+        // recorded during the original investigation) so the LLM knows what
+        // signal originally drove the fork. The manifest stores only a
+        // catalog — bodies live in source files / external systems — so we
+        // can't fully restore content, but we can pass the labeled list
+        // forward as a synthetic context paste.
+        //
+        // Post-base evidence (file/paste added in follow-up turns) must also
+        // make it into the session.
+        let base_ticket = crate::models::Ticket {
+            id: 99001,
+            subject: "audio dropped".into(),
+            description: "initial intake".into(),
+            requester_org: None,
+            requester_email: None,
+            tags: vec![],
+            created_at: chrono::Utc::now(),
+            updated_at: None,
+            comments: vec![],
+        };
+        let base_evidence = crate::models::BaseEvidenceManifest {
+            schema: "triage-cli/base-evidence".into(),
+            schema_version: 1,
+            ticket_id: "99001".into(),
+            captured_at: chrono::Utc::now(),
+            evidence: vec![
+                crate::models::EvidenceItem {
+                    id: "E-001".into(),
+                    kind: "datadog_log_window".into(),
+                    label: "JeffCom 2026-05-13T07:00 to 07:30".into(),
+                    source_time: None,
+                    source_path: "datadog:log_window".into(),
+                },
+                crate::models::EvidenceItem {
+                    id: "E-002".into(),
+                    kind: "local_file".into(),
+                    label: "apex.log".into(),
+                    source_time: None,
+                    source_path: "local:apex.log".into(),
+                },
+            ],
+        };
+        let post_base_turn = crate::models::Turn {
+            schema: "triage-cli/conversation".into(),
+            schema_version: 1,
+            ticket_id: "99001".into(),
+            turn: 1,
+            turn_kind: crate::models::TurnKind::Analyst,
+            ts: chrono::Utc::now(),
+            author: Some("enrique".into()),
+            body: "follow-up question".into(),
+            evidence: vec![crate::models::EvidenceProvenance::Paste {
+                label: "new-paste".into(),
+                body: "NEW_EVIDENCE_SENTINEL".into(),
+                bytes: 21,
+                sent_to_provider: true,
+            }],
+            provider: None,
+            model: None,
+            tokens_in: None,
+            tokens_out: None,
+            elapsed_s: None,
+            session_id: None,
+            resumed: None,
+            action: None,
+            outcome: None,
+            drove_revision_from_turns: None,
+            diff: None,
+        };
+
+        let session = build_revise_session(&base_ticket, &base_evidence, &[post_base_turn], 0);
+
+        let pasted_texts: Vec<&str> = session
+            .evidence
+            .pasted_logs
+            .iter()
+            .map(|p| p.text.as_str())
+            .collect();
+        // Base-evidence catalog must be surfaced (E-001 and E-002 ids preserved).
+        let catalog_text = pasted_texts
+            .iter()
+            .find(|s| s.contains("E-001") && s.contains("E-002"))
+            .copied()
+            .unwrap_or_else(|| {
+                panic!("base-evidence catalog missing; pasted_logs = {pasted_texts:?}")
+            });
+        assert!(
+            catalog_text.contains("datadog_log_window") && catalog_text.contains("apex.log"),
+            "catalog summary does not name original evidence kinds/labels: {catalog_text}"
+        );
+        // Post-base evidence must also be in the session.
+        assert!(
+            pasted_texts
+                .iter()
+                .any(|s| s.contains("NEW_EVIDENCE_SENTINEL")),
+            "post-base evidence missing; pasted_logs = {pasted_texts:?}"
         );
     }
 }

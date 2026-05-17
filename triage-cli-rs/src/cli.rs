@@ -371,6 +371,7 @@ async fn cmd_triage(c: TriageCmd) -> ExitCode {
             customer_history_override: None,
             memory_hits_override: Some(memory_hits),
             followup_mode: false,
+            tickets_root: None,
         };
         let rubric = load_rubric_or_die();
         let reporter = MetricsReporter::new(Box::new(StderrReporter { verbose: c.verbose }));
@@ -459,6 +460,7 @@ async fn cmd_triage(c: TriageCmd) -> ExitCode {
         customer_history_override: None,
         memory_hits_override: None,
         followup_mode: false,
+        tickets_root: None,
     };
 
     let rubric = load_rubric_or_die();
@@ -650,6 +652,7 @@ async fn cmd_investigate(c: InvestigateCmd) -> ExitCode {
         customer_history_override: None,
         memory_hits_override: fixture_memory,
         followup_mode: false,
+        tickets_root: None,
     };
 
     if c.tui {
@@ -749,6 +752,7 @@ async fn cmd_demo(c: DemoCmd) -> ExitCode {
         customer_history_override: None,
         memory_hits_override: Some(memory_hits),
         followup_mode: false,
+        tickets_root: None,
     };
     let rubric = load_rubric_or_die();
     let reporter = StderrReporter { verbose: c.verbose };

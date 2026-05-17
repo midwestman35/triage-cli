@@ -288,6 +288,7 @@ pub async fn run_iteration(
             customer_history_override: None,
             memory_hits_override: None,
             followup_mode: false,
+            tickets_root: None,
         };
         let reporter: Box<dyn Reporter> = Box::new(SilentReporter);
         match pipeline::investigate_one_structured(

@@ -1184,6 +1184,7 @@ async fn poll_iteration(
             customer_history_override: None,
             memory_hits_override: None,
             followup_mode: false,
+            tickets_root: None,
         };
         let no_logs = opts.no_logs;
         let tid_copy = *tid;
@@ -1287,6 +1288,7 @@ fn opts_to_investigate(opts: WatcherOptions) -> InvestigateOptions {
         customer_history_override: None,
         memory_hits_override: None,
         followup_mode: false,
+        tickets_root: None,
     }
 }
 
@@ -1825,9 +1827,19 @@ async fn run_chat_session(ticket_id: &str) -> anyhow::Result<()> {
                                 clear_textarea(&mut input);
                             }
                             ChatCommand::Revise => {
+                                // Construct a Datadog client per-revise so the
+                                // structured pipeline can re-fetch logs around
+                                // the original anchor. `None` is fine when the
+                                // env isn't configured — the pipeline degrades
+                                // gracefully and leans on the base-evidence
+                                // catalog plus any newly attached evidence.
+                                let dd = DatadogClient::from_env().ok();
+                                let dd_source: Option<&dyn DatadogSource> =
+                                    dd.as_ref().map(|d| d as &dyn DatadogSource);
                                 pipeline::revise(
                                     &ticket_dir,
                                     ticket_id,
+                                    dd_source,
                                     &pipeline::InvestigateOptions::defaults(),
                                 )
                                 .await?;
@@ -1883,6 +1895,49 @@ fn next_turn_number(ticket_dir: &Path) -> anyhow::Result<u32> {
     Ok(outcome.turns.iter().map(|t| t.turn).max().unwrap_or(0) + 1)
 }
 
+/// Build the prompt sent to the follow-up LLM by combining the analyst's
+/// question body with the bodies of any pending evidence (file content +
+/// paste bodies). Returns the body unchanged when there is no evidence.
+///
+/// File content is read via `investigation::read_text_if_supported`, which
+/// applies the same per-entry / aggregate caps as the rest of the pipeline.
+/// Binary or unreadable files are surfaced as a one-line note so the LLM
+/// at least sees that the file existed.
+///
+/// TODO(E2): provider trait already exposes `attachments: &[Attachment]`,
+/// but providers do not yet materialize that channel into native multi-part
+/// requests. Once that lands, file content should flow through attachments
+/// instead of being inlined here.
+fn build_followup_prompt(body: &str, evidence: &[crate::models::EvidenceProvenance]) -> String {
+    if evidence.is_empty() {
+        return body.to_string();
+    }
+    let mut prompt = String::from(body);
+    prompt.push_str("\n\n## Attached evidence\n");
+    for ev in evidence {
+        match ev {
+            crate::models::EvidenceProvenance::File {
+                copied_path,
+                basename,
+                bytes,
+                detected_type,
+                ..
+            } => {
+                prompt.push_str(&format!("\n### file: {basename} ({bytes} bytes)\n"));
+                match investigation::read_text_if_supported(copied_path, *detected_type) {
+                    Some(content) => prompt.push_str(&content),
+                    None => prompt.push_str("[binary or unreadable — content not included]"),
+                }
+                prompt.push('\n');
+            }
+            crate::models::EvidenceProvenance::Paste { label, body, .. } => {
+                prompt.push_str(&format!("\n### paste: {label}\n{body}\n"));
+            }
+        }
+    }
+    prompt
+}
+
 async fn send_analyst_turn(
     ticket_dir: &Path,
     ticket_id: &str,
@@ -1892,6 +1947,10 @@ async fn send_analyst_turn(
     input: &mut tui_textarea::TextArea<'_>,
 ) -> anyhow::Result<()> {
     use crate::chat;
+    // Build the augmented prompt BEFORE moving `evidence` into the turn
+    // record below. The follow-up provider needs to see file/paste content,
+    // not just the analyst's question.
+    let augmented_prompt = build_followup_prompt(body, &evidence);
     {
         // Acquire the lock BEFORE computing `next` so a concurrent writer
         // can't sneak an append between our read and our own append, which
@@ -1940,7 +1999,7 @@ async fn send_analyst_turn(
     let _result = pipeline::followup_turn(
         ticket_dir,
         ticket_id,
-        body,
+        &augmented_prompt,
         "",
         &std::env::var("CODEX_MODEL")
             .unwrap_or_else(|_| crate::providers::codex::DEFAULT_CODEX_MODEL.to_string()),
@@ -2164,6 +2223,67 @@ status: open
         assert_eq!(
             summary.quoted_rubric_row.as_deref(),
             Some("customer LAN, switch, or SDWAN. Link to site master ticket")
+        );
+    }
+
+    #[test]
+    fn build_followup_prompt_empty_evidence_returns_body_unchanged() {
+        let prompt = build_followup_prompt("ANALYST_QUESTION", &[]);
+        assert_eq!(prompt, "ANALYST_QUESTION");
+    }
+
+    #[test]
+    fn build_followup_prompt_includes_paste_and_file_content() {
+        use crate::models::{EvidenceProvenance, ExtractionStatus, FileType};
+        use std::io::Write as _;
+
+        // File case: write a temp file with a sentinel and reference it as
+        // an EvidenceProvenance::File. Reader must surface the content.
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(b"FILE_CONTENT_SENTINEL\n").unwrap();
+        let file_path = tmp.path().to_path_buf();
+
+        let evidence = vec![
+            EvidenceProvenance::File {
+                source_path: file_path.clone(),
+                copied_path: file_path.clone(),
+                basename: "diag.log".into(),
+                sha256: "0".repeat(64),
+                bytes: 22,
+                detected_type: FileType::Log,
+                extraction: ExtractionStatus::Full,
+                truncated: false,
+                truncation_note: None,
+                sent_to_provider: true,
+            },
+            EvidenceProvenance::Paste {
+                label: "operator-note".into(),
+                body: "PASTE_BODY_SENTINEL".into(),
+                bytes: 19,
+                sent_to_provider: true,
+            },
+        ];
+
+        let prompt = build_followup_prompt("ANALYST_QUESTION", &evidence);
+        assert!(
+            prompt.contains("ANALYST_QUESTION"),
+            "prompt missing question"
+        );
+        assert!(
+            prompt.contains("FILE_CONTENT_SENTINEL"),
+            "prompt missing file content: {prompt}"
+        );
+        assert!(
+            prompt.contains("diag.log"),
+            "prompt missing file basename: {prompt}"
+        );
+        assert!(
+            prompt.contains("PASTE_BODY_SENTINEL"),
+            "prompt missing paste body: {prompt}"
+        );
+        assert!(
+            prompt.contains("operator-note"),
+            "prompt missing paste label: {prompt}"
         );
     }
 }
