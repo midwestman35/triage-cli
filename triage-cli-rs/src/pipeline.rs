@@ -874,6 +874,117 @@ pub async fn followup_turn(
     Ok(result)
 }
 
+/// `/revise` re-entry. Validates that there is new evidence since the
+/// last revise, loads base snapshots, and appends a system revise turn
+/// to CONVERSATION.jsonl. The actual five-markdown re-emission is
+/// orchestrated by the TUI caller via
+/// `investigate_one_structured(..., followup_mode=true)` (Task 14);
+/// this function owns the validation gate and the system-turn write.
+pub async fn revise(ticket_dir: &std::path::Path, ticket_id: &str) -> Result<(), PipelineError> {
+    use crate::chat;
+    use std::time::Duration;
+
+    // Acquire the per-ticket lock for the duration of the revise.
+    let session_dir = chat::session_dir(ticket_dir);
+    let _guard =
+        chat::acquire_session_lock(&session_dir, Duration::from_secs(5)).map_err(|e| match e {
+            chat::ChatError::LockContention { lock_path } => {
+                FollowupError::LockContention(lock_path)
+            }
+            other => FollowupError::Chat(other),
+        })?;
+
+    // Load the conversation and find the last system/revise turn number.
+    let conv = chat::conversation_jsonl_path(ticket_dir);
+    let outcome = chat::parse_conversation_jsonl(&conv).map_err(FollowupError::Chat)?;
+    let last_revise_turn = outcome
+        .turns
+        .iter()
+        .rev()
+        .find(|t| {
+            matches!(t.turn_kind, crate::models::TurnKind::System)
+                && t.action.as_deref() == Some("revise")
+        })
+        .map(|t| t.turn)
+        .unwrap_or(0);
+
+    // Validate: at least one new analyst-or-automated turn since the last
+    // revise must carry new evidence (file or labeled paste). A
+    // question-only turn does NOT qualify.
+    let new_evidence_present = outcome.turns.iter().any(|t| {
+        t.turn > last_revise_turn
+            && matches!(
+                t.turn_kind,
+                crate::models::TurnKind::Analyst | crate::models::TurnKind::Automated
+            )
+            && !t.evidence.is_empty()
+    });
+    if !new_evidence_present {
+        return Err(PipelineError::Followup(FollowupError::BaseSnapshotMissing(
+            "no new evidence since last /revise; attach a file or labeled paste before revising"
+                .to_string(),
+        )));
+    }
+
+    // Load base snapshots — these drive the re-emission in Task 14.
+    let base_ticket = chat::read_base_ticket(ticket_dir)
+        .map_err(|e| FollowupError::BaseSnapshotMissing(e.to_string()))?;
+    let _base_evidence = chat::read_base_evidence_manifest(ticket_dir)
+        .map_err(|e| FollowupError::BaseSnapshotMissing(e.to_string()))?;
+
+    // The structured re-emission via investigate_one_structured(..., followup_mode: true)
+    // is wired by the TUI caller in Task 14. For v1 of revise() we validate the gate,
+    // load the snapshots, and emit a system revise turn. The TUI orchestrates the
+    // synthetic-bundle construction and the structured pipeline call after revise()
+    // returns Ok(()).
+
+    let next_turn = outcome.turns.iter().map(|t| t.turn).max().unwrap_or(0) + 1;
+    let driving_turns: Vec<u32> = outcome
+        .turns
+        .iter()
+        .filter(|t| t.turn > last_revise_turn)
+        .map(|t| t.turn)
+        .collect();
+
+    let system_turn = crate::models::Turn {
+        schema: "triage-cli/conversation".into(),
+        schema_version: 1,
+        ticket_id: ticket_id.to_string(),
+        turn: next_turn,
+        turn_kind: crate::models::TurnKind::System,
+        ts: chrono::Utc::now(),
+        author: None,
+        body: format!(
+            "Revise validated using base ticket id {}. {} turn(s) since last revise carry new evidence.",
+            base_ticket.id,
+            driving_turns.len(),
+        ),
+        evidence: vec![],
+        provider: None,
+        model: None,
+        tokens_in: None,
+        tokens_out: None,
+        elapsed_s: None,
+        session_id: None,
+        resumed: None,
+        action: Some("revise".to_string()),
+        outcome: Some("validated".to_string()),
+        drove_revision_from_turns: Some(driving_turns),
+        diff: None,
+    };
+    chat::append_turn(&conv, &system_turn).map_err(FollowupError::Chat)?;
+
+    let parsed = chat::parse_conversation_jsonl(&conv).map_err(FollowupError::Chat)?;
+    chat::write_conversation_md(
+        &chat::conversation_md_path(ticket_dir),
+        &parsed.turns,
+        ticket_id,
+    )
+    .map_err(FollowupError::Chat)?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1063,5 +1174,81 @@ mod tests {
             parsed.turns[1].turn_kind,
             crate::models::TurnKind::Codex
         ));
+    }
+
+    #[tokio::test]
+    async fn revise_uses_base_ticket_snapshot_and_preserves_conversation() {
+        let dir = tempfile::tempdir().unwrap();
+        let ticket_dir = dir.path().join("44776");
+        std::fs::create_dir_all(ticket_dir.join(".session")).unwrap();
+
+        // Seed a base-ticket and base-evidence snapshot
+        let ticket = crate::models::Ticket {
+            id: 44776,
+            subject: "audio dropped".into(),
+            description: "".into(),
+            requester_org: None,
+            requester_email: None,
+            tags: vec![],
+            created_at: chrono::Utc::now(),
+            updated_at: None,
+            comments: vec![],
+        };
+        crate::chat::write_base_ticket(&ticket_dir, &ticket).unwrap();
+        crate::chat::write_base_evidence_manifest(
+            &ticket_dir,
+            &crate::models::BaseEvidenceManifest {
+                schema: "triage-cli/base-evidence".into(),
+                schema_version: 1,
+                ticket_id: "44776".into(),
+                captured_at: chrono::Utc::now(),
+                evidence: vec![],
+            },
+        )
+        .unwrap();
+
+        // Seed an analyst follow-up turn WITH evidence (a paste)
+        let analyst = crate::models::Turn {
+            schema: "triage-cli/conversation".into(),
+            schema_version: 1,
+            ticket_id: "44776".into(),
+            turn: 1,
+            turn_kind: crate::models::TurnKind::Analyst,
+            ts: chrono::Utc::now(),
+            author: Some("enrique".into()),
+            body: "new evidence: reboot at 14:32".into(),
+            evidence: vec![crate::models::EvidenceProvenance::Paste {
+                label: "note".into(),
+                body: "reboot evidence".into(),
+                bytes: 16,
+                sent_to_provider: true,
+            }],
+            provider: None,
+            model: None,
+            tokens_in: None,
+            tokens_out: None,
+            elapsed_s: None,
+            session_id: None,
+            resumed: None,
+            action: None,
+            outcome: None,
+            drove_revision_from_turns: None,
+            diff: None,
+        };
+        let conv_path = crate::chat::conversation_jsonl_path(&ticket_dir);
+        crate::chat::append_turn(&conv_path, &analyst).unwrap();
+        let analyst_pre = crate::chat::parse_conversation_jsonl(&conv_path).unwrap();
+        assert_eq!(analyst_pre.turns.len(), 1);
+
+        // Call revise (implementation in step 12.2)
+        let outcome = revise(&ticket_dir, "44776").await;
+        assert!(outcome.is_ok(), "revise failed: {:?}", outcome.err());
+
+        // Conversation must be preserved + extended with a system revise turn
+        let after = crate::chat::parse_conversation_jsonl(&conv_path).unwrap();
+        assert!(after.turns.len() >= 2);
+        let last = after.turns.last().unwrap();
+        assert!(matches!(last.turn_kind, crate::models::TurnKind::System));
+        assert_eq!(last.action.as_deref(), Some("revise"));
     }
 }
