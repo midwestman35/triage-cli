@@ -46,13 +46,18 @@ owo-colors = "4"
 # TUI
 ratatui = { version = "0.28", features = ["crossterm"] }
 crossterm = "0.28"
+tui-textarea = "0.6"
 
 # Filesystem + utilities
 which = "6"
 dirs = "5"
+fs2 = "0.4"
 
 [features]
 default = []
+
+[dev-dependencies]
+tempfile = "3"
 
 [profile.release]
 opt-level = 3

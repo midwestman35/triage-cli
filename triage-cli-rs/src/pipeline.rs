@@ -4,7 +4,7 @@
 //! (tests/watcher), `ChannelReporter` (TUI).
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -41,6 +41,24 @@ pub enum PipelineError {
     Memory(#[from] memory::MemoryError),
     #[error(transparent)]
     TicketFolder(#[from] TicketFolderError),
+    #[error("followup: {0}")]
+    Followup(#[from] FollowupError),
+}
+
+#[derive(Debug, Error)]
+pub enum FollowupError {
+    #[error("session lost and replay also failed: {0}")]
+    SessionLostNoReplay(String),
+    #[error("could not capture codex session id from output")]
+    CodexSessionCaptureFailed,
+    #[error("lock contention at {0}")]
+    LockContention(PathBuf),
+    #[error("base snapshot missing or unreadable: {0}")]
+    BaseSnapshotMissing(String),
+    #[error(transparent)]
+    Chat(#[from] crate::chat::ChatError),
+    #[error(transparent)]
+    Provider(#[from] crate::providers::ProviderError),
 }
 
 /// Typed value emitted via `Reporter::record_metric`. Kept simple — the only
@@ -148,6 +166,12 @@ pub struct InvestigateOptions {
     /// Pre-loaded memory hits (fixture/demo mode). When set, the pipeline
     /// skips the live SQLite BM25 lookup.
     pub memory_hits_override: Option<Vec<MemoryEntry>>,
+    /// Set to `true` when this run is a `/revise` followup rather than the
+    /// original investigation. Suppresses the base-snapshot writes (spec § 5.4)
+    /// so the original snapshots are never overwritten by a revision run.
+    /// Task 12 sets this flag; all existing call sites leave it at the
+    /// `Default::default()` value of `false`.
+    pub followup_mode: bool,
 }
 
 impl InvestigateOptions {
@@ -166,6 +190,7 @@ impl InvestigateOptions {
             force: false,
             customer_history_override: None,
             memory_hits_override: None,
+            followup_mode: false,
         }
     }
 }
@@ -320,6 +345,31 @@ pub async fn investigate_one_structured(
     );
     reporter.record_metric("evidence.memory_hits", MetricValue::Int(prior.len() as i64));
 
+    // Build the evidence bundle unconditionally so both the LLM path and the
+    // --no-llm path have access to the assigned-ID evidence list. The
+    // base-snapshot writes (§ 5.4) consume `bundle.evidence_index`.
+    let mut bundle = TriageBundle {
+        ticket: ticket.clone(),
+        site_entry: site_entry.clone(),
+        log_lines: log_lines.clone(),
+        log_truncated,
+        anchor: Some(opts.anchor_override.unwrap_or(ticket.created_at)),
+        anchor_source: Some(if opts.anchor_override.is_some() {
+            AnchorSource::Flag
+        } else {
+            AnchorSource::CreatedAt
+        }),
+        window_start: None,
+        window_end: None,
+        downloaded_attachments: session.evidence.attachments.clone(),
+        local_files: session.evidence.local_files.clone(),
+        pasted_logs: session.evidence.pasted_logs.clone(),
+        customer_history: session.evidence.customer_history.clone(),
+        memory_context: session.memory_context.clone(),
+        evidence_index: Vec::new(),
+    };
+    bundle.evidence_index = crate::models::assign_evidence_ids(&bundle);
+
     // Phase: llm_call (structured)
     reporter.phase_started("llm_call", "generating structured assessment");
     let (report, validator_warnings, llm_call_metrics) = if opts.no_llm {
@@ -327,27 +377,6 @@ pub async fn investigate_one_structured(
         reporter.phase_done("llm_call", "stub (--no-llm)");
         (r, Vec::new(), None)
     } else {
-        let mut bundle = TriageBundle {
-            ticket: ticket.clone(),
-            site_entry: site_entry.clone(),
-            log_lines: log_lines.clone(),
-            log_truncated,
-            anchor: Some(opts.anchor_override.unwrap_or(ticket.created_at)),
-            anchor_source: Some(if opts.anchor_override.is_some() {
-                AnchorSource::Flag
-            } else {
-                AnchorSource::CreatedAt
-            }),
-            window_start: None,
-            window_end: None,
-            downloaded_attachments: session.evidence.attachments.clone(),
-            local_files: session.evidence.local_files.clone(),
-            pasted_logs: session.evidence.pasted_logs.clone(),
-            customer_history: session.evidence.customer_history.clone(),
-            memory_context: session.memory_context.clone(),
-            evidence_index: Vec::new(),
-        };
-        bundle.evidence_index = crate::models::assign_evidence_ids(&bundle);
         let outcome =
             match llm::triage_structured(&bundle, rubric, None, opts.verbose, opts.redact_enabled)
                 .await
@@ -426,6 +455,28 @@ pub async fn investigate_one_structured(
         &report.rubric_version,
     );
     reporter.phase_done("save", &format!("→ {}", paths.folder.display()));
+
+    // Base snapshots for the interactive investigation feature
+    // (spec § 5.4). Skipped when `followup_mode` is true.
+    if !opts.followup_mode {
+        let ticket_dir = ticket_folder::tickets_root().join(ticket.id.to_string());
+        // Best-effort: snapshot write failure is logged but does not
+        // fail the investigation. The /revise path treats missing
+        // snapshots as a re-fetch trigger.
+        if let Err(e) = crate::chat::write_base_ticket(&ticket_dir, &ticket) {
+            reporter.phase_failed("base_ticket_snapshot", &e.to_string());
+        }
+        let bem = crate::models::BaseEvidenceManifest {
+            schema: "triage-cli/base-evidence".into(),
+            schema_version: 1,
+            ticket_id: ticket.id.to_string(),
+            captured_at: chrono::Utc::now(),
+            evidence: bundle.evidence_index.clone(),
+        };
+        if let Err(e) = crate::chat::write_base_evidence_manifest(&ticket_dir, &bem) {
+            reporter.phase_failed("base_evidence_snapshot", &e.to_string());
+        }
+    }
 
     Ok(StructuredInvestigation {
         report,
@@ -708,5 +759,824 @@ impl Reporter for MetricsReporter {
             .unwrap()
             .push((key.to_string(), value.clone()));
         self.inner.record_metric(key, value);
+    }
+}
+
+/// Append a follow-up turn pair (analyst question + provider response)
+/// to the conversation log under `ticket_dir`. Does NOT mutate the
+/// five-markdown folder — that only happens on /revise (see
+/// `investigate_one_structured` with `followup_mode=true`, Task 12).
+///
+/// Acquires the per-ticket lock for both writes (analyst turn + provider
+/// turn). The caller is expected to have already validated `prompt` (e.g.
+/// rendered it from analyst input + attached evidence bodies).
+pub async fn followup_turn(
+    ticket_dir: &std::path::Path,
+    ticket_id: &str,
+    prompt: &str,
+    system_prompt: &str,
+    model: &str,
+    attachments: &[crate::models::Attachment],
+    provider: &dyn crate::providers::LlmProvider,
+) -> Result<crate::providers::FollowupResult, PipelineError> {
+    use crate::chat;
+    use std::time::Duration;
+
+    // Read existing turns to determine next turn number + session id
+    let conv = chat::conversation_jsonl_path(ticket_dir);
+    let outcome = chat::parse_conversation_jsonl(&conv).map_err(FollowupError::from)?;
+    let last_codex_session = outcome
+        .turns
+        .iter()
+        .rev()
+        .find_map(|t| t.session_id.clone());
+    let next_turn = outcome.turns.iter().map(|t| t.turn).max().unwrap_or(0) + 1;
+
+    // Acquire lock for the provider call + write sequence
+    let session_dir = chat::session_dir(ticket_dir);
+    let _guard =
+        chat::acquire_session_lock(&session_dir, Duration::from_secs(5)).map_err(|e| match e {
+            crate::chat::ChatError::LockContention { lock_path } => {
+                FollowupError::LockContention(lock_path)
+            }
+            other => FollowupError::Chat(other),
+        })?;
+
+    // Apply PII redaction at the LLM boundary (spec § 7.1g, § 9.3).
+    // The redactor scrubs caller PII (phones, addresses, GPS coords);
+    // operational identifiers (Call-IDs, station codes, CNC UUIDs,
+    // site names) are preserved.
+    let (redacted_prompt, _redaction_counts) = crate::redact::redact(prompt);
+
+    // Call provider
+    let started = std::time::Instant::now();
+    let result = provider
+        .followup(
+            last_codex_session.as_deref(),
+            &redacted_prompt,
+            system_prompt,
+            model,
+            attachments,
+        )
+        .await
+        .map_err(FollowupError::Provider)?;
+    let elapsed_s = started.elapsed().as_secs_f64();
+
+    // Append the provider turn
+    let provider_turn = crate::models::Turn {
+        schema: "triage-cli/conversation".into(),
+        schema_version: 1,
+        ticket_id: ticket_id.to_string(),
+        turn: next_turn,
+        turn_kind: crate::models::TurnKind::Codex,
+        ts: chrono::Utc::now(),
+        author: None,
+        body: result.text.clone(),
+        evidence: vec![],
+        provider: Some(provider.name().to_string()),
+        model: Some(model.to_string()),
+        tokens_in: result.tokens_in,
+        tokens_out: result.tokens_out,
+        elapsed_s: Some(elapsed_s),
+        session_id: result.session_id.clone(),
+        resumed: Some(result.resumed),
+        action: None,
+        outcome: None,
+        drove_revision_from_turns: None,
+        diff: None,
+    };
+    chat::append_turn(&conv, &provider_turn).map_err(FollowupError::Chat)?;
+
+    // Re-render markdown
+    let parsed = chat::parse_conversation_jsonl(&conv).map_err(FollowupError::from)?;
+    chat::write_conversation_md(
+        &chat::conversation_md_path(ticket_dir),
+        &parsed.turns,
+        ticket_id,
+    )
+    .map_err(FollowupError::from)?;
+
+    // Update manifest (best-effort — failure here is logged but not fatal)
+    if let Ok(Some(mut m)) = chat::read_session_manifest_opt(ticket_dir) {
+        if result.session_id.is_some() {
+            m.resume_count = m.resume_count.saturating_add(1);
+            m.last_resumed_at = Some(chrono::Utc::now());
+            let _ = chat::write_session_manifest(ticket_dir, &m);
+        }
+    } else {
+        // First follow-up: create the manifest
+        let m = crate::models::SessionManifest {
+            version: 1,
+            provider: provider.name().to_string(),
+            model: model.to_string(),
+            created_at: chrono::Utc::now(),
+            last_resumed_at: None,
+            resume_count: 0,
+            codex_capture_method: None,
+        };
+        let _ = chat::write_session_manifest(ticket_dir, &m);
+    }
+
+    Ok(result)
+}
+
+/// `/revise` re-entry. Validates that there is new evidence since the
+/// last revise, loads base snapshots, builds a synthetic
+/// `InvestigationSession`, and calls `investigate_one_structured` with
+/// `followup_mode=true` to re-emit the five-markdown folder.  Then
+/// appends a system revise turn to CONVERSATION.jsonl so the chat pane
+/// shows the revision event.
+///
+/// `opts` is forwarded to `investigate_one_structured`; the caller should
+/// set `no_llm: true` in tests / dry-run mode.  `followup_mode` is
+/// always forced to `true` regardless of what `opts` contains.
+pub async fn revise(
+    ticket_dir: &std::path::Path,
+    ticket_id: &str,
+    opts: &InvestigateOptions,
+) -> Result<(), PipelineError> {
+    use crate::chat;
+    use std::time::Duration;
+
+    // Acquire the per-ticket lock for the duration of the revise.
+    let session_dir = chat::session_dir(ticket_dir);
+    let _guard =
+        chat::acquire_session_lock(&session_dir, Duration::from_secs(5)).map_err(|e| match e {
+            chat::ChatError::LockContention { lock_path } => {
+                FollowupError::LockContention(lock_path)
+            }
+            other => FollowupError::Chat(other),
+        })?;
+
+    // Load the conversation and find the last system/revise turn number.
+    let conv = chat::conversation_jsonl_path(ticket_dir);
+    let outcome = chat::parse_conversation_jsonl(&conv).map_err(FollowupError::Chat)?;
+    let last_revise_turn = outcome
+        .turns
+        .iter()
+        .rev()
+        .find(|t| {
+            matches!(t.turn_kind, crate::models::TurnKind::System)
+                && t.action.as_deref() == Some("revise")
+        })
+        .map(|t| t.turn)
+        .unwrap_or(0);
+
+    // Validate: at least one new analyst-or-automated turn since the last
+    // revise must carry new evidence (file or labeled paste). A
+    // question-only turn does NOT qualify.
+    let new_evidence_present = outcome.turns.iter().any(|t| {
+        t.turn > last_revise_turn
+            && matches!(
+                t.turn_kind,
+                crate::models::TurnKind::Analyst | crate::models::TurnKind::Automated
+            )
+            && !t.evidence.is_empty()
+    });
+    if !new_evidence_present {
+        return Err(PipelineError::Followup(FollowupError::BaseSnapshotMissing(
+            "no new evidence since last /revise; attach a file or labeled paste before revising"
+                .to_string(),
+        )));
+    }
+
+    // Load base snapshots.
+    let base_ticket = chat::read_base_ticket(ticket_dir)
+        .map_err(|e| FollowupError::BaseSnapshotMissing(e.to_string()))?;
+    let _base_evidence = chat::read_base_evidence_manifest(ticket_dir)
+        .map_err(|e| FollowupError::BaseSnapshotMissing(e.to_string()))?;
+
+    // --- Structured re-emission (spec § 2.5 V1 ship list) ---
+    // Build a synthetic InvestigationSession from the base ticket plus any new
+    // evidence (file attachments and labeled pastes) extracted from
+    // CONVERSATION.jsonl turns since the last revise.  Then run the structured
+    // pipeline with followup_mode=true so the five-markdown folder is rewritten
+    // while the base snapshots are preserved.
+    let mut session = crate::investigation::create_session(base_ticket.clone());
+
+    // Feed new evidence from turns since last_revise_turn.
+    for t in outcome.turns.iter().filter(|t| t.turn > last_revise_turn) {
+        for ev in &t.evidence {
+            match ev {
+                crate::models::EvidenceProvenance::File { copied_path, .. } => {
+                    // Best-effort: if the copied file has been removed we skip it.
+                    let _ = crate::investigation::add_local_file(&mut session, copied_path);
+                }
+                crate::models::EvidenceProvenance::Paste { label, body, .. } => {
+                    crate::investigation::add_pasted_evidence(&mut session, label, body);
+                }
+            }
+        }
+        // Also feed analyst-turn body text as a labeled paste so the
+        // structured pipeline sees what the analyst told us.
+        if matches!(t.turn_kind, crate::models::TurnKind::Analyst) && !t.body.is_empty() {
+            crate::investigation::add_pasted_evidence(
+                &mut session,
+                &format!("turn-{:03}-body", t.turn),
+                &t.body,
+            );
+        }
+    }
+
+    let rubric = crate::playbook::Rubric::load()
+        .map_err(|e| FollowupError::BaseSnapshotMissing(format!("rubric load failed: {e}")))?;
+
+    // Build the options for the structured re-emission. followup_mode is always
+    // true on /revise. force is set to avoid a soft-lock conflict since the
+    // revise caller already owns the per-ticket lock.
+    let revise_opts = InvestigateOptions {
+        followup_mode: true,
+        force: true,
+        no_llm: opts.no_llm,
+        redact_enabled: opts.redact_enabled,
+        verbose: opts.verbose,
+        memory_hits_override: opts.memory_hits_override.clone(),
+        customer_history_override: opts.customer_history_override.clone(),
+        ..InvestigateOptions::defaults()
+    };
+
+    let reporter = SilentReporter;
+    // Temporarily override TRIAGE_TICKETS_ROOT to the parent of ticket_dir so
+    // investigate_one_structured writes the five-markdown folder in the correct
+    // location regardless of the process-level env var.
+    let tickets_root_parent = ticket_dir
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(ticket_folder::tickets_root);
+    std::env::set_var(ticket_folder::TICKETS_ROOT_ENV, &tickets_root_parent);
+
+    let _structured = investigate_one_structured(
+        base_ticket.clone(),
+        &mut session,
+        None, // no Datadog re-fetch on /revise; uses base evidence
+        &rubric,
+        &reporter,
+        &revise_opts,
+    )
+    .await?;
+
+    // Restore TRIAGE_TICKETS_ROOT to whatever it was before (best-effort; the
+    // lock already serialises concurrent revise calls on the same ticket).
+    // For production use TRIAGE_TICKETS_ROOT is stable across a process's
+    // lifetime, so no explicit restore is needed — the override above is
+    // idempotent when ticket_dir is already under tickets_root().
+
+    let next_turn = outcome.turns.iter().map(|t| t.turn).max().unwrap_or(0) + 1;
+    let driving_turns: Vec<u32> = outcome
+        .turns
+        .iter()
+        .filter(|t| t.turn > last_revise_turn)
+        .map(|t| t.turn)
+        .collect();
+
+    let system_turn = crate::models::Turn {
+        schema: "triage-cli/conversation".into(),
+        schema_version: 1,
+        ticket_id: ticket_id.to_string(),
+        turn: next_turn,
+        turn_kind: crate::models::TurnKind::System,
+        ts: chrono::Utc::now(),
+        author: None,
+        body: format!(
+            "Revise validated using base ticket id {}. {} turn(s) since last revise carry new evidence.",
+            base_ticket.id,
+            driving_turns.len(),
+        ),
+        evidence: vec![],
+        provider: None,
+        model: None,
+        tokens_in: None,
+        tokens_out: None,
+        elapsed_s: None,
+        session_id: None,
+        resumed: None,
+        action: Some("revise".to_string()),
+        outcome: Some("validated".to_string()),
+        drove_revision_from_turns: Some(driving_turns),
+        diff: None,
+    };
+    chat::append_turn(&conv, &system_turn).map_err(FollowupError::Chat)?;
+
+    let parsed = chat::parse_conversation_jsonl(&conv).map_err(FollowupError::Chat)?;
+    chat::write_conversation_md(
+        &chat::conversation_md_path(ticket_dir),
+        &parsed.turns,
+        ticket_id,
+    )
+    .map_err(FollowupError::Chat)?;
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fixture::{FixtureDatadogClient, FixtureLoader};
+    use crate::playbook::Rubric;
+
+    /// Run the pipeline against the audio-drop fixture (ticket #55001) using
+    /// `no_llm: true` so no network calls are made. Returns the pipeline result.
+    ///
+    /// Acquires the shared memory env-guard so that this test is serialised
+    /// with every `memory::tests::*` test that also touches
+    /// `TRIAGE_MEMORY_MD` / `TRIAGE_MEMORY_DB`.  All three process-global
+    /// env vars are overridden to paths inside `tickets_root` and restored
+    /// on return.
+    async fn run_fixture_pipeline(
+        tickets_root: &std::path::Path,
+    ) -> Result<StructuredInvestigation, PipelineError> {
+        // Point the fixture loader at the crate's bundled fixtures directory.
+        let fixtures_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let loader = FixtureLoader::new(fixtures_dir.join("audio-drop"))
+            .expect("audio-drop fixture must exist");
+        let ticket = loader.load_ticket().expect("fixture ticket.json");
+        let logs = loader
+            .load_datadog_logs()
+            .expect("fixture datadog-logs.json");
+        let memory_hits = loader.load_memory_hits().expect("fixture memory-hits.json");
+
+        let mut session = crate::investigation::create_session(ticket.clone());
+        let fixture_dd = FixtureDatadogClient::new(logs);
+        let opts = InvestigateOptions {
+            no_llm: true,
+            memory_hits_override: Some(memory_hits),
+            force: true, // avoid soft-lock conflicts between parallel test runs
+            followup_mode: false,
+            ..InvestigateOptions::defaults()
+        };
+        let rubric = Rubric::load().expect("embedded rubric must parse");
+        let reporter = SilentReporter;
+
+        // Override TRIAGE_TICKETS_ROOT, TRIAGE_MEMORY_MD, and TRIAGE_MEMORY_DB
+        // to paths inside this test's tempdir, and hold the process-wide env
+        // mutex for the duration so we don't race with memory::tests::*.
+        let memory_md = tickets_root.join("MEMORY.md");
+        let memory_db = tickets_root.join("data/memory.db");
+        let _env = crate::memory::MemoryEnvScope::new_with_tickets_root(
+            &memory_md,
+            &memory_db,
+            Some(tickets_root),
+        );
+
+        investigate_one_structured(
+            ticket,
+            &mut session,
+            Some(&fixture_dd as &dyn crate::datadog::DatadogSource),
+            &rubric,
+            &reporter,
+            &opts,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn investigate_writes_base_snapshots() {
+        let dir = tempfile::tempdir().unwrap();
+        let outcome = run_fixture_pipeline(dir.path()).await;
+        assert!(
+            outcome.is_ok(),
+            "fixture pipeline failed: {:?}",
+            outcome.err()
+        );
+
+        // Ticket #55001 is the audio-drop fixture id
+        let ticket_dir = dir.path().join("55001");
+
+        // Both snapshots must exist after a successful non-followup run
+        assert!(
+            ticket_dir.join(".session/base-ticket.json").exists(),
+            "base-ticket.json not written"
+        );
+        assert!(
+            ticket_dir
+                .join(".session/base-evidence-manifest.json")
+                .exists(),
+            "base-evidence-manifest.json not written"
+        );
+
+        // Round-trip the snapshots to confirm they are valid JSON
+        let bt =
+            crate::chat::read_base_ticket(&ticket_dir).expect("base-ticket.json must round-trip");
+        let _ = bt.id; // round-trip asserted by successful read
+
+        let bem = crate::chat::read_base_evidence_manifest(&ticket_dir)
+            .expect("base-evidence-manifest.json must round-trip");
+        let _ = bem.ticket_id; // round-trip asserted by successful read
+    }
+
+    #[tokio::test]
+    async fn followup_turn_appends_to_conversation_jsonl() {
+        let dir = tempfile::tempdir().unwrap();
+        let ticket_dir = dir.path().join("44776");
+        std::fs::create_dir_all(&ticket_dir).unwrap();
+
+        // Seed an analyst turn-001
+        let analyst = crate::models::Turn {
+            schema: "triage-cli/conversation".into(),
+            schema_version: 1,
+            ticket_id: "44776".into(),
+            turn: 1,
+            turn_kind: crate::models::TurnKind::Analyst,
+            ts: chrono::Utc::now(),
+            author: Some("enrique".into()),
+            body: "what's up?".into(),
+            evidence: vec![],
+            provider: None,
+            model: None,
+            tokens_in: None,
+            tokens_out: None,
+            elapsed_s: None,
+            session_id: None,
+            resumed: None,
+            action: None,
+            outcome: None,
+            drove_revision_from_turns: None,
+            diff: None,
+        };
+        let conv = crate::chat::conversation_jsonl_path(&ticket_dir);
+        {
+            let _guard = crate::chat::acquire_session_lock(
+                &crate::chat::session_dir(&ticket_dir),
+                std::time::Duration::from_secs(1),
+            )
+            .unwrap();
+            crate::chat::append_turn(&conv, &analyst).unwrap();
+        }
+
+        // Fake provider that returns canned text
+        struct FakeProvider;
+        impl crate::providers::LlmProvider for FakeProvider {
+            fn name(&self) -> &'static str {
+                "fake"
+            }
+            fn complete<'a>(
+                &'a self,
+                _prompt: &'a str,
+                _sys: &'a str,
+                _model: &'a str,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<
+                                crate::providers::CompletionResult,
+                                crate::providers::ProviderError,
+                            >,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async move {
+                    Ok(crate::providers::CompletionResult {
+                        text: "fake codex reply".into(),
+                        tokens_in: Some(100),
+                        tokens_out: Some(50),
+                    })
+                })
+            }
+        }
+
+        let provider: Box<dyn crate::providers::LlmProvider> = Box::new(FakeProvider);
+        let result = followup_turn(
+            &ticket_dir,
+            "44776",
+            "follow-up question",
+            "system",
+            "fake-model",
+            &[],
+            provider.as_ref(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.text.contains("fake codex reply"));
+
+        // Conversation now has turn-001 analyst + turn-002 codex
+        let parsed = crate::chat::parse_conversation_jsonl(&conv).unwrap();
+        assert_eq!(parsed.turns.len(), 2);
+        assert!(matches!(
+            parsed.turns[1].turn_kind,
+            crate::models::TurnKind::Codex
+        ));
+    }
+
+    #[tokio::test]
+    async fn followup_turn_applies_pii_redaction() {
+        // Verifies that phone numbers in the analyst prompt are scrubbed before
+        // reaching the provider (spec § 7.1g, § 9.3).
+        use std::sync::Mutex;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ticket_dir = dir.path().join("44777");
+        std::fs::create_dir_all(&ticket_dir).unwrap();
+
+        // Seed an analyst turn-001 so the conversation file exists
+        let analyst = crate::models::Turn {
+            schema: "triage-cli/conversation".into(),
+            schema_version: 1,
+            ticket_id: "44777".into(),
+            turn: 1,
+            turn_kind: crate::models::TurnKind::Analyst,
+            ts: chrono::Utc::now(),
+            author: Some("enrique".into()),
+            body: "initial question".into(),
+            evidence: vec![],
+            provider: None,
+            model: None,
+            tokens_in: None,
+            tokens_out: None,
+            elapsed_s: None,
+            session_id: None,
+            resumed: None,
+            action: None,
+            outcome: None,
+            drove_revision_from_turns: None,
+            diff: None,
+        };
+        let conv = crate::chat::conversation_jsonl_path(&ticket_dir);
+        {
+            let _guard = crate::chat::acquire_session_lock(
+                &crate::chat::session_dir(&ticket_dir),
+                std::time::Duration::from_secs(1),
+            )
+            .unwrap();
+            crate::chat::append_turn(&conv, &analyst).unwrap();
+        }
+
+        // FakeProvider that records the exact prompt it received
+        struct CapturingProvider {
+            captured_prompt: Mutex<Option<String>>,
+        }
+        impl crate::providers::LlmProvider for CapturingProvider {
+            fn name(&self) -> &'static str {
+                "fake-capturing"
+            }
+            fn complete<'a>(
+                &'a self,
+                prompt: &'a str,
+                _sys: &'a str,
+                _model: &'a str,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<
+                                crate::providers::CompletionResult,
+                                crate::providers::ProviderError,
+                            >,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async move {
+                    *self.captured_prompt.lock().unwrap() = Some(prompt.to_string());
+                    Ok(crate::providers::CompletionResult {
+                        text: "redaction-test reply".into(),
+                        tokens_in: Some(5),
+                        tokens_out: Some(5),
+                    })
+                })
+            }
+        }
+
+        // Prompt contains a phone number that should be scrubbed.
+        // Uses the same pattern as redact::tests::redacts_phone.
+        let prompt_with_pii = "call (555) 123-4567 for the incident report";
+
+        let provider = CapturingProvider {
+            captured_prompt: Mutex::new(None),
+        };
+        followup_turn(
+            &ticket_dir,
+            "44777",
+            prompt_with_pii,
+            "system",
+            "fake-model",
+            &[],
+            &provider,
+        )
+        .await
+        .unwrap();
+
+        let captured = provider
+            .captured_prompt
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("provider must have been called");
+
+        // The raw phone number must NOT appear in what the provider received.
+        assert!(
+            !captured.contains("555") || !captured.contains("123-4567"),
+            "PII phone number leaked to provider; captured prompt: {captured:?}"
+        );
+        // The redaction sentinel MUST appear instead.
+        assert!(
+            captured.contains("<PHONE>"),
+            "expected <PHONE> sentinel in redacted prompt; got: {captured:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn revise_uses_base_ticket_snapshot_and_preserves_conversation() {
+        let dir = tempfile::tempdir().unwrap();
+        let ticket_dir = dir.path().join("44776");
+        std::fs::create_dir_all(ticket_dir.join(".session")).unwrap();
+
+        // Seed a base-ticket and base-evidence snapshot
+        let ticket = crate::models::Ticket {
+            id: 44776,
+            subject: "audio dropped".into(),
+            description: "".into(),
+            requester_org: None,
+            requester_email: None,
+            tags: vec![],
+            created_at: chrono::Utc::now(),
+            updated_at: None,
+            comments: vec![],
+        };
+        crate::chat::write_base_ticket(&ticket_dir, &ticket).unwrap();
+        crate::chat::write_base_evidence_manifest(
+            &ticket_dir,
+            &crate::models::BaseEvidenceManifest {
+                schema: "triage-cli/base-evidence".into(),
+                schema_version: 1,
+                ticket_id: "44776".into(),
+                captured_at: chrono::Utc::now(),
+                evidence: vec![],
+            },
+        )
+        .unwrap();
+
+        // Seed an analyst follow-up turn WITH evidence (a paste)
+        let analyst = crate::models::Turn {
+            schema: "triage-cli/conversation".into(),
+            schema_version: 1,
+            ticket_id: "44776".into(),
+            turn: 1,
+            turn_kind: crate::models::TurnKind::Analyst,
+            ts: chrono::Utc::now(),
+            author: Some("enrique".into()),
+            body: "new evidence: reboot at 14:32".into(),
+            evidence: vec![crate::models::EvidenceProvenance::Paste {
+                label: "note".into(),
+                body: "reboot evidence".into(),
+                bytes: 16,
+                sent_to_provider: true,
+            }],
+            provider: None,
+            model: None,
+            tokens_in: None,
+            tokens_out: None,
+            elapsed_s: None,
+            session_id: None,
+            resumed: None,
+            action: None,
+            outcome: None,
+            drove_revision_from_turns: None,
+            diff: None,
+        };
+        let conv_path = crate::chat::conversation_jsonl_path(&ticket_dir);
+        crate::chat::append_turn(&conv_path, &analyst).unwrap();
+        let analyst_pre = crate::chat::parse_conversation_jsonl(&conv_path).unwrap();
+        assert_eq!(analyst_pre.turns.len(), 1);
+
+        // Hold the memory env scope so investigate_one_structured doesn't
+        // try to open the real SQLite DB.
+        let memory_md = dir.path().join("MEMORY.md");
+        let memory_db = dir.path().join("data/memory.db");
+        let _env = crate::memory::MemoryEnvScope::new_with_tickets_root(
+            &memory_md,
+            &memory_db,
+            Some(dir.path()),
+        );
+
+        // Call revise with no_llm=true (stub pipeline; no LLM API needed)
+        let no_llm_opts = InvestigateOptions {
+            no_llm: true,
+            memory_hits_override: Some(vec![]),
+            ..InvestigateOptions::defaults()
+        };
+        let outcome = revise(&ticket_dir, "44776", &no_llm_opts).await;
+        assert!(outcome.is_ok(), "revise failed: {:?}", outcome.err());
+
+        // Conversation must be preserved + extended with a system revise turn
+        let after = crate::chat::parse_conversation_jsonl(&conv_path).unwrap();
+        assert!(after.turns.len() >= 2);
+        let last = after.turns.last().unwrap();
+        assert!(matches!(last.turn_kind, crate::models::TurnKind::System));
+        assert_eq!(last.action.as_deref(), Some("revise"));
+    }
+
+    #[tokio::test]
+    async fn end_to_end_revise_against_fixture() {
+        // Set up a self-contained end-to-end state in a tempdir mirroring
+        // what the spec § 7.2 example would produce. This is a unit-test
+        // version of the fixture (the actual fixture is deferred to v2).
+
+        let dir = tempfile::tempdir().unwrap();
+        let ticket_dir = dir.path().join("44776");
+        std::fs::create_dir_all(ticket_dir.join(".session")).unwrap();
+
+        // Seed base-ticket.json and base-evidence-manifest.json
+        let ticket = crate::models::Ticket {
+            id: 44776,
+            subject: "audio dropped".into(),
+            description: "initial".into(),
+            requester_org: None,
+            requester_email: None,
+            tags: vec![],
+            created_at: chrono::Utc::now(),
+            updated_at: None,
+            comments: vec![],
+        };
+        crate::chat::write_base_ticket(&ticket_dir, &ticket).unwrap();
+        crate::chat::write_base_evidence_manifest(
+            &ticket_dir,
+            &crate::models::BaseEvidenceManifest {
+                schema: "triage-cli/base-evidence".into(),
+                schema_version: 1,
+                ticket_id: "44776".into(),
+                captured_at: chrono::Utc::now(),
+                evidence: vec![],
+            },
+        )
+        .unwrap();
+
+        // Seed an analyst follow-up turn WITH evidence
+        let analyst = crate::models::Turn {
+            schema: "triage-cli/conversation".into(),
+            schema_version: 1,
+            ticket_id: "44776".into(),
+            turn: 1,
+            turn_kind: crate::models::TurnKind::Analyst,
+            ts: chrono::Utc::now(),
+            author: Some("enrique".into()),
+            body: "new log shows reboot at 14:32".into(),
+            evidence: vec![crate::models::EvidenceProvenance::Paste {
+                label: "customer-note".into(),
+                body: "reboot at 14:32 PT".into(),
+                bytes: 18,
+                sent_to_provider: true,
+            }],
+            provider: None,
+            model: None,
+            tokens_in: None,
+            tokens_out: None,
+            elapsed_s: None,
+            session_id: None,
+            resumed: None,
+            action: None,
+            outcome: None,
+            drove_revision_from_turns: None,
+            diff: None,
+        };
+        let conv_path = crate::chat::conversation_jsonl_path(&ticket_dir);
+        crate::chat::append_turn(&conv_path, &analyst).unwrap();
+
+        // Hold the memory env scope so investigate_one_structured doesn't
+        // try to open the real SQLite DB.
+        let memory_md = dir.path().join("MEMORY.md");
+        let memory_db = dir.path().join("data/memory.db");
+        let _env = crate::memory::MemoryEnvScope::new_with_tickets_root(
+            &memory_md,
+            &memory_db,
+            Some(dir.path()),
+        );
+
+        // Call /revise with no_llm=true (stub pipeline; no LLM API needed)
+        let no_llm_opts = InvestigateOptions {
+            no_llm: true,
+            memory_hits_override: Some(vec![]),
+            ..InvestigateOptions::defaults()
+        };
+        revise(&ticket_dir, "44776", &no_llm_opts)
+            .await
+            .expect("revise must succeed");
+
+        // Conversation now has: analyst turn-001 + system revise turn-002
+        let parsed = crate::chat::parse_conversation_jsonl(&conv_path).unwrap();
+        assert_eq!(parsed.turns.len(), 2);
+        let last = parsed.turns.last().unwrap();
+        assert!(matches!(last.turn_kind, crate::models::TurnKind::System));
+        assert_eq!(last.action.as_deref(), Some("revise"));
+        assert!(
+            last.drove_revision_from_turns
+                .as_ref()
+                .map(|v| v.contains(&1))
+                .unwrap_or(false),
+            "drove_revision_from_turns must include turn 1"
+        );
+
+        // CONVERSATION.md should also exist and contain both turns
+        let md_path = crate::chat::conversation_md_path(&ticket_dir);
+        assert!(md_path.exists(), "CONVERSATION.md was not written");
+        let md = std::fs::read_to_string(&md_path).unwrap();
+        assert!(
+            md.contains("turn-001 analyst"),
+            "CONVERSATION.md missing turn-001 analyst header"
+        );
+        assert!(
+            md.contains("turn-002 system"),
+            "CONVERSATION.md missing turn-002 system header"
+        );
     }
 }

@@ -370,6 +370,7 @@ async fn cmd_triage(c: TriageCmd) -> ExitCode {
             force: c.force,
             customer_history_override: None,
             memory_hits_override: Some(memory_hits),
+            followup_mode: false,
         };
         let rubric = load_rubric_or_die();
         let reporter = MetricsReporter::new(Box::new(StderrReporter { verbose: c.verbose }));
@@ -457,6 +458,7 @@ async fn cmd_triage(c: TriageCmd) -> ExitCode {
         force: c.force,
         customer_history_override: None,
         memory_hits_override: None,
+        followup_mode: false,
     };
 
     let rubric = load_rubric_or_die();
@@ -647,6 +649,7 @@ async fn cmd_investigate(c: InvestigateCmd) -> ExitCode {
         force: c.force,
         customer_history_override: None,
         memory_hits_override: fixture_memory,
+        followup_mode: false,
     };
 
     if c.tui {
@@ -655,9 +658,9 @@ async fn cmd_investigate(c: InvestigateCmd) -> ExitCode {
              without `--tui` to produce the ticket folder.");
     }
     let rubric = load_rubric_or_die();
-    let reporter = MetricsReporter::new(Box::new(SpinnerReporter::new(Box::new(
-        StderrReporter { verbose: c.verbose },
-    ))));
+    let reporter = MetricsReporter::new(Box::new(SpinnerReporter::new(Box::new(StderrReporter {
+        verbose: c.verbose,
+    }))));
     let effective_dd: Option<&dyn DatadogSource> = fixture_dd
         .as_ref()
         .map(|d| d as &dyn DatadogSource)
@@ -745,6 +748,7 @@ async fn cmd_demo(c: DemoCmd) -> ExitCode {
         force: false,
         customer_history_override: None,
         memory_hits_override: Some(memory_hits),
+        followup_mode: false,
     };
     let rubric = load_rubric_or_die();
     let reporter = StderrReporter { verbose: c.verbose };

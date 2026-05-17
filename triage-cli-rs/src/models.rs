@@ -852,6 +852,140 @@ fn truncate_for_warn(s: &str, max_chars: usize) -> String {
     }
 }
 
+//
+// ──────────────────────────────────────────────────────────────────────
+//   Interactive investigation — conversation and session types
+//   (spec § 5.1, 5.3, 5.4)
+// ──────────────────────────────────────────────────────────────────────
+//
+
+/// One entry in `Tickets/<id>/CONVERSATION.jsonl` (spec § 5.1).
+/// Source of truth for the conversation log; `CONVERSATION.md` is derived.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Turn {
+    pub schema: String,
+    pub schema_version: u32,
+    pub ticket_id: String,
+    pub turn: u32,
+    pub turn_kind: TurnKind,
+    pub ts: DateTime<Utc>,
+    pub body: String,
+
+    // analyst / automated turns
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<EvidenceProvenance>,
+
+    // codex / unleash turns
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_in: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_out: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elapsed_s: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resumed: Option<bool>,
+
+    // system turns
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drove_revision_from_turns: Option<Vec<u32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TurnKind {
+    Analyst,
+    Codex,
+    System,
+    Automated,
+}
+
+/// Provenance for a single evidence item attached to a turn (spec § 5.3).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum EvidenceProvenance {
+    File {
+        source_path: PathBuf,
+        copied_path: PathBuf,
+        basename: String,
+        sha256: String,
+        bytes: u64,
+        detected_type: FileType,
+        extraction: ExtractionStatus,
+        truncated: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        truncation_note: Option<String>,
+        sent_to_provider: bool,
+    },
+    Paste {
+        label: String,
+        body: String,
+        bytes: u64,
+        sent_to_provider: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExtractionStatus {
+    Full,
+    Truncated,
+    BinarySkipped,
+}
+
+/// Session provenance stored at `Tickets/<id>/.session/manifest.json`
+/// (spec § 5.4).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionManifest {
+    pub version: u32,
+    pub provider: String,
+    pub model: String,
+    pub created_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_resumed_at: Option<DateTime<Utc>>,
+    pub resume_count: u32,
+    /// Records how the session ID was extracted (one of
+    /// `codex_json_output`, `stderr_session_id_line`, `none_replay_only`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_capture_method: Option<String>,
+}
+
+/// Durable evidence snapshot written at the end of the original
+/// `investigate` run (spec § 5.4). `/revise` rebuilds from this — never
+/// from parsed markdown.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BaseEvidenceManifest {
+    pub schema: String,
+    pub schema_version: u32,
+    pub ticket_id: String,
+    pub captured_at: DateTime<Utc>,
+    pub evidence: Vec<EvidenceItem>,
+}
+
+/// Attachment passed to `LlmProvider::followup` (spec § 5.7 — provider
+/// trait extension).
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct Attachment {
+    pub copied_path: PathBuf,
+    pub basename: String,
+    pub detected_type: FileType,
+    pub extracted_text: Option<String>,
+}
+
 /// Snapshot of the Zendesk facts the engine knew before the LLM ran.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct IntakeTicketFacts {
@@ -1368,5 +1502,63 @@ mod v1_reframe_tests {
         let out = truncate_for_warn(&s, 10);
         assert!(out.ends_with('…'));
         assert_eq!(out.chars().count(), 11); // 10 + the ellipsis
+    }
+}
+
+#[cfg(test)]
+mod chat_model_tests {
+    use super::*;
+
+    #[test]
+    fn turn_analyst_round_trip() {
+        let turn = Turn {
+            schema: "triage-cli/conversation".into(),
+            schema_version: 1,
+            ticket_id: "44776".into(),
+            turn: 1,
+            turn_kind: TurnKind::Analyst,
+            ts: "2026-05-15T14:20:13Z".parse().unwrap(),
+            author: Some("enrique".into()),
+            body: "hello".into(),
+            evidence: vec![EvidenceProvenance::Paste {
+                label: "note".into(),
+                body: "x".into(),
+                bytes: 1,
+                sent_to_provider: true,
+            }],
+            provider: None,
+            model: None,
+            tokens_in: None,
+            tokens_out: None,
+            elapsed_s: None,
+            session_id: None,
+            resumed: None,
+            action: None,
+            outcome: None,
+            drove_revision_from_turns: None,
+            diff: None,
+        };
+        let json = serde_json::to_string(&turn).unwrap();
+        let back: Turn = serde_json::from_str(&json).unwrap();
+        assert_eq!(turn.body, back.body);
+        assert_eq!(turn.turn_kind, TurnKind::Analyst);
+        assert_eq!(back.evidence.len(), 1);
+    }
+
+    #[test]
+    fn session_manifest_round_trip() {
+        let m = SessionManifest {
+            version: 1,
+            provider: "codex".into(),
+            model: "gpt-5.5".into(),
+            created_at: "2026-05-15T14:21:02Z".parse().unwrap(),
+            last_resumed_at: Some("2026-05-17T09:14:54Z".parse().unwrap()),
+            resume_count: 1,
+            codex_capture_method: Some("stderr_session_id_line".into()),
+        };
+        let json = serde_json::to_string_pretty(&m).unwrap();
+        let back: SessionManifest = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.provider, "codex");
+        assert_eq!(back.resume_count, 1);
     }
 }

@@ -3,6 +3,7 @@
 //! Layout mirrors the Python package one-module-per-file, plus a CLI entry point.
 
 pub mod build_map;
+pub mod chat;
 pub mod cli;
 pub mod datadog;
 pub mod extract;
