@@ -27,7 +27,7 @@ Controlled by `LLM_PROVIDER` env var (default: `unleash`).
 | `unleash` (default) | HTTP to internal Axon gateway | `UNLEASH_API_KEY`, `UNLEASH_ASSISTANT_ID` |
 | `codex` | Subprocess to `codex exec`; inherits Codex OAuth | `codex` CLI on PATH |
 
-The `claude` and `openai` providers were removed 2026-05-14 in favor of unleash + codex (see `docs/adr/0002-prune-claude-openai-providers.md`); if a future Anthropic API path is added, it must work with the enterprise OAuth seat the operator has — i.e. via the `claude` CLI subprocess, not the SDK. Codex reads `CODEX_MODEL` (default `gpt-5-codex`); Unleash ignores any model parameter — the model is selected server-side by `UNLEASH_ASSISTANT_ID`.
+The `claude` and `openai` providers were removed 2026-05-14 in favor of unleash + codex (see `docs/adr/0002-prune-claude-openai-providers.md`); if a future Anthropic API path is added, it must work with the enterprise OAuth seat the operator has — i.e. via the `claude` CLI subprocess, not the SDK. Codex reads `CODEX_MODEL` (default `gpt-5.5`); Unleash ignores any model parameter — the model is selected server-side by `UNLEASH_ASSISTANT_ID`.
 
 ## Memory layer
 

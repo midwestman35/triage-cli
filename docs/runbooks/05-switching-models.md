@@ -7,7 +7,7 @@
 | Provider | Env value | Required configuration | Default model |
 | --- | --- | --- | --- |
 | Unleash (default) | `unleash` | `UNLEASH_API_KEY`, `UNLEASH_ASSISTANT_ID`; optional `UNLEASH_BASE_URL`, `UNLEASH_ACCOUNT` | Selected server-side by the assistant ID — the CLI does not pass a model parameter. |
-| Codex CLI | `codex` | `codex` binary on `PATH` + an existing codex OAuth session; optional `CODEX_MODEL` | `gpt-5-codex` |
+| Codex CLI | `codex` | `codex` binary on `PATH` + an existing codex OAuth session; optional `CODEX_MODEL` | `gpt-5.5` |
 
 ## Steps
 
@@ -29,7 +29,7 @@
    ```dotenv
    # Dev escape hatch — subprocess to the local codex CLI.
    LLM_PROVIDER=codex
-   CODEX_MODEL=gpt-5-codex   # optional; this is the default
+   CODEX_MODEL=gpt-5.5   # optional; this is the default
    ```
 
 2. **Run a cheap triage smoke:**
@@ -43,7 +43,7 @@
 3. **If switching to codex, verify the local seat once:**
 
    ```bash
-   codex exec --model gpt-5-codex "ping"
+   codex exec --model gpt-5.5 "ping"
    ```
 
    You should see a non-empty response. If it fails, run `codex` once interactively to refresh the OAuth session.

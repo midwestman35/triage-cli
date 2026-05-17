@@ -149,7 +149,7 @@ ZENDESK_API_TOKEN          # required — Zendesk API token (NOT a password)
 LLM_PROVIDER               # default unleash — options: unleash, codex
 UNLEASH_API_KEY            # required when LLM_PROVIDER=unleash
 UNLEASH_ASSISTANT_ID       # required when LLM_PROVIDER=unleash (selects model server-side)
-CODEX_MODEL                # default gpt-5-codex (used when LLM_PROVIDER=codex)
+CODEX_MODEL                # default gpt-5.5 (used when LLM_PROVIDER=codex)
 
 DD_API_KEY                 # optional — Datadog API key for triage/watch enrichment
 DD_APP_KEY                 # optional — Datadog application key for triage/watch enrichment

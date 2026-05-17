@@ -110,14 +110,14 @@ cp .env.example .env
 | `LLM_PROVIDER` | `unleash` (default) or `codex`. |
 | `UNLEASH_API_KEY` | Required when `LLM_PROVIDER=unleash`. |
 | `UNLEASH_ASSISTANT_ID` | Required when `LLM_PROVIDER=unleash`. The model is selected server-side by the assistant; the CLI does not pass a model parameter. |
-| `CODEX_MODEL` | Model identifier passed to `codex exec` when `LLM_PROVIDER=codex`. Default `gpt-5-codex`. |
+| `CODEX_MODEL` | Model identifier passed to `codex exec` when `LLM_PROVIDER=codex`. Default `gpt-5.5`. |
 
 ## LLM providers
 
 | Value | Mechanism | Auth | Notes |
 |---|---|---|---|
 | `unleash` *(default)* | HTTP to `/chats` | `UNLEASH_API_KEY` + `UNLEASH_ASSISTANT_ID` | Internal Axon gateway. Model is chosen server-side by the assistant ID. |
-| `codex` | Subprocess to `codex exec` | Inherits codex OAuth | `codex` must be on PATH. Default model `gpt-5-codex`, override with `CODEX_MODEL`. |
+| `codex` | Subprocess to `codex exec` | Inherits codex OAuth | `codex` must be on PATH. Default model `gpt-5.5`, override with `CODEX_MODEL`. |
 
 `unleash` is the production path; `codex` is the dev escape hatch when the
 gateway is unreachable. The `claude` and `openai` providers were removed

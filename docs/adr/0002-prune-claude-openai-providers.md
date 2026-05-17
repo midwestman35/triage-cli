@@ -33,7 +33,7 @@ buying anything.
   `OPENAI_MODEL` / `OPENAI_BASE_URL` env vars.
 - `LLM_PROVIDER` accepts exactly two values: `unleash` (default) and `codex`.
   Any other value is rejected by `doctor` with a clear error.
-- Default codex model is `gpt-5-codex` (env override `CODEX_MODEL`).
+- Default codex model is `gpt-5.5` (env override `CODEX_MODEL`).
 - `ANTHROPIC_MODEL` is no longer read by any code path and is removed from
   `.env.example`.
 

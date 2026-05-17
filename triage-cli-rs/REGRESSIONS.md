@@ -29,7 +29,7 @@ stdout read.
 **Python (historical):** Three providers (`unleash`, `claude`, `openai`).
 
 **Rust:** Two providers: `unleash` (HTTP) and `codex` (subprocess). The `claude` and `openai` providers were removed 2026-05-14 (ADR-0002). Codex is invoked via
-`codex exec <prompt>`; selected via `LLM_PROVIDER=codex`. Default model `gpt-5-codex` (env `CODEX_MODEL`).
+`codex exec <prompt>`; selected via `LLM_PROVIDER=codex`. Default model `gpt-5.5` (env `CODEX_MODEL`).
 
 **Impact:** Net-new functionality on the Rust side, not a regression. Documented for awareness.
 

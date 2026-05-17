@@ -62,7 +62,7 @@ step yourself.
    - `ZENDESK_SUBDOMAIN`, `ZENDESK_EMAIL`, `ZENDESK_API_TOKEN` — generate the API token in Zendesk Admin Center under Apps and integrations -> Zendesk API. Do **not** append `/token` to the email; the client does that.
    - `LLM_PROVIDER` — `unleash` (default, HTTP to the internal Axon gateway) or `codex` (subprocess to the local `codex` CLI). These are the only accepted values as of 2026-05-14; see `docs/adr/0002-prune-claude-openai-providers.md`.
      - For `unleash`: set `UNLEASH_API_KEY` and `UNLEASH_ASSISTANT_ID`. The model is chosen server-side by the assistant.
-     - For `codex`: ensure the `codex` CLI is on `PATH`. Optionally set `CODEX_MODEL` (default `gpt-5-codex`).
+     - For `codex`: ensure the `codex` CLI is on `PATH`. Optionally set `CODEX_MODEL` (default `gpt-5.5`).
    - `DD_API_KEY`, `DD_APP_KEY` — optional. Add these only if you plan to use Datadog enrichment in `triage`, `watch`, or `inbox`; Guided Investigation does not need them.
 
 5. **Build the site map** if you will use one-shot triage or watcher site resolution (turns `apex-cnc-inventory.md` into `data/cnc-map.json`):
