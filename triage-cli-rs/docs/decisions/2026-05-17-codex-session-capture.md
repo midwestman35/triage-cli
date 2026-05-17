@@ -121,6 +121,15 @@ to remember. Native resume works end-to-end.
 to ChatGPT). Tests are gated on `CODEX_AVAILABLE=1` so they don't run in
 CI without an authenticated codex on PATH.
 
+## Note on model choice
+
+The contract test uses `gpt-5.5` while the codex provider's default model is
+`gpt-5-codex` (see `triage-cli-rs/src/providers/codex.rs`). The session-ID
+capture method is model-agnostic — the `thread.started` JSONL event is
+emitted regardless of the model parameter. Choosing `gpt-5.5` for the
+contract test matches the spec's example commands and exercises the same
+auth path as the production provider.
+
 ## Session-expired surface
 
 When `codex exec resume <uuid>` is called with a well-formed UUID that

@@ -7,6 +7,14 @@
 //!
 //! See `docs/decisions/2026-05-17-codex-session-capture.md` for the
 //! capture-method decision driven by these tests.
+//!
+//! ## Local-run timing
+//!
+//! Tests run codex subprocesses synchronously (`Command::output()` with no
+//! timeout). A typical run is ~50 seconds wall-clock for all four tests. A
+//! hung codex (network stall, expired auth, etc.) will block a local cargo
+//! test run indefinitely — CI is safe because tests skip without
+//! `CODEX_AVAILABLE=1`. A timeout helper is tracked as a v2 improvement.
 
 use std::env;
 use std::process::Command;
@@ -54,6 +62,8 @@ fn capture_method_json() {
 
 #[test]
 fn capture_method_stderr_regex() {
+    // Informational only — no assertion; documents Method B (stderr regex) as a
+    // fallback shape, not the selected capture method (see decision doc).
     if !codex_available() {
         eprintln!("skipped: set CODEX_AVAILABLE=1 and ensure `codex` is on PATH");
         return;
@@ -116,19 +126,19 @@ fn resume_round_trip() {
     // because future codex versions could rename the event while keeping
     // the field stable — the round-trip assertion below catches drift
     // either way.
-    let session_id = first_stdout
+    let thread_id = first_stdout
         .lines()
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
         .find_map(|v| v.get("thread_id").and_then(|t| t.as_str()).map(String::from))
         .expect("thread_id not found in first --json stdout");
 
-    eprintln!("captured thread_id: {session_id}");
+    eprintln!("captured thread_id: {thread_id}");
 
     let second = Command::new("codex")
         .args([
             "exec",
             "resume",
-            &session_id,
+            &thread_id,
             "--skip-git-repo-check",
             "--json",
             "--model",
