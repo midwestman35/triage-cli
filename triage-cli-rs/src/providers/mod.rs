@@ -133,7 +133,7 @@ pub(crate) fn base_url(env_name: &str, default: &str) -> String {
 /// Stamp attachment content into a prompt string. Used by providers that
 /// don't have a native multi-part request channel (codex subprocess,
 /// unleash /chats body). Empty attachments → prompt unchanged.
-pub fn stamp_attachments_into_prompt(
+pub(crate) fn stamp_attachments_into_prompt(
     prompt: &str,
     attachments: &[crate::models::Attachment],
 ) -> String {
@@ -144,8 +144,9 @@ pub fn stamp_attachments_into_prompt(
     out.push_str("\n\n## Attached files");
     for a in attachments {
         out.push_str(&format!(
-            "\n\n### file: {} ({:?})",
-            a.basename, a.detected_type
+            "\n\n### file: {} ({})",
+            a.basename,
+            a.detected_type.as_str()
         ));
         match &a.extracted_text {
             Some(text) => {
@@ -224,7 +225,7 @@ mod followup_tests {
             )
             .await
             .unwrap();
-        assert!(r.text.contains("ATTACHMENT_BODY_SENTINEL") || r.text.contains("what changed?"));
+        assert!(r.text.contains("ATTACHMENT_BODY_SENTINEL"));
         let captured = p.last_prompt.lock().unwrap().clone().unwrap();
         assert!(
             captured.contains("ATTACHMENT_BODY_SENTINEL"),

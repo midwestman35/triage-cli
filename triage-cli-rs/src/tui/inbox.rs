@@ -1895,8 +1895,6 @@ fn next_turn_number(ticket_dir: &Path) -> anyhow::Result<u32> {
     Ok(outcome.turns.iter().map(|t| t.turn).max().unwrap_or(0) + 1)
 }
 
-/// Build the prompt sent to the follow-up LLM by combining the analyst's
-/// question body with the bodies of any pending evidence (file content +
 /// Convert pending evidence into a (augmented_prompt, attachments) pair.
 /// Pastes are inlined into the prompt (they have no file path). Files
 /// become Attachment entries; their content flows through the provider's
