@@ -22,6 +22,17 @@ pub struct CompletionResult {
     pub tokens_out: Option<u32>,
 }
 
+/// Returned by `LlmProvider::followup`. Extends `CompletionResult` with
+/// session information for resumable providers (codex).
+#[derive(Debug, Clone, Default)]
+pub struct FollowupResult {
+    pub text: String,
+    pub tokens_in: Option<u32>,
+    pub tokens_out: Option<u32>,
+    pub session_id: Option<String>,
+    pub resumed: bool,
+}
+
 /// Single-turn LLM completion contract. Mirrors Python `LLMProvider.complete`.
 ///
 /// Rust 1.95 supports `async fn` in traits natively. We use the explicit
@@ -36,6 +47,30 @@ pub trait LlmProvider: Send + Sync {
         system_prompt: &'a str,
         model: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<CompletionResult, ProviderError>> + Send + 'a>>;
+
+    /// Optional follow-up surface (spec § 5.7). Default impl ignores
+    /// `session_id` and calls `complete()` with the caller-supplied
+    /// replay-context prompt. Providers with native session resume
+    /// (codex — Task 10) override this method.
+    fn followup<'a>(
+        &'a self,
+        _session_id: Option<&'a str>,
+        prompt: &'a str,
+        system_prompt: &'a str,
+        model: &'a str,
+        _attachments: &'a [crate::models::Attachment],
+    ) -> Pin<Box<dyn Future<Output = Result<FollowupResult, ProviderError>> + Send + 'a>> {
+        Box::pin(async move {
+            let r = self.complete(prompt, system_prompt, model).await?;
+            Ok(FollowupResult {
+                text: r.text,
+                tokens_in: r.tokens_in,
+                tokens_out: r.tokens_out,
+                session_id: None,
+                resumed: false,
+            })
+        })
+    }
 }
 
 #[derive(Debug, Error)]
@@ -91,5 +126,50 @@ pub(crate) fn base_url(env_name: &str, default: &str) -> String {
         default.trim_end_matches('/').to_string()
     } else {
         trimmed.to_string()
+    }
+}
+
+#[cfg(test)]
+mod followup_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    struct FakeProvider {
+        last_prompt: Mutex<Option<String>>,
+    }
+    impl LlmProvider for FakeProvider {
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+        fn complete<'a>(
+            &'a self,
+            prompt: &'a str,
+            _system: &'a str,
+            _model: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<CompletionResult, ProviderError>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                *self.last_prompt.lock().unwrap() = Some(prompt.to_string());
+                Ok(CompletionResult {
+                    text: format!("echo:{prompt}"),
+                    tokens_in: Some(10),
+                    tokens_out: Some(20),
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn default_followup_uses_replay_context() {
+        let p = FakeProvider {
+            last_prompt: Mutex::new(None),
+        };
+        let r = p
+            .followup(Some("ignored-session-id"), "what changed?", "sys", "m", &[])
+            .await
+            .unwrap();
+        assert_eq!(r.text, "echo:what changed?");
+        assert!(!r.resumed);
+        assert!(r.session_id.is_none());
     }
 }
