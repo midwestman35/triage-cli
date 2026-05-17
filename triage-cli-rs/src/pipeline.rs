@@ -842,12 +842,46 @@ pub async fn followup_turn(
         .map_err(FollowupError::Provider)?;
     let elapsed_s = started.elapsed().as_secs_f64();
 
+    // Detect codex session-lost fallback: we attempted a resume (prior session
+    // existed) but the provider did NOT resume — it started fresh without the
+    // prior turn context. Insert a System turn BEFORE the codex turn so the
+    // analyst knows the model has amnesia and can restate relevant facts.
+    let session_lost = last_codex_session.is_some() && !result.resumed;
+    let codex_turn_number = if session_lost {
+        let system_turn = crate::models::Turn {
+            schema: "triage-cli/conversation".into(),
+            schema_version: 1,
+            ticket_id: ticket_id.to_string(),
+            turn: next_turn,
+            turn_kind: crate::models::TurnKind::System,
+            ts: chrono::Utc::now(),
+            author: None,
+            body: "Codex resume failed — continuing in a fresh session. Prior turn context is no longer available to the model; restate relevant facts in your next question if needed.".to_string(),
+            evidence: vec![],
+            provider: None,
+            model: None,
+            tokens_in: None,
+            tokens_out: None,
+            elapsed_s: None,
+            session_id: None,
+            resumed: None,
+            action: Some("session_lost".to_string()),
+            outcome: None,
+            drove_revision_from_turns: None,
+            diff: None,
+        };
+        chat::append_turn(&conv, &system_turn).map_err(FollowupError::Chat)?;
+        next_turn + 1
+    } else {
+        next_turn
+    };
+
     // Append the provider turn
     let provider_turn = crate::models::Turn {
         schema: "triage-cli/conversation".into(),
         schema_version: 1,
         ticket_id: ticket_id.to_string(),
-        turn: next_turn,
+        turn: codex_turn_number,
         turn_kind: crate::models::TurnKind::Codex,
         ts: chrono::Utc::now(),
         author: None,
@@ -1324,6 +1358,319 @@ mod tests {
             parsed.turns[1].turn_kind,
             crate::models::TurnKind::Codex
         ));
+    }
+
+    #[tokio::test]
+    async fn followup_turn_inserts_system_note_when_codex_session_lost() {
+        use crate::chat;
+        let dir = tempfile::tempdir().unwrap();
+        let ticket_dir = dir.path().join("44999");
+        std::fs::create_dir_all(&ticket_dir).unwrap();
+
+        // Seed conversation with an analyst turn AND a codex turn that has a
+        // session_id — this is what triggers the resume-attempt path.
+        let analyst = crate::models::Turn {
+            schema: "triage-cli/conversation".into(),
+            schema_version: 1,
+            ticket_id: "44999".into(),
+            turn: 1,
+            turn_kind: crate::models::TurnKind::Analyst,
+            ts: chrono::Utc::now(),
+            author: Some("enrique".into()),
+            body: "first question".into(),
+            evidence: vec![],
+            provider: None,
+            model: None,
+            tokens_in: None,
+            tokens_out: None,
+            elapsed_s: None,
+            session_id: None,
+            resumed: None,
+            action: None,
+            outcome: None,
+            drove_revision_from_turns: None,
+            diff: None,
+        };
+        let codex = crate::models::Turn {
+            schema: "triage-cli/conversation".into(),
+            schema_version: 1,
+            ticket_id: "44999".into(),
+            turn: 2,
+            turn_kind: crate::models::TurnKind::Codex,
+            ts: chrono::Utc::now(),
+            author: None,
+            body: "first answer".into(),
+            evidence: vec![],
+            provider: Some("codex".into()),
+            model: Some("gpt-5.5".into()),
+            tokens_in: None,
+            tokens_out: None,
+            elapsed_s: None,
+            session_id: Some("01HOLD000000".into()),
+            resumed: Some(false),
+            action: None,
+            outcome: None,
+            drove_revision_from_turns: None,
+            diff: None,
+        };
+        let conv = chat::conversation_jsonl_path(&ticket_dir);
+        {
+            let _g = chat::acquire_session_lock(
+                &chat::session_dir(&ticket_dir),
+                std::time::Duration::from_secs(1),
+            )
+            .unwrap();
+            chat::append_turn(&conv, &analyst).unwrap();
+            chat::append_turn(&conv, &codex).unwrap();
+        }
+
+        // FakeProvider that mimics the codex session-lost fallback: resumed=false
+        // with a freshly-issued session_id.
+        struct LostSessionProvider;
+        impl crate::providers::LlmProvider for LostSessionProvider {
+            fn name(&self) -> &'static str {
+                "fake-lost"
+            }
+            fn complete<'a>(
+                &'a self,
+                _prompt: &'a str,
+                _sys: &'a str,
+                _model: &'a str,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<
+                                crate::providers::CompletionResult,
+                                crate::providers::ProviderError,
+                            >,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async move {
+                    Ok(crate::providers::CompletionResult {
+                        text: "fresh response".into(),
+                        tokens_in: None,
+                        tokens_out: None,
+                    })
+                })
+            }
+            fn followup<'a>(
+                &'a self,
+                _session_id: Option<&'a str>,
+                _prompt: &'a str,
+                _sys: &'a str,
+                _model: &'a str,
+                _attachments: &'a [crate::models::Attachment],
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<
+                                crate::providers::FollowupResult,
+                                crate::providers::ProviderError,
+                            >,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async move {
+                    Ok(crate::providers::FollowupResult {
+                        text: "fresh response".into(),
+                        tokens_in: None,
+                        tokens_out: None,
+                        session_id: Some("01HFRESH00000".into()),
+                        resumed: false,
+                    })
+                })
+            }
+        }
+
+        let provider: Box<dyn crate::providers::LlmProvider> = Box::new(LostSessionProvider);
+        followup_turn(
+            &ticket_dir,
+            "44999",
+            "follow-up after session lost",
+            "system",
+            "gpt-5.5",
+            &[],
+            provider.as_ref(),
+        )
+        .await
+        .unwrap();
+
+        let parsed = chat::parse_conversation_jsonl(&conv).unwrap();
+        // Expect: analyst(1), codex(2), system-session-lost(3), codex(4)
+        assert_eq!(
+            parsed.turns.len(),
+            4,
+            "expected analyst+codex+system+codex; got {:?}",
+            parsed
+                .turns
+                .iter()
+                .map(|t| (t.turn, &t.turn_kind, t.action.clone()))
+                .collect::<Vec<_>>()
+        );
+        let system_turn = parsed
+            .turns
+            .iter()
+            .find(|t| matches!(t.turn_kind, crate::models::TurnKind::System))
+            .expect("system turn must be present");
+        assert_eq!(system_turn.action.as_deref(), Some("session_lost"));
+        // The system turn must precede the new codex turn in the JSONL.
+        let positions: Vec<(u32, &crate::models::TurnKind)> = parsed
+            .turns
+            .iter()
+            .map(|t| (t.turn, &t.turn_kind))
+            .collect();
+        let sys_idx = positions
+            .iter()
+            .position(|(_, k)| matches!(k, crate::models::TurnKind::System))
+            .unwrap();
+        let new_codex_idx = positions
+            .iter()
+            .rposition(|(_, k)| matches!(k, crate::models::TurnKind::Codex))
+            .unwrap();
+        assert!(
+            sys_idx < new_codex_idx,
+            "system turn must precede new codex turn in JSONL order"
+        );
+    }
+
+    #[tokio::test]
+    async fn followup_turn_no_system_note_on_first_followup() {
+        // No prior codex session: provider returns resumed=false with a fresh
+        // session_id, which is normal first-followup behavior — NOT session-lost.
+        // The function must NOT insert a system "session_lost" turn here.
+        use crate::chat;
+        let dir = tempfile::tempdir().unwrap();
+        let ticket_dir = dir.path().join("44998");
+        std::fs::create_dir_all(&ticket_dir).unwrap();
+
+        // Seed only an analyst turn — no prior codex session_id exists.
+        let analyst = crate::models::Turn {
+            schema: "triage-cli/conversation".into(),
+            schema_version: 1,
+            ticket_id: "44998".into(),
+            turn: 1,
+            turn_kind: crate::models::TurnKind::Analyst,
+            ts: chrono::Utc::now(),
+            author: Some("enrique".into()),
+            body: "initial question".into(),
+            evidence: vec![],
+            provider: None,
+            model: None,
+            tokens_in: None,
+            tokens_out: None,
+            elapsed_s: None,
+            session_id: None,
+            resumed: None,
+            action: None,
+            outcome: None,
+            drove_revision_from_turns: None,
+            diff: None,
+        };
+        let conv = chat::conversation_jsonl_path(&ticket_dir);
+        {
+            let _g = chat::acquire_session_lock(
+                &chat::session_dir(&ticket_dir),
+                std::time::Duration::from_secs(1),
+            )
+            .unwrap();
+            chat::append_turn(&conv, &analyst).unwrap();
+        }
+
+        // Provider returns resumed=false with a new session_id — normal first-call.
+        struct FirstFollowupProvider;
+        impl crate::providers::LlmProvider for FirstFollowupProvider {
+            fn name(&self) -> &'static str {
+                "fake-first"
+            }
+            fn complete<'a>(
+                &'a self,
+                _prompt: &'a str,
+                _sys: &'a str,
+                _model: &'a str,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<
+                                crate::providers::CompletionResult,
+                                crate::providers::ProviderError,
+                            >,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async move {
+                    Ok(crate::providers::CompletionResult {
+                        text: "first codex reply".into(),
+                        tokens_in: None,
+                        tokens_out: None,
+                    })
+                })
+            }
+            fn followup<'a>(
+                &'a self,
+                _session_id: Option<&'a str>,
+                _prompt: &'a str,
+                _sys: &'a str,
+                _model: &'a str,
+                _attachments: &'a [crate::models::Attachment],
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<
+                                crate::providers::FollowupResult,
+                                crate::providers::ProviderError,
+                            >,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async move {
+                    Ok(crate::providers::FollowupResult {
+                        text: "first codex reply".into(),
+                        tokens_in: None,
+                        tokens_out: None,
+                        session_id: Some("01HFIRST00000".into()),
+                        resumed: false,
+                    })
+                })
+            }
+        }
+
+        let provider: Box<dyn crate::providers::LlmProvider> = Box::new(FirstFollowupProvider);
+        followup_turn(
+            &ticket_dir,
+            "44998",
+            "first follow-up question",
+            "system",
+            "gpt-5.5",
+            &[],
+            provider.as_ref(),
+        )
+        .await
+        .unwrap();
+
+        let parsed = chat::parse_conversation_jsonl(&conv).unwrap();
+        // Expect: analyst(1), codex(2) — no system turn
+        assert_eq!(
+            parsed.turns.len(),
+            2,
+            "expected analyst+codex only (no session_lost system turn); got {:?}",
+            parsed
+                .turns
+                .iter()
+                .map(|t| (t.turn, &t.turn_kind, t.action.clone()))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !parsed
+                .turns
+                .iter()
+                .any(|t| matches!(t.turn_kind, crate::models::TurnKind::System)),
+            "no System turn expected on first follow-up"
+        );
     }
 
     #[tokio::test]
