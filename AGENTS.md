@@ -6,7 +6,7 @@ This file provides guidance to Codex (codex.com) and other AGENTS.md-compatible 
 
 ## What this is
 
-A **Rust 1.95+** CLI that triages Zendesk tickets for the Carbyne APEX NG911/E911 platform. The crate lives in `triage-cli-rs/`. Seven subcommands:
+A **Rust 1.95+** CLI that triages Zendesk tickets for the Carbyne APEX NG911/E911 platform. The crate lives in `triage-cli-rs/`. Eight subcommands:
 
 - `triage-cli investigate <id-or-url>` — interactive guided session. Fetches the ticket, lets the analyst drop in attachments and pasted evidence, then runs the structured pipeline. Writes a five-markdown ticket folder under `${TRIAGE_TICKETS_ROOT:-./Tickets}/<id>/`. Requires a TTY.
 - `triage-cli triage <id-or-url>` — headless single-shot pipeline (no evidence prompts). Same ticket-folder output; also prints `FORK_PACKET.md` to stdout (pipeable handoff).
@@ -15,6 +15,9 @@ A **Rust 1.95+** CLI that triages Zendesk tickets for the Carbyne APEX NG911/E91
 - `triage-cli doctor` — health-check env vars, credentials, output-dir writability; exits 0/1.
 - `triage-cli build-map` — regenerates `data/cnc-map.json` from `apex-cnc-inventory.md`.
 - `triage-cli setup` — interactive first-run; prompts for env vars and writes `.env`. Idempotent.
+- `triage-cli demo [<name>]` — run a built-in canned fixture end-to-end with no credentials (forces `--no-llm` for byte-stable output). Called without a name, it lists the available fixtures.
+
+`triage` and `investigate` also accept `--fixture <dir>` (load ticket/logs from a fixture directory instead of Zendesk/Datadog), `--no-llm` (skip the provider call and emit a deterministic stub report — used by fixtures and golden tests), and `--metrics-out <path>` (write a best-effort JSON run-metrics record on success; failures here never change the exit code).
 
 The reference for the v1 surface is the spec at **`docs/spec/v1-reframe.md`** — when behavior is ambiguous, that file wins. `README.md` is the user-facing reference. The frozen Python source lives in `archive/python-source-2026-05-12.zip` — do not edit it, do not port new features back to Python.
 
@@ -77,7 +80,7 @@ Tests are inline (`#[cfg(test)]`) in the same `.rs` source files. Mocked clients
 
 `triage-cli-rs/` follows one-module-per-file. The binary entry point is `src/main.rs` → `triage_cli::run()` (in `src/lib.rs`) → `cli::run()`. Current modules under `src/`:
 
-`build_map`, `cli`, `datadog`, `extract`, `interactive`, `investigation`, `llm`, `memory`, `models`, `pipeline`, `playbook`, `providers/` (`mod`, `unleash`, `codex`), `redact`, `setup`, `ticket_folder`, `tui/` (`mod`, `inbox`), `watcher`, `zendesk`.
+`build_map`, `cli`, `datadog`, `extract`, `fixture`, `interactive`, `investigation`, `llm`, `memory`, `models`, `pipeline`, `playbook`, `providers/` (`mod`, `unleash`, `codex`), `redact`, `setup`, `ticket_folder`, `tui/` (`mod`, `inbox`), `watcher`, `zendesk`.
 
 The legacy `render` module and `tui/investigate.rs` were removed in the v1 reframe — there is no longer a prose-note renderer or a mid-investigation TUI.
 
@@ -87,13 +90,18 @@ The legacy `render` module and `tui/investigate.rs` were removed in the v1 refra
 
 Pipeline errors flow through the `pipeline::PipelineError` enum (`Zendesk`, `Datadog`, `Llm`, `Extract`, `Memory`, `TicketFolder`). Add new variants there rather than reaching for `anyhow::Error` when callers might match on the kind.
 
+### Evidence-ID model
+
+`models::assign_evidence_ids(bundle)` builds a deterministically ordered, zero-padded `Vec<EvidenceItem>` (`id` = `E-001`, `E-002`, …) from the assembled `TriageBundle` — one item per Zendesk comment, attachment, Datadog log, local file, pasted note, and memory hit. The sort key is `(kind_order, source_time, source_path)` so identical inputs always yield identical IDs (there are stability tests in `models.rs`). The pipeline assigns these in a single pass after bundle assembly and before the LLM call, storing them on `TriageBundle::evidence_index`; `EVIDENCE_PREFLIGHT.md` and `FORK_PACKET.md` cite the IDs so a reviewer can trace each routing decision back to its raw source. This is roadmap item 1 — see `docs/ROADMAP.md` for the planned citation-validator follow-up.
+
 ### Reporter trait
 
-The `Reporter` trait (`pipeline::Reporter`) decouples progress output from pipeline logic. Three implementations:
+The `Reporter` trait (`pipeline::Reporter`) decouples progress output from pipeline logic. Besides the three phase callbacks it carries a `record_metric(key, MetricValue)` hook (default no-op; `MetricValue` is `Float`/`Int`/`Bool`/`Str`). Four implementations:
 
 - `StderrReporter` — default for `triage` and `investigate`. Emits phase lines to stderr (verbose-gated for `phase_started`, always for `phase_done` / `phase_failed`).
 - `SilentReporter` — used by tests and the watcher.
 - `ChannelReporter` — emits `TuiEvent`s into a tokio channel; used by the inbox TUI.
+- `MetricsReporter` — decorator that wraps another reporter, forwards every callback, and captures per-phase wall-clock timings plus named metrics. `cli` wraps the `StderrReporter` in one for `triage`/`investigate`/`watch`; after the pipeline returns, `--metrics-out` serializes `phase_timings()` + `named_metrics()` to JSON. Metrics emission is best-effort and never changes the exit code.
 
 There is no terminal `Done` event: the caller of `investigate_one_structured` receives the `StructuredInvestigation` value (report + paths + validator warnings) synchronously. The inbox refreshes its row by re-reading `STATE.md` after the call returns.
 
@@ -160,6 +168,12 @@ There is **no `confluence.rs`** by design. Refreshing the inventory from Conflue
 
 Site-level only: `<DD_CALL_CENTER_TAG>:<site_name> status:(<levels>)`. Window is `anchor ± window_minutes`, capped at 200 lines (`log_truncated = true` when at the cap). `site_name` is regex-validated (`^[a-zA-Z0-9._-]+$`) before query interpolation — do not loosen this. `DD_STATION_TAG` is read by no code today but is reserved for station-level filtering; leave it in `.env.example`.
 
+### Fixture / demo mode
+
+`fixture.rs` runs the pipeline end-to-end with no real credentials. A fixture is a directory holding `ticket.json`, `datadog-logs.json`, and `memory-hits.json` (the `expected/` subdir is reserved for golden-output tests, roadmap item #3). `FixtureLoader` reads those files; `FixtureDatadogClient` implements `DatadogSource` over the canned logs. The shipped fixtures live in `triage-cli-rs/fixtures/` and `NAMED_FIXTURES` lists them: `audio-drop`, `no-site-map`, `missing-evidence`, `vendor-fork`. `fixtures_root()` resolves the fixtures dir via `TRIAGE_FIXTURES_DIR` → binary-adjacent `fixtures/` → `./fixtures/` → `./triage-cli-rs/fixtures/`.
+
+`triage-cli demo <name>` (`cli::cmd_demo`) forces `no_llm: true` so output is byte-stable for golden comparison; `triage`/`investigate --fixture <dir>` take an arbitrary fixture path. `--no-llm` short-circuits the provider call in `pipeline::investigate_one_structured` and emits a deterministic stub `StructuredTriageReport` instead. This is roadmap item #2.
+
 ### Watcher state
 
 `data/watcher-state-<view-key>.json` has shape `{"version": 1, "triaged": {"<ticket-id>": "<iso updated_at>"}}`. `watcher::should_triage` is the pure decider (re-triage when `updated_at` advances; first-run silent backfill marks pre-cutoff tickets as seen with no note). State writes are atomic (tempfile + rename) and pruned to 1000 entries at the end of each iteration. The same state file is shared between `watch` and `inbox` for a given view.
@@ -202,6 +216,7 @@ Logging during the TUI run is redirected to a per-view file printed at startup s
 | `TRIAGE_RUBRIC_PATH` | Dev override: load the fork rubric from this file instead of the embedded copy. Release builds should leave this unset. |
 | `TRIAGE_OWNER` | Identifier recorded in `STATE.md`'s `owner` field; overrides `$USER`. |
 | `TRIAGE_MEMORY_MD` / `TRIAGE_MEMORY_DB` | Test-only overrides for the MEMORY.md / SQLite paths. |
+| `TRIAGE_FIXTURES_DIR` | Override the fixtures root used by `demo` / `--fixture` (default falls through to a binary-adjacent or repo `fixtures/` dir). |
 | `DIFF_VIEWER` | Command run on `--diff` soft-lock conflicts (e.g. `code --diff`). Falls back to `diff -u`. |
 | `LLM_PROVIDER` and provider creds | See the *LLM providers* table above. |
 
@@ -212,7 +227,9 @@ Logging during the TUI run is redirected to a per-view file printed at startup s
 | Triage system prompt | `triage-cli-rs/src/llm.rs` |
 | Anchor extraction prompt | `triage-cli-rs/src/llm.rs` |
 | Structured pipeline | `triage-cli-rs/src/pipeline.rs` (`investigate_one_structured`) |
-| Reporter trait + implementations | `triage-cli-rs/src/pipeline.rs` (`Reporter`, `StderrReporter`, `SilentReporter`, `ChannelReporter`) |
+| Reporter trait + implementations | `triage-cli-rs/src/pipeline.rs` (`Reporter`, `StderrReporter`, `SilentReporter`, `ChannelReporter`, `MetricsReporter`) |
+| Evidence-ID assignment | `triage-cli-rs/src/models.rs` (`EvidenceItem`, `assign_evidence_ids`) |
+| Fixture / demo mode | `triage-cli-rs/src/fixture.rs`, `triage-cli-rs/fixtures/` |
 | Five-markdown ticket folder writer | `triage-cli-rs/src/ticket_folder.rs` (`write_ticket_folder`, `stash_debug_response`, `tickets_root`) |
 | Fork rubric loader (embedded + `TRIAGE_RUBRIC_PATH` override) | `triage-cli-rs/src/playbook.rs` |
 | Embedded rubric file | `triage-cli-rs/playbook/fork-rubric.md` |
@@ -233,6 +250,7 @@ Logging during the TUI run is redirected to a per-view file printed at startup s
 | v1 reframe spec | `docs/spec/v1-reframe.md` |
 | Frozen Python source (reference only) | `archive/python-source-2026-05-12.zip` |
 | Architecture decisions | `docs/adr/` |
+| Deferred-work roadmap | `docs/ROADMAP.md` |
 | Operator runbooks | `docs/runbooks/` |
 | Quick reference | `docs/CHEATSHEET.md` |
 | Known regressions / open issues | `triage-cli-rs/REGRESSIONS.md` |
