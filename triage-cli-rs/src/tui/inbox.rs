@@ -1825,7 +1825,12 @@ async fn run_chat_session(ticket_id: &str) -> anyhow::Result<()> {
                                 clear_textarea(&mut input);
                             }
                             ChatCommand::Revise => {
-                                pipeline::revise(&ticket_dir, ticket_id).await?;
+                                pipeline::revise(
+                                    &ticket_dir,
+                                    ticket_id,
+                                    &pipeline::InvestigateOptions::defaults(),
+                                )
+                                .await?;
                                 clear_textarea(&mut input);
                             }
                             ChatCommand::Retry => {

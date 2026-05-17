@@ -881,12 +881,20 @@ pub async fn followup_turn(
 }
 
 /// `/revise` re-entry. Validates that there is new evidence since the
-/// last revise, loads base snapshots, and appends a system revise turn
-/// to CONVERSATION.jsonl. The actual five-markdown re-emission is
-/// orchestrated by the TUI caller via
-/// `investigate_one_structured(..., followup_mode=true)` (Task 14);
-/// this function owns the validation gate and the system-turn write.
-pub async fn revise(ticket_dir: &std::path::Path, ticket_id: &str) -> Result<(), PipelineError> {
+/// last revise, loads base snapshots, builds a synthetic
+/// `InvestigationSession`, and calls `investigate_one_structured` with
+/// `followup_mode=true` to re-emit the five-markdown folder.  Then
+/// appends a system revise turn to CONVERSATION.jsonl so the chat pane
+/// shows the revision event.
+///
+/// `opts` is forwarded to `investigate_one_structured`; the caller should
+/// set `no_llm: true` in tests / dry-run mode.  `followup_mode` is
+/// always forced to `true` regardless of what `opts` contains.
+pub async fn revise(
+    ticket_dir: &std::path::Path,
+    ticket_id: &str,
+    opts: &InvestigateOptions,
+) -> Result<(), PipelineError> {
     use crate::chat;
     use std::time::Duration;
 
@@ -932,17 +940,86 @@ pub async fn revise(ticket_dir: &std::path::Path, ticket_id: &str) -> Result<(),
         )));
     }
 
-    // Load base snapshots — these drive the re-emission in Task 14.
+    // Load base snapshots.
     let base_ticket = chat::read_base_ticket(ticket_dir)
         .map_err(|e| FollowupError::BaseSnapshotMissing(e.to_string()))?;
     let _base_evidence = chat::read_base_evidence_manifest(ticket_dir)
         .map_err(|e| FollowupError::BaseSnapshotMissing(e.to_string()))?;
 
-    // The structured re-emission via investigate_one_structured(..., followup_mode: true)
-    // is wired by the TUI caller in Task 14. For v1 of revise() we validate the gate,
-    // load the snapshots, and emit a system revise turn. The TUI orchestrates the
-    // synthetic-bundle construction and the structured pipeline call after revise()
-    // returns Ok(()).
+    // --- Structured re-emission (spec § 2.5 V1 ship list) ---
+    // Build a synthetic InvestigationSession from the base ticket plus any new
+    // evidence (file attachments and labeled pastes) extracted from
+    // CONVERSATION.jsonl turns since the last revise.  Then run the structured
+    // pipeline with followup_mode=true so the five-markdown folder is rewritten
+    // while the base snapshots are preserved.
+    let mut session = crate::investigation::create_session(base_ticket.clone());
+
+    // Feed new evidence from turns since last_revise_turn.
+    for t in outcome.turns.iter().filter(|t| t.turn > last_revise_turn) {
+        for ev in &t.evidence {
+            match ev {
+                crate::models::EvidenceProvenance::File { copied_path, .. } => {
+                    // Best-effort: if the copied file has been removed we skip it.
+                    let _ = crate::investigation::add_local_file(&mut session, copied_path);
+                }
+                crate::models::EvidenceProvenance::Paste { label, body, .. } => {
+                    crate::investigation::add_pasted_evidence(&mut session, label, body);
+                }
+            }
+        }
+        // Also feed analyst-turn body text as a labeled paste so the
+        // structured pipeline sees what the analyst told us.
+        if matches!(t.turn_kind, crate::models::TurnKind::Analyst) && !t.body.is_empty() {
+            crate::investigation::add_pasted_evidence(
+                &mut session,
+                &format!("turn-{:03}-body", t.turn),
+                &t.body,
+            );
+        }
+    }
+
+    let rubric = crate::playbook::Rubric::load()
+        .map_err(|e| FollowupError::BaseSnapshotMissing(format!("rubric load failed: {e}")))?;
+
+    // Build the options for the structured re-emission. followup_mode is always
+    // true on /revise. force is set to avoid a soft-lock conflict since the
+    // revise caller already owns the per-ticket lock.
+    let revise_opts = InvestigateOptions {
+        followup_mode: true,
+        force: true,
+        no_llm: opts.no_llm,
+        redact_enabled: opts.redact_enabled,
+        verbose: opts.verbose,
+        memory_hits_override: opts.memory_hits_override.clone(),
+        customer_history_override: opts.customer_history_override.clone(),
+        ..InvestigateOptions::defaults()
+    };
+
+    let reporter = SilentReporter;
+    // Temporarily override TRIAGE_TICKETS_ROOT to the parent of ticket_dir so
+    // investigate_one_structured writes the five-markdown folder in the correct
+    // location regardless of the process-level env var.
+    let tickets_root_parent = ticket_dir
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(ticket_folder::tickets_root);
+    std::env::set_var(ticket_folder::TICKETS_ROOT_ENV, &tickets_root_parent);
+
+    let _structured = investigate_one_structured(
+        base_ticket.clone(),
+        &mut session,
+        None, // no Datadog re-fetch on /revise; uses base evidence
+        &rubric,
+        &reporter,
+        &revise_opts,
+    )
+    .await?;
+
+    // Restore TRIAGE_TICKETS_ROOT to whatever it was before (best-effort; the
+    // lock already serialises concurrent revise calls on the same ticket).
+    // For production use TRIAGE_TICKETS_ROOT is stable across a process's
+    // lifetime, so no explicit restore is needed — the override above is
+    // idempotent when ticket_dir is already under tickets_root().
 
     let next_turn = outcome.turns.iter().map(|t| t.turn).max().unwrap_or(0) + 1;
     let driving_turns: Vec<u32> = outcome
@@ -1362,8 +1439,23 @@ mod tests {
         let analyst_pre = crate::chat::parse_conversation_jsonl(&conv_path).unwrap();
         assert_eq!(analyst_pre.turns.len(), 1);
 
-        // Call revise (implementation in step 12.2)
-        let outcome = revise(&ticket_dir, "44776").await;
+        // Hold the memory env scope so investigate_one_structured doesn't
+        // try to open the real SQLite DB.
+        let memory_md = dir.path().join("MEMORY.md");
+        let memory_db = dir.path().join("data/memory.db");
+        let _env = crate::memory::MemoryEnvScope::new_with_tickets_root(
+            &memory_md,
+            &memory_db,
+            Some(dir.path()),
+        );
+
+        // Call revise with no_llm=true (stub pipeline; no LLM API needed)
+        let no_llm_opts = InvestigateOptions {
+            no_llm: true,
+            memory_hits_override: Some(vec![]),
+            ..InvestigateOptions::defaults()
+        };
+        let outcome = revise(&ticket_dir, "44776", &no_llm_opts).await;
         assert!(outcome.is_ok(), "revise failed: {:?}", outcome.err());
 
         // Conversation must be preserved + extended with a system revise turn
@@ -1440,8 +1532,23 @@ mod tests {
         let conv_path = crate::chat::conversation_jsonl_path(&ticket_dir);
         crate::chat::append_turn(&conv_path, &analyst).unwrap();
 
-        // Call /revise
-        revise(&ticket_dir, "44776")
+        // Hold the memory env scope so investigate_one_structured doesn't
+        // try to open the real SQLite DB.
+        let memory_md = dir.path().join("MEMORY.md");
+        let memory_db = dir.path().join("data/memory.db");
+        let _env = crate::memory::MemoryEnvScope::new_with_tickets_root(
+            &memory_md,
+            &memory_db,
+            Some(dir.path()),
+        );
+
+        // Call /revise with no_llm=true (stub pipeline; no LLM API needed)
+        let no_llm_opts = InvestigateOptions {
+            no_llm: true,
+            memory_hits_override: Some(vec![]),
+            ..InvestigateOptions::defaults()
+        };
+        revise(&ticket_dir, "44776", &no_llm_opts)
             .await
             .expect("revise must succeed");
 
