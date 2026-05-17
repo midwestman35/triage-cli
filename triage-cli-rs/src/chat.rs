@@ -13,9 +13,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use fs2::FileExt;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::models::{EvidenceProvenance, Turn, TurnKind};
+use crate::investigation;
+use crate::models::{EvidenceProvenance, ExtractionStatus, Turn, TurnKind};
 
 #[derive(Debug, Error)]
 pub enum ChatError {
@@ -219,11 +221,112 @@ pub fn acquire_session_lock(
     }
 }
 
+const MAX_RAW_BYTES_SOFT_WARN: u64 = 1 << 20; // 1 MB
+const TRUNCATE_TEXT_BYTES: usize = 256 << 10; // 256 KB
+
+/// Attach a file to turn `turn_no` of the conversation under
+/// `ticket_dir`. Computes sha256 over the raw bytes, copies the file
+/// into `ticket_dir/attachments/turn-NNN/` (unless the source is already
+/// under `ticket_dir`), and returns the provenance record.
+pub fn attach_file(
+    ticket_dir: &Path,
+    turn_no: u32,
+    source: &Path,
+) -> Result<EvidenceProvenance, ChatError> {
+    let meta = fs::metadata(source)?;
+    let bytes = meta.len();
+    let basename = source
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unnamed")
+        .to_string();
+    let sha256 = sha256_of_file(source)?;
+    let detected = investigation::detect_file_type(source);
+
+    // Decide copy destination
+    let copied_path = if source.starts_with(ticket_dir) {
+        source.to_path_buf()
+    } else {
+        let dst_dir = ticket_dir
+            .join("attachments")
+            .join(format!("turn-{turn_no:03}"));
+        fs::create_dir_all(&dst_dir)?;
+        let dst = dst_dir.join(&basename);
+        fs::copy(source, &dst)?;
+        dst
+    };
+
+    // Decide extraction outcome
+    let extracted_text = investigation::read_text_if_supported(&copied_path, detected);
+    let (extraction, truncated, truncation_note) = match (&extracted_text, detected) {
+        (Some(text), _) if text.len() > TRUNCATE_TEXT_BYTES => (
+            ExtractionStatus::Truncated,
+            true,
+            Some(format!(
+                "extracted text truncated to first {} KB",
+                TRUNCATE_TEXT_BYTES / 1024
+            )),
+        ),
+        (Some(_), _) => (ExtractionStatus::Full, false, None),
+        (None, _) => (ExtractionStatus::BinarySkipped, false, None),
+    };
+
+    // Size soft-warn note (the analyst is shown this in the TUI; the
+    // provenance row records it as truncation_note when applicable)
+    let truncation_note = if bytes > MAX_RAW_BYTES_SOFT_WARN && truncation_note.is_none() {
+        Some(format!(
+            "raw file size {bytes} bytes exceeds soft-warn threshold {} bytes",
+            MAX_RAW_BYTES_SOFT_WARN
+        ))
+    } else {
+        truncation_note
+    };
+
+    Ok(EvidenceProvenance::File {
+        source_path: source.to_path_buf(),
+        copied_path,
+        basename,
+        sha256,
+        bytes,
+        detected_type: detected,
+        extraction,
+        truncated,
+        truncation_note,
+        sent_to_provider: !matches!(extraction, ExtractionStatus::BinarySkipped),
+    })
+}
+
+/// Attach a labeled paste to a turn. Returns the provenance record.
+pub fn attach_paste(label: &str, body: &str) -> EvidenceProvenance {
+    EvidenceProvenance::Paste {
+        label: label.to_string(),
+        body: body.to_string(),
+        bytes: body.len() as u64,
+        sent_to_provider: true,
+    }
+}
+
+fn sha256_of_file(path: &Path) -> Result<String, ChatError> {
+    use std::io::Read;
+    let mut f = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::models::{EvidenceProvenance, TurnKind};
     use chrono::Utc;
+    use std::io::Write as IoWrite;
     use std::time::Duration;
     use tempfile::tempdir;
 
@@ -375,5 +478,76 @@ mod tests {
         // Second acquisition with a short budget must fail.
         let r = acquire_session_lock(&session_dir, Duration::from_millis(100));
         assert!(matches!(r, Err(ChatError::LockContention { .. })));
+    }
+
+    #[test]
+    fn attach_file_computes_sha256_and_copies() {
+        let dir = tempdir().unwrap();
+        let ticket_dir = dir.path().join("44776");
+        let src = dir.path().join("station.log");
+        let mut f = fs::File::create(&src).unwrap();
+        f.write_all(b"sample log contents").unwrap();
+        let prov = attach_file(&ticket_dir, 3, &src).unwrap();
+        match prov {
+            EvidenceProvenance::File {
+                basename,
+                copied_path,
+                sha256,
+                bytes,
+                truncated,
+                sent_to_provider,
+                ..
+            } => {
+                assert_eq!(basename, "station.log");
+                assert!(copied_path.exists());
+                assert_eq!(bytes, 19);
+                assert!(!truncated);
+                assert!(sent_to_provider);
+                // sha256 of "sample log contents"
+                assert_eq!(sha256.len(), 64);
+            }
+            _ => panic!("expected File variant"),
+        }
+    }
+
+    #[test]
+    fn attach_file_skips_copy_if_already_inside_ticket_dir() {
+        let dir = tempdir().unwrap();
+        let ticket_dir = dir.path().join("44776");
+        fs::create_dir_all(&ticket_dir).unwrap();
+        let internal = ticket_dir.join("preflight.log");
+        let mut f = fs::File::create(&internal).unwrap();
+        f.write_all(b"already inside").unwrap();
+        let prov = attach_file(&ticket_dir, 3, &internal).unwrap();
+        match prov {
+            EvidenceProvenance::File {
+                source_path,
+                copied_path,
+                ..
+            } => {
+                // Same path — no copy.
+                assert_eq!(source_path, copied_path);
+            }
+            _ => panic!("expected File variant"),
+        }
+    }
+
+    #[test]
+    fn attach_paste_records_label_and_bytes() {
+        let prov = attach_paste("customer-note", "rebooted twice during the call");
+        match prov {
+            EvidenceProvenance::Paste {
+                label,
+                body,
+                bytes,
+                sent_to_provider,
+            } => {
+                assert_eq!(label, "customer-note");
+                assert!(body.starts_with("rebooted"));
+                assert_eq!(bytes, 30);
+                assert!(sent_to_provider);
+            }
+            _ => panic!("expected Paste variant"),
+        }
     }
 }
