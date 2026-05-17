@@ -129,7 +129,11 @@ fn resume_round_trip() {
     let thread_id = first_stdout
         .lines()
         .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .find_map(|v| v.get("thread_id").and_then(|t| t.as_str()).map(String::from))
+        .find_map(|v| {
+            v.get("thread_id")
+                .and_then(|t| t.as_str())
+                .map(String::from)
+        })
         .expect("thread_id not found in first --json stdout");
 
     eprintln!("captured thread_id: {thread_id}");

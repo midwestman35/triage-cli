@@ -655,9 +655,9 @@ async fn cmd_investigate(c: InvestigateCmd) -> ExitCode {
              without `--tui` to produce the ticket folder.");
     }
     let rubric = load_rubric_or_die();
-    let reporter = MetricsReporter::new(Box::new(SpinnerReporter::new(Box::new(
-        StderrReporter { verbose: c.verbose },
-    ))));
+    let reporter = MetricsReporter::new(Box::new(SpinnerReporter::new(Box::new(StderrReporter {
+        verbose: c.verbose,
+    }))));
     let effective_dd: Option<&dyn DatadogSource> = fixture_dd
         .as_ref()
         .map(|d| d as &dyn DatadogSource)
