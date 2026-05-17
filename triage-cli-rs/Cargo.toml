@@ -46,6 +46,7 @@ owo-colors = "4"
 # TUI
 ratatui = { version = "0.28", features = ["crossterm"] }
 crossterm = "0.28"
+tui-textarea = "0.6"
 
 # Filesystem + utilities
 which = "6"
