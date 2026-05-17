@@ -4,7 +4,7 @@
 //! (tests/watcher), `ChannelReporter` (TUI).
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -41,6 +41,24 @@ pub enum PipelineError {
     Memory(#[from] memory::MemoryError),
     #[error(transparent)]
     TicketFolder(#[from] TicketFolderError),
+    #[error("followup: {0}")]
+    Followup(#[from] FollowupError),
+}
+
+#[derive(Debug, Error)]
+pub enum FollowupError {
+    #[error("session lost and replay also failed: {0}")]
+    SessionLostNoReplay(String),
+    #[error("could not capture codex session id from output")]
+    CodexSessionCaptureFailed,
+    #[error("lock contention at {0}")]
+    LockContention(PathBuf),
+    #[error("base snapshot missing or unreadable: {0}")]
+    BaseSnapshotMissing(String),
+    #[error(transparent)]
+    Chat(#[from] crate::chat::ChatError),
+    #[error(transparent)]
+    Provider(#[from] crate::providers::ProviderError),
 }
 
 /// Typed value emitted via `Reporter::record_metric`. Kept simple — the only
@@ -744,6 +762,118 @@ impl Reporter for MetricsReporter {
     }
 }
 
+/// Append a follow-up turn pair (analyst question + provider response)
+/// to the conversation log under `ticket_dir`. Does NOT mutate the
+/// five-markdown folder — that only happens on /revise (see
+/// `investigate_one_structured` with `followup_mode=true`, Task 12).
+///
+/// Acquires the per-ticket lock for both writes (analyst turn + provider
+/// turn). The caller is expected to have already validated `prompt` (e.g.
+/// rendered it from analyst input + attached evidence bodies).
+pub async fn followup_turn(
+    ticket_dir: &std::path::Path,
+    ticket_id: &str,
+    prompt: &str,
+    system_prompt: &str,
+    model: &str,
+    attachments: &[crate::models::Attachment],
+    provider: &dyn crate::providers::LlmProvider,
+) -> Result<crate::providers::FollowupResult, PipelineError> {
+    use crate::chat;
+    use std::time::Duration;
+
+    // Read existing turns to determine next turn number + session id
+    let conv = chat::conversation_jsonl_path(ticket_dir);
+    let outcome = chat::parse_conversation_jsonl(&conv).map_err(FollowupError::from)?;
+    let last_codex_session = outcome
+        .turns
+        .iter()
+        .rev()
+        .find_map(|t| t.session_id.clone());
+    let next_turn = outcome.turns.iter().map(|t| t.turn).max().unwrap_or(0) + 1;
+
+    // Acquire lock for the provider call + write sequence
+    let session_dir = chat::session_dir(ticket_dir);
+    let _guard =
+        chat::acquire_session_lock(&session_dir, Duration::from_secs(5)).map_err(|e| match e {
+            crate::chat::ChatError::LockContention { lock_path } => {
+                FollowupError::LockContention(lock_path)
+            }
+            other => FollowupError::Chat(other),
+        })?;
+
+    // Call provider
+    let started = std::time::Instant::now();
+    let result = provider
+        .followup(
+            last_codex_session.as_deref(),
+            prompt,
+            system_prompt,
+            model,
+            attachments,
+        )
+        .await
+        .map_err(FollowupError::Provider)?;
+    let elapsed_s = started.elapsed().as_secs_f64();
+
+    // Append the provider turn
+    let provider_turn = crate::models::Turn {
+        schema: "triage-cli/conversation".into(),
+        schema_version: 1,
+        ticket_id: ticket_id.to_string(),
+        turn: next_turn,
+        turn_kind: crate::models::TurnKind::Codex,
+        ts: chrono::Utc::now(),
+        author: None,
+        body: result.text.clone(),
+        evidence: vec![],
+        provider: Some(provider.name().to_string()),
+        model: Some(model.to_string()),
+        tokens_in: result.tokens_in,
+        tokens_out: result.tokens_out,
+        elapsed_s: Some(elapsed_s),
+        session_id: result.session_id.clone(),
+        resumed: Some(result.resumed),
+        action: None,
+        outcome: None,
+        drove_revision_from_turns: None,
+        diff: None,
+    };
+    chat::append_turn(&conv, &provider_turn).map_err(FollowupError::Chat)?;
+
+    // Re-render markdown
+    let parsed = chat::parse_conversation_jsonl(&conv).map_err(FollowupError::from)?;
+    chat::write_conversation_md(
+        &chat::conversation_md_path(ticket_dir),
+        &parsed.turns,
+        ticket_id,
+    )
+    .map_err(FollowupError::from)?;
+
+    // Update manifest (best-effort — failure here is logged but not fatal)
+    if let Ok(Some(mut m)) = chat::read_session_manifest_opt(ticket_dir) {
+        if result.session_id.is_some() {
+            m.resume_count = m.resume_count.saturating_add(1);
+            m.last_resumed_at = Some(chrono::Utc::now());
+            let _ = chat::write_session_manifest(ticket_dir, &m);
+        }
+    } else {
+        // First follow-up: create the manifest
+        let m = crate::models::SessionManifest {
+            version: 1,
+            provider: provider.name().to_string(),
+            model: model.to_string(),
+            created_at: chrono::Utc::now(),
+            last_resumed_at: None,
+            resume_count: 0,
+            codex_capture_method: None,
+        };
+        let _ = chat::write_session_manifest(ticket_dir, &m);
+    }
+
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -838,5 +968,100 @@ mod tests {
         let bem = crate::chat::read_base_evidence_manifest(&ticket_dir)
             .expect("base-evidence-manifest.json must round-trip");
         let _ = bem.ticket_id; // round-trip asserted by successful read
+    }
+
+    #[tokio::test]
+    async fn followup_turn_appends_to_conversation_jsonl() {
+        let dir = tempfile::tempdir().unwrap();
+        let ticket_dir = dir.path().join("44776");
+        std::fs::create_dir_all(&ticket_dir).unwrap();
+
+        // Seed an analyst turn-001
+        let analyst = crate::models::Turn {
+            schema: "triage-cli/conversation".into(),
+            schema_version: 1,
+            ticket_id: "44776".into(),
+            turn: 1,
+            turn_kind: crate::models::TurnKind::Analyst,
+            ts: chrono::Utc::now(),
+            author: Some("enrique".into()),
+            body: "what's up?".into(),
+            evidence: vec![],
+            provider: None,
+            model: None,
+            tokens_in: None,
+            tokens_out: None,
+            elapsed_s: None,
+            session_id: None,
+            resumed: None,
+            action: None,
+            outcome: None,
+            drove_revision_from_turns: None,
+            diff: None,
+        };
+        let conv = crate::chat::conversation_jsonl_path(&ticket_dir);
+        {
+            let _guard = crate::chat::acquire_session_lock(
+                &crate::chat::session_dir(&ticket_dir),
+                std::time::Duration::from_secs(1),
+            )
+            .unwrap();
+            crate::chat::append_turn(&conv, &analyst).unwrap();
+        }
+
+        // Fake provider that returns canned text
+        struct FakeProvider;
+        impl crate::providers::LlmProvider for FakeProvider {
+            fn name(&self) -> &'static str {
+                "fake"
+            }
+            fn complete<'a>(
+                &'a self,
+                _prompt: &'a str,
+                _sys: &'a str,
+                _model: &'a str,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<
+                                crate::providers::CompletionResult,
+                                crate::providers::ProviderError,
+                            >,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async move {
+                    Ok(crate::providers::CompletionResult {
+                        text: "fake codex reply".into(),
+                        tokens_in: Some(100),
+                        tokens_out: Some(50),
+                    })
+                })
+            }
+        }
+
+        let provider: Box<dyn crate::providers::LlmProvider> = Box::new(FakeProvider);
+        let result = followup_turn(
+            &ticket_dir,
+            "44776",
+            "follow-up question",
+            "system",
+            "fake-model",
+            &[],
+            provider.as_ref(),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.text.contains("fake codex reply"));
+
+        // Conversation now has turn-001 analyst + turn-002 codex
+        let parsed = crate::chat::parse_conversation_jsonl(&conv).unwrap();
+        assert_eq!(parsed.turns.len(), 2);
+        assert!(matches!(
+            parsed.turns[1].turn_kind,
+            crate::models::TurnKind::Codex
+        ));
     }
 }
