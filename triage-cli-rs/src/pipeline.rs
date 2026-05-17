@@ -148,6 +148,12 @@ pub struct InvestigateOptions {
     /// Pre-loaded memory hits (fixture/demo mode). When set, the pipeline
     /// skips the live SQLite BM25 lookup.
     pub memory_hits_override: Option<Vec<MemoryEntry>>,
+    /// Set to `true` when this run is a `/revise` followup rather than the
+    /// original investigation. Suppresses the base-snapshot writes (spec § 5.4)
+    /// so the original snapshots are never overwritten by a revision run.
+    /// Task 12 sets this flag; all existing call sites leave it at the
+    /// `Default::default()` value of `false`.
+    pub followup_mode: bool,
 }
 
 impl InvestigateOptions {
@@ -166,6 +172,7 @@ impl InvestigateOptions {
             force: false,
             customer_history_override: None,
             memory_hits_override: None,
+            followup_mode: false,
         }
     }
 }
@@ -320,6 +327,31 @@ pub async fn investigate_one_structured(
     );
     reporter.record_metric("evidence.memory_hits", MetricValue::Int(prior.len() as i64));
 
+    // Build the evidence bundle unconditionally so both the LLM path and the
+    // --no-llm path have access to the assigned-ID evidence list. The
+    // base-snapshot writes (§ 5.4) consume `bundle.evidence_index`.
+    let mut bundle = TriageBundle {
+        ticket: ticket.clone(),
+        site_entry: site_entry.clone(),
+        log_lines: log_lines.clone(),
+        log_truncated,
+        anchor: Some(opts.anchor_override.unwrap_or(ticket.created_at)),
+        anchor_source: Some(if opts.anchor_override.is_some() {
+            AnchorSource::Flag
+        } else {
+            AnchorSource::CreatedAt
+        }),
+        window_start: None,
+        window_end: None,
+        downloaded_attachments: session.evidence.attachments.clone(),
+        local_files: session.evidence.local_files.clone(),
+        pasted_logs: session.evidence.pasted_logs.clone(),
+        customer_history: session.evidence.customer_history.clone(),
+        memory_context: session.memory_context.clone(),
+        evidence_index: Vec::new(),
+    };
+    bundle.evidence_index = crate::models::assign_evidence_ids(&bundle);
+
     // Phase: llm_call (structured)
     reporter.phase_started("llm_call", "generating structured assessment");
     let (report, validator_warnings, llm_call_metrics) = if opts.no_llm {
@@ -327,27 +359,6 @@ pub async fn investigate_one_structured(
         reporter.phase_done("llm_call", "stub (--no-llm)");
         (r, Vec::new(), None)
     } else {
-        let mut bundle = TriageBundle {
-            ticket: ticket.clone(),
-            site_entry: site_entry.clone(),
-            log_lines: log_lines.clone(),
-            log_truncated,
-            anchor: Some(opts.anchor_override.unwrap_or(ticket.created_at)),
-            anchor_source: Some(if opts.anchor_override.is_some() {
-                AnchorSource::Flag
-            } else {
-                AnchorSource::CreatedAt
-            }),
-            window_start: None,
-            window_end: None,
-            downloaded_attachments: session.evidence.attachments.clone(),
-            local_files: session.evidence.local_files.clone(),
-            pasted_logs: session.evidence.pasted_logs.clone(),
-            customer_history: session.evidence.customer_history.clone(),
-            memory_context: session.memory_context.clone(),
-            evidence_index: Vec::new(),
-        };
-        bundle.evidence_index = crate::models::assign_evidence_ids(&bundle);
         let outcome =
             match llm::triage_structured(&bundle, rubric, None, opts.verbose, opts.redact_enabled)
                 .await
@@ -426,6 +437,28 @@ pub async fn investigate_one_structured(
         &report.rubric_version,
     );
     reporter.phase_done("save", &format!("→ {}", paths.folder.display()));
+
+    // Base snapshots for the interactive investigation feature
+    // (spec § 5.4). Skipped when `followup_mode` is true.
+    if !opts.followup_mode {
+        let ticket_dir = ticket_folder::tickets_root().join(ticket.id.to_string());
+        // Best-effort: snapshot write failure is logged but does not
+        // fail the investigation. The /revise path treats missing
+        // snapshots as a re-fetch trigger.
+        if let Err(e) = crate::chat::write_base_ticket(&ticket_dir, &ticket) {
+            reporter.phase_failed("base_ticket_snapshot", &e.to_string());
+        }
+        let bem = crate::models::BaseEvidenceManifest {
+            schema: "triage-cli/base-evidence".into(),
+            schema_version: 1,
+            ticket_id: ticket.id.to_string(),
+            captured_at: chrono::Utc::now(),
+            evidence: bundle.evidence_index.clone(),
+        };
+        if let Err(e) = crate::chat::write_base_evidence_manifest(&ticket_dir, &bem) {
+            reporter.phase_failed("base_evidence_snapshot", &e.to_string());
+        }
+    }
 
     Ok(StructuredInvestigation {
         report,
@@ -708,5 +741,88 @@ impl Reporter for MetricsReporter {
             .unwrap()
             .push((key.to_string(), value.clone()));
         self.inner.record_metric(key, value);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fixture::{FixtureDatadogClient, FixtureLoader};
+    use crate::playbook::Rubric;
+
+    /// Run the pipeline against the audio-drop fixture (ticket #55001) using
+    /// `no_llm: true` so no network calls are made. Returns the pipeline result.
+    async fn run_fixture_pipeline(
+        tickets_root: &std::path::Path,
+    ) -> Result<StructuredInvestigation, PipelineError> {
+        // Point the fixture loader at the crate's bundled fixtures directory.
+        let fixtures_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let loader = FixtureLoader::new(fixtures_dir.join("audio-drop"))
+            .expect("audio-drop fixture must exist");
+        let ticket = loader.load_ticket().expect("fixture ticket.json");
+        let logs = loader
+            .load_datadog_logs()
+            .expect("fixture datadog-logs.json");
+        let memory_hits = loader.load_memory_hits().expect("fixture memory-hits.json");
+
+        let mut session = crate::investigation::create_session(ticket.clone());
+        let fixture_dd = FixtureDatadogClient::new(logs);
+        let opts = InvestigateOptions {
+            no_llm: true,
+            memory_hits_override: Some(memory_hits),
+            force: true, // avoid soft-lock conflicts between parallel test runs
+            followup_mode: false,
+            ..InvestigateOptions::defaults()
+        };
+        let rubric = Rubric::load().expect("embedded rubric must parse");
+        let reporter = SilentReporter;
+
+        // Override the tickets root for this test run.
+        std::env::set_var("TRIAGE_TICKETS_ROOT", tickets_root);
+
+        investigate_one_structured(
+            ticket,
+            &mut session,
+            Some(&fixture_dd as &dyn crate::datadog::DatadogSource),
+            &rubric,
+            &reporter,
+            &opts,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn investigate_writes_base_snapshots() {
+        let dir = tempfile::tempdir().unwrap();
+        let outcome = run_fixture_pipeline(dir.path()).await;
+        assert!(
+            outcome.is_ok(),
+            "fixture pipeline failed: {:?}",
+            outcome.err()
+        );
+
+        // Ticket #55001 is the audio-drop fixture id
+        let ticket_dir = dir.path().join("55001");
+
+        // Both snapshots must exist after a successful non-followup run
+        assert!(
+            ticket_dir.join(".session/base-ticket.json").exists(),
+            "base-ticket.json not written"
+        );
+        assert!(
+            ticket_dir
+                .join(".session/base-evidence-manifest.json")
+                .exists(),
+            "base-evidence-manifest.json not written"
+        );
+
+        // Round-trip the snapshots to confirm they are valid JSON
+        let bt =
+            crate::chat::read_base_ticket(&ticket_dir).expect("base-ticket.json must round-trip");
+        let _ = bt.id; // round-trip asserted by successful read
+
+        let bem = crate::chat::read_base_evidence_manifest(&ticket_dir)
+            .expect("base-evidence-manifest.json must round-trip");
+        let _ = bem.ticket_id; // round-trip asserted by successful read
     }
 }

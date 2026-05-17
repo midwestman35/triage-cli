@@ -1126,6 +1126,7 @@ async fn poll_iteration(
             force: false,
             customer_history_override: None,
             memory_hits_override: None,
+            followup_mode: false,
         };
         let no_logs = opts.no_logs;
         let tid_copy = *tid;
@@ -1228,6 +1229,7 @@ fn opts_to_investigate(opts: WatcherOptions) -> InvestigateOptions {
         force: false,
         customer_history_override: None,
         memory_hits_override: None,
+        followup_mode: false,
     }
 }
 
