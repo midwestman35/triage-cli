@@ -8,7 +8,7 @@
 //! See `docs/superpowers/specs/2026-05-17-interactive-investigation-design.md`.
 
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -43,19 +43,24 @@ pub fn parse_conversation_jsonl(path: &Path) -> Result<ParseOutcome, ChatError> 
     if !path.exists() {
         return Ok(ParseOutcome::default());
     }
-    let file = fs::File::open(path)?;
-    let reader = BufReader::new(file);
+    let content = fs::read_to_string(path)?;
+    let ends_with_newline = content.ends_with('\n');
+    let lines: Vec<&str> = content.split('\n').collect();
+    let last_non_empty_idx = lines.iter().rposition(|l| !l.trim().is_empty());
+
     let mut turns = Vec::new();
     let mut torn_final_line = false;
-    let lines: Vec<String> = reader.lines().collect::<Result<Vec<_>, _>>()?;
-    let last_idx = lines.len().saturating_sub(1);
     for (i, line) in lines.iter().enumerate() {
         if line.trim().is_empty() {
             continue;
         }
+        // A chunk is potentially torn only when it is the last non-empty chunk
+        // AND the file does not end with a newline (no terminator written).
+        let is_last_non_empty = Some(i) == last_non_empty_idx;
+        let is_potentially_torn = is_last_non_empty && !ends_with_newline;
         match serde_json::from_str::<Turn>(line) {
             Ok(turn) => turns.push(turn),
-            Err(_) if i == last_idx => {
+            Err(_) if is_potentially_torn => {
                 torn_final_line = true;
             }
             Err(e) => return Err(ChatError::Json(e)),
@@ -474,12 +479,29 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("CONVERSATION.jsonl");
         append_turn(&path, &sample_analyst_turn(1)).unwrap();
-        // Simulate a torn write: append a partial JSON line
+        // Simulate a torn write: use write! (not writeln!) so there is no trailing
+        // newline — physically realistic, since a killed process never completes the
+        // final fsync + newline terminator.
         let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
-        writeln!(f, "{{\"schema\":\"triage-cli/conv").unwrap();
+        write!(f, "{{\"schema\":\"triage-cli/conv").unwrap();
         let out = parse_conversation_jsonl(&path).unwrap();
         assert_eq!(out.turns.len(), 1);
         assert!(out.torn_final_line);
+    }
+
+    #[test]
+    fn newline_terminated_corrupt_final_record_propagates_error() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("CONVERSATION.jsonl");
+        append_turn(&path, &sample_analyst_turn(1)).unwrap();
+        // Append a newline-terminated but malformed record.
+        let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(f, "{{not_a_valid_turn}}").unwrap();
+        let err = parse_conversation_jsonl(&path);
+        assert!(
+            matches!(err, Err(ChatError::Json(_))),
+            "expected ChatError::Json for newline-terminated corrupt record, got {err:?}"
+        );
     }
 
     #[test]
