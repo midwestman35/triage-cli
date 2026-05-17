@@ -1897,45 +1897,39 @@ fn next_turn_number(ticket_dir: &Path) -> anyhow::Result<u32> {
 
 /// Build the prompt sent to the follow-up LLM by combining the analyst's
 /// question body with the bodies of any pending evidence (file content +
-/// paste bodies). Returns the body unchanged when there is no evidence.
-///
-/// File content is read via `investigation::read_text_if_supported`, which
-/// applies the same per-entry / aggregate caps as the rest of the pipeline.
-/// Binary or unreadable files are surfaced as a one-line note so the LLM
-/// at least sees that the file existed.
-///
-/// TODO(E2): provider trait already exposes `attachments: &[Attachment]`,
-/// but providers do not yet materialize that channel into native multi-part
-/// requests. Once that lands, file content should flow through attachments
-/// instead of being inlined here.
-fn build_followup_prompt(body: &str, evidence: &[crate::models::EvidenceProvenance]) -> String {
-    if evidence.is_empty() {
-        return body.to_string();
-    }
+/// Convert pending evidence into a (augmented_prompt, attachments) pair.
+/// Pastes are inlined into the prompt (they have no file path). Files
+/// become Attachment entries; their content flows through the provider's
+/// native attachments channel.
+fn build_followup_message(
+    body: &str,
+    evidence: &[crate::models::EvidenceProvenance],
+) -> (String, Vec<crate::models::Attachment>) {
     let mut prompt = String::from(body);
-    prompt.push_str("\n\n## Attached evidence\n");
+    let mut attachments = Vec::new();
     for ev in evidence {
         match ev {
+            crate::models::EvidenceProvenance::Paste { label, body, .. } => {
+                prompt.push_str(&format!("\n\n## paste: {label}\n{body}"));
+            }
             crate::models::EvidenceProvenance::File {
                 copied_path,
                 basename,
-                bytes,
                 detected_type,
                 ..
             } => {
-                prompt.push_str(&format!("\n### file: {basename} ({bytes} bytes)\n"));
-                match investigation::read_text_if_supported(copied_path, *detected_type) {
-                    Some(content) => prompt.push_str(&content),
-                    None => prompt.push_str("[binary or unreadable — content not included]"),
-                }
-                prompt.push('\n');
-            }
-            crate::models::EvidenceProvenance::Paste { label, body, .. } => {
-                prompt.push_str(&format!("\n### paste: {label}\n{body}\n"));
+                let extracted_text =
+                    investigation::read_text_if_supported(copied_path, *detected_type);
+                attachments.push(crate::models::Attachment {
+                    copied_path: copied_path.clone(),
+                    basename: basename.clone(),
+                    detected_type: *detected_type,
+                    extracted_text,
+                });
             }
         }
     }
-    prompt
+    (prompt, attachments)
 }
 
 async fn send_analyst_turn(
@@ -1947,10 +1941,10 @@ async fn send_analyst_turn(
     input: &mut tui_textarea::TextArea<'_>,
 ) -> anyhow::Result<()> {
     use crate::chat;
-    // Build the augmented prompt BEFORE moving `evidence` into the turn
-    // record below. The follow-up provider needs to see file/paste content,
-    // not just the analyst's question.
-    let augmented_prompt = build_followup_prompt(body, &evidence);
+    // Build the augmented prompt and attachments BEFORE moving `evidence`
+    // into the turn record below. Pastes are inlined; files become
+    // Attachment entries that flow through the provider's native channel.
+    let (augmented_prompt, attachments) = build_followup_message(body, &evidence);
     {
         // Acquire the lock BEFORE computing `next` so a concurrent writer
         // can't sneak an append between our read and our own append, which
@@ -2003,7 +1997,7 @@ async fn send_analyst_turn(
         "",
         &std::env::var("CODEX_MODEL")
             .unwrap_or_else(|_| crate::providers::codex::DEFAULT_CODEX_MODEL.to_string()),
-        &[],
+        &attachments,
         provider,
     )
     .await?;
@@ -2227,22 +2221,20 @@ status: open
     }
 
     #[test]
-    fn build_followup_prompt_empty_evidence_returns_body_unchanged() {
-        let prompt = build_followup_prompt("ANALYST_QUESTION", &[]);
+    fn build_followup_message_empty_evidence_returns_unchanged() {
+        let (prompt, atts) = build_followup_message("ANALYST_QUESTION", &[]);
         assert_eq!(prompt, "ANALYST_QUESTION");
+        assert!(atts.is_empty());
     }
 
     #[test]
-    fn build_followup_prompt_includes_paste_and_file_content() {
+    fn build_followup_message_inlines_pastes_and_routes_files_to_attachments() {
         use crate::models::{EvidenceProvenance, ExtractionStatus, FileType};
         use std::io::Write as _;
 
-        // File case: write a temp file with a sentinel and reference it as
-        // an EvidenceProvenance::File. Reader must surface the content.
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
         tmp.write_all(b"FILE_CONTENT_SENTINEL\n").unwrap();
         let file_path = tmp.path().to_path_buf();
-
         let evidence = vec![
             EvidenceProvenance::File {
                 source_path: file_path.clone(),
@@ -2263,27 +2255,21 @@ status: open
                 sent_to_provider: true,
             },
         ];
-
-        let prompt = build_followup_prompt("ANALYST_QUESTION", &evidence);
+        let (prompt, atts) = build_followup_message("ANALYST_QUESTION", &evidence);
+        // Paste is inlined into the prompt; file is NOT.
+        assert!(prompt.contains("ANALYST_QUESTION"));
+        assert!(prompt.contains("PASTE_BODY_SENTINEL"));
+        assert!(prompt.contains("operator-note"));
         assert!(
-            prompt.contains("ANALYST_QUESTION"),
-            "prompt missing question"
+            !prompt.contains("FILE_CONTENT_SENTINEL"),
+            "file content should not be in prompt; should be in attachments"
         );
-        assert!(
-            prompt.contains("FILE_CONTENT_SENTINEL"),
-            "prompt missing file content: {prompt}"
-        );
-        assert!(
-            prompt.contains("diag.log"),
-            "prompt missing file basename: {prompt}"
-        );
-        assert!(
-            prompt.contains("PASTE_BODY_SENTINEL"),
-            "prompt missing paste body: {prompt}"
-        );
-        assert!(
-            prompt.contains("operator-note"),
-            "prompt missing paste label: {prompt}"
+        // File becomes an attachment with extracted content.
+        assert_eq!(atts.len(), 1);
+        assert_eq!(atts[0].basename, "diag.log");
+        assert_eq!(
+            atts[0].extracted_text.as_deref().unwrap_or(""),
+            "FILE_CONTENT_SENTINEL\n"
         );
     }
 }

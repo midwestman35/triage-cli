@@ -48,20 +48,21 @@ pub trait LlmProvider: Send + Sync {
         model: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<CompletionResult, ProviderError>> + Send + 'a>>;
 
-    /// Optional follow-up surface (spec § 5.7). Default impl ignores
-    /// `session_id` and calls `complete()` with the caller-supplied
-    /// replay-context prompt. Providers with native session resume
-    /// (codex — Task 10) override this method.
+    /// Optional follow-up surface (spec § 5.7). Default impl stamps
+    /// attachment content into the prompt then delegates to `complete()`.
+    /// Providers with native session resume (codex — Task 10) override
+    /// this method.
     fn followup<'a>(
         &'a self,
         _session_id: Option<&'a str>,
         prompt: &'a str,
         system_prompt: &'a str,
         model: &'a str,
-        _attachments: &'a [crate::models::Attachment],
+        attachments: &'a [crate::models::Attachment],
     ) -> Pin<Box<dyn Future<Output = Result<FollowupResult, ProviderError>> + Send + 'a>> {
         Box::pin(async move {
-            let r = self.complete(prompt, system_prompt, model).await?;
+            let stamped = stamp_attachments_into_prompt(prompt, attachments);
+            let r = self.complete(&stamped, system_prompt, model).await?;
             Ok(FollowupResult {
                 text: r.text,
                 tokens_in: r.tokens_in,
@@ -129,6 +130,34 @@ pub(crate) fn base_url(env_name: &str, default: &str) -> String {
     }
 }
 
+/// Stamp attachment content into a prompt string. Used by providers that
+/// don't have a native multi-part request channel (codex subprocess,
+/// unleash /chats body). Empty attachments → prompt unchanged.
+pub fn stamp_attachments_into_prompt(
+    prompt: &str,
+    attachments: &[crate::models::Attachment],
+) -> String {
+    if attachments.is_empty() {
+        return prompt.to_string();
+    }
+    let mut out = String::from(prompt);
+    out.push_str("\n\n## Attached files");
+    for a in attachments {
+        out.push_str(&format!(
+            "\n\n### file: {} ({:?})",
+            a.basename, a.detected_type
+        ));
+        match &a.extracted_text {
+            Some(text) => {
+                out.push('\n');
+                out.push_str(text);
+            }
+            None => out.push_str("\n[binary or unreadable — content not included]"),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod followup_tests {
     use super::*;
@@ -171,5 +200,80 @@ mod followup_tests {
         assert_eq!(r.text, "echo:what changed?");
         assert!(!r.resumed);
         assert!(r.session_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn default_followup_stamps_attachments_into_prompt() {
+        use crate::models::{Attachment, FileType};
+        let p = FakeProvider {
+            last_prompt: Mutex::new(None),
+        };
+        let att = Attachment {
+            copied_path: std::path::PathBuf::from("/dev/null"),
+            basename: "diag.log".into(),
+            detected_type: FileType::Log,
+            extracted_text: Some("ATTACHMENT_BODY_SENTINEL".into()),
+        };
+        let r = p
+            .followup(
+                None,
+                "what changed?",
+                "sys",
+                "m",
+                std::slice::from_ref(&att),
+            )
+            .await
+            .unwrap();
+        assert!(r.text.contains("ATTACHMENT_BODY_SENTINEL") || r.text.contains("what changed?"));
+        let captured = p.last_prompt.lock().unwrap().clone().unwrap();
+        assert!(
+            captured.contains("ATTACHMENT_BODY_SENTINEL"),
+            "stamp missing: {captured}"
+        );
+        assert!(
+            captured.contains("diag.log"),
+            "basename missing: {captured}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod stamp_tests {
+    use super::*;
+
+    #[test]
+    fn stamp_attachments_empty_returns_prompt_unchanged() {
+        assert_eq!(stamp_attachments_into_prompt("hello", &[]), "hello");
+    }
+
+    #[test]
+    fn stamp_attachments_includes_basename_and_content() {
+        use crate::models::{Attachment, FileType};
+        let a = Attachment {
+            copied_path: std::path::PathBuf::from("/x/y.log"),
+            basename: "y.log".into(),
+            detected_type: FileType::Log,
+            extracted_text: Some("CONTENT".into()),
+        };
+        let s = stamp_attachments_into_prompt("question", std::slice::from_ref(&a));
+        assert!(s.contains("question"));
+        assert!(s.contains("y.log"));
+        assert!(s.contains("CONTENT"));
+    }
+
+    #[test]
+    fn stamp_attachments_handles_binary_attachment() {
+        use crate::models::{Attachment, FileType};
+        let a = Attachment {
+            copied_path: std::path::PathBuf::from("/x/y.bin"),
+            basename: "y.bin".into(),
+            detected_type: FileType::Unknown,
+            extracted_text: None,
+        };
+        let s = stamp_attachments_into_prompt("question", std::slice::from_ref(&a));
+        assert!(
+            s.contains("[binary or unreadable"),
+            "missing fallback note: {s}"
+        );
     }
 }

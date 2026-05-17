@@ -73,16 +73,17 @@ impl LlmProvider for CodexSubprocessProvider {
         prompt: &'a str,
         system_prompt: &'a str,
         model: &'a str,
-        _attachments: &'a [crate::models::Attachment],
+        attachments: &'a [crate::models::Attachment],
     ) -> Pin<Box<dyn Future<Output = Result<FollowupResult, ProviderError>> + Send + 'a>> {
         Box::pin(async move {
             if which::which("codex").is_err() {
                 return Err(ProviderError::SubprocessMissing("codex"));
             }
+            let stamped = super::stamp_attachments_into_prompt(prompt, attachments);
             let combined = if system_prompt.is_empty() {
-                prompt.to_string()
+                stamped
             } else {
-                format!("## System\n{system_prompt}\n\n## User\n{prompt}")
+                format!("## System\n{system_prompt}\n\n## User\n{stamped}")
             };
 
             // Try native resume first if we have a session ID.
