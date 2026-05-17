@@ -145,6 +145,7 @@ pub enum FileType {
     Text,
     Log,
     Json,
+    Zip,
     Unknown,
 }
 
@@ -154,6 +155,7 @@ impl FileType {
             Self::Text => "text",
             Self::Log => "log",
             Self::Json => "json",
+            Self::Zip => "zip",
             Self::Unknown => "unknown",
         }
     }
