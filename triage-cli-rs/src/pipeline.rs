@@ -502,15 +502,16 @@ pub async fn investigate_one_structured(
     })
 }
 
-/// Per-entry cap on body snapshots stored in `BaseEvidenceManifest`
-/// (schema v2). Bodies larger than this are head-truncated. 256 KB
-/// matches the per-zip-entry cap in `investigation.rs`; the JSON-escape
-/// inflation makes the on-disk impact roughly 1.5× that.
+/// Per-entry cap on base-evidence body snapshots. Kept in sync with
+/// ZIP_ENTRY_CAP_BYTES in investigation.rs so attached zip entries and
+/// snapshot bodies share the same size budget.
 const BODY_SNAPSHOT_CAP_BYTES: usize = 256 * 1024;
 
-/// Truncate `body` to at most `BODY_SNAPSHOT_CAP_BYTES`, preserving the
-/// head. Returns `None` if `body` is empty after trimming. The truncation
-/// respects UTF-8 char boundaries.
+/// Truncate `body` to at most `BODY_SNAPSHOT_CAP_BYTES`, respecting UTF-8
+/// char boundaries. Appends a `"\n\n[truncated]"` marker when truncation
+/// occurs — the returned string may exceed the cap by ~14 bytes (the
+/// marker length). Returns `None` for empty input (including the
+/// pathological case where the entire cap is one codepoint).
 fn cap_body_snapshot(body: String) -> Option<String> {
     if body.is_empty() {
         return None;
@@ -523,6 +524,12 @@ fn cap_body_snapshot(body: String) -> Option<String> {
     let mut cut = BODY_SNAPSHOT_CAP_BYTES;
     while cut > 0 && !body.is_char_boundary(cut) {
         cut -= 1;
+    }
+    // Pathological case: the entire cap window is occupied by a single
+    // multi-byte codepoint — no valid boundary found. Return None rather
+    // than Some("\n\n[truncated]"), which would violate the contract.
+    if cut == 0 {
+        return None;
     }
     let mut truncated = body[..cut].to_string();
     truncated.push_str("\n\n[truncated]");
@@ -542,11 +549,18 @@ fn collect_base_evidence_entries(bundle: &TriageBundle) -> Vec<crate::models::Ba
         .iter()
         .map(|item| {
             let body = match item.kind.as_str() {
+                // Note: matches by label only. If multiple pasted_logs share the
+                // same label, only the first match's body is captured — a
+                // pre-existing ambiguity in assign_evidence_ids. Tracked in
+                // ADR-0003.
                 "pasted_note" => bundle
                     .pasted_logs
                     .iter()
                     .find(|p| p.label == item.label)
                     .and_then(|p| cap_body_snapshot(p.text.clone())),
+                // Note: matches by basename only. Two local files with the same
+                // basename in different directories collide on the first match.
+                // Same pre-existing ambiguity as the pasted_note arm.
                 "local_file" => bundle
                     .local_files
                     .iter()
@@ -2663,7 +2677,7 @@ validator_warnings: []\n---\n";
     }
 
     #[test]
-    fn base_evidence_round_trips_paste_bodies() {
+    fn collect_base_evidence_entries_copies_paste_body() {
         // collect_base_evidence_entries must copy a pasted_note's text into
         // the entry's `body` field — the central guarantee of ADR-0003 for
         // the pasted_note kind.
@@ -2829,6 +2843,14 @@ validator_warnings: []\n---\n";
             .iter()
             .map(|p| p.text.as_str())
             .collect();
+        // 1 catalog paste + 2 body pastes (E-001, E-002); E-003 body is None
+        // and must NOT produce an extra paste.
+        assert_eq!(
+            session.evidence.pasted_logs.len(),
+            3,
+            "expected 3 pasted_logs (1 catalog + 2 bodies); got {}; logs = {pasted_texts:?}",
+            session.evidence.pasted_logs.len()
+        );
         assert!(
             pasted_texts
                 .iter()
@@ -2854,5 +2876,26 @@ validator_warnings: []\n---\n";
             });
         assert!(catalog.contains("datadog_log_window"));
         assert!(catalog.contains("pasted_note"));
+    }
+
+    #[test]
+    fn cap_body_snapshot_empty_returns_none() {
+        assert!(cap_body_snapshot(String::new()).is_none());
+    }
+
+    #[test]
+    fn cap_body_snapshot_short_returns_unchanged() {
+        let s = "short content".to_string();
+        let result = cap_body_snapshot(s.clone()).unwrap();
+        assert_eq!(result, s);
+    }
+
+    #[test]
+    fn cap_body_snapshot_long_truncates_with_marker() {
+        let s = "a".repeat(BODY_SNAPSHOT_CAP_BYTES + 100);
+        let result = cap_body_snapshot(s).unwrap();
+        assert!(result.contains("[truncated]"));
+        // Marker overage is documented; allow ~14 bytes slack.
+        assert!(result.len() <= BODY_SNAPSHOT_CAP_BYTES + 32);
     }
 }

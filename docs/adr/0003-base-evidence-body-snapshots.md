@@ -59,3 +59,18 @@ writes are v2.
 - **Schema version is informational**, not enforced at read time —
   the reader trusts serde defaults to handle missing fields. This
   keeps the read path simple and supports incremental migration.
+
+## Known Limitations
+
+- **Duplicate label / basename ambiguity**: `assign_evidence_ids`
+  generates EvidenceItem labels from `pasted_log.label` and
+  `local_file.path.file_name()`. If two pastes share a label, or two
+  local files share a basename (in different directories), only the
+  first match's body is captured by `collect_base_evidence_entries`.
+  This is pre-existing behavior, not introduced by this patch. A
+  proper fix requires either (a) enforcing unique labels at attach
+  time, or (b) changing the EvidenceItem source_path to a fully
+  qualified identifier and matching on that. Out of scope for v2.
+
+- **Truncation marker exceeds cap by ~14 bytes**: see doc comment on
+  `cap_body_snapshot` in pipeline.rs.
