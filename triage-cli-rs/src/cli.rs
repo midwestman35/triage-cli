@@ -985,12 +985,11 @@ fn show_full_state_diff(existing_path: &Path, new_content: &str) -> std::io::Res
             // exactly like POSIX `sh` would, but cross-platform and without
             // ever spawning a real shell. The file-path args are passed via
             // `Command::args`, so they never go through a parser at all.
-            let parts = shlex::split(trimmed).ok_or_else(|| {
-                std::io::Error::other("DIFF_VIEWER has unbalanced quoting")
-            })?;
-            let (cmd, args) = parts.split_first().ok_or_else(|| {
-                std::io::Error::other("DIFF_VIEWER is empty after parsing")
-            })?;
+            let parts = shlex::split(trimmed)
+                .ok_or_else(|| std::io::Error::other("DIFF_VIEWER has unbalanced quoting"))?;
+            let (cmd, args) = parts
+                .split_first()
+                .ok_or_else(|| std::io::Error::other("DIFF_VIEWER is empty after parsing"))?;
             let status = Command::new(cmd)
                 .args(args)
                 .arg(existing_path)
@@ -1022,9 +1021,9 @@ fn show_full_state_diff(existing_path: &Path, new_content: &str) -> std::io::Res
 async fn cmd_watch(c: WatchCmd) -> ExitCode {
     let levels = parse_levels(&c.levels);
     let backfill_hours = parse_backfill(&c.backfill);
-    let state_file = c
-        .state_file
-        .unwrap_or_else(|| crate::paths::triage_home().join(format!("data/watcher-state-{}.json", c.view)));
+    let state_file = c.state_file.unwrap_or_else(|| {
+        crate::paths::triage_home().join(format!("data/watcher-state-{}.json", c.view))
+    });
     let opts = WatcherOptions {
         view_id: Some(c.view),
         interval: c.interval,
@@ -1050,7 +1049,8 @@ async fn cmd_inbox(c: InboxCmd) -> ExitCode {
     let (view_id, view_key) = resolve_view(c.view.as_deref());
     let backfill_hours = parse_backfill(&c.backfill);
     let levels = parse_levels(&c.levels);
-    let state_file = crate::paths::triage_home().join(format!("data/watcher-state-{view_key}.json"));
+    let state_file =
+        crate::paths::triage_home().join(format!("data/watcher-state-{view_key}.json"));
     let opts = WatcherOptions {
         view_id,
         interval: c.poll,

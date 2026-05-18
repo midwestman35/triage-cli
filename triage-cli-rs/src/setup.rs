@@ -20,11 +20,26 @@ pub async fn doctor() -> ExitCode {
     let home = crate::paths::triage_home();
     eprintln!("triage_home: {}", home.display());
     eprintln!("  .env:                  {}", home.join(".env").display());
-    eprintln!("  MEMORY.md:             {}", home.join("MEMORY.md").display());
-    eprintln!("  apex-cnc-inventory.md: {}", home.join("apex-cnc-inventory.md").display());
-    eprintln!("  data/cnc-map.json:     {}", home.join("data/cnc-map.json").display());
-    eprintln!("  data/memory.db:        {}", home.join("data/memory.db").display());
-    eprintln!("  Tickets/:              {}", crate::ticket_folder::tickets_root().display());
+    eprintln!(
+        "  MEMORY.md:             {}",
+        home.join("MEMORY.md").display()
+    );
+    eprintln!(
+        "  apex-cnc-inventory.md: {}",
+        home.join("apex-cnc-inventory.md").display()
+    );
+    eprintln!(
+        "  data/cnc-map.json:     {}",
+        home.join("data/cnc-map.json").display()
+    );
+    eprintln!(
+        "  data/memory.db:        {}",
+        home.join("data/memory.db").display()
+    );
+    eprintln!(
+        "  Tickets/:              {}",
+        crate::ticket_folder::tickets_root().display()
+    );
     eprintln!();
 
     eprintln!("Zendesk:");
@@ -94,10 +109,7 @@ pub async fn doctor() -> ExitCode {
 
     let inv = home.join("apex-cnc-inventory.md");
     let map = home.join("data/cnc-map.json");
-    if let (Ok(inv_md), Ok(map_md)) = (
-        std::fs::metadata(&inv),
-        std::fs::metadata(&map),
-    ) {
+    if let (Ok(inv_md), Ok(map_md)) = (std::fs::metadata(&inv), std::fs::metadata(&map)) {
         if let (Ok(inv_mt), Ok(map_mt)) = (inv_md.modified(), map_md.modified()) {
             if inv_mt > map_mt {
                 eprintln!(
@@ -207,7 +219,10 @@ pub fn setup() -> ExitCode {
     eprintln!("{} wrote {} ({} keys)", "✓".green(), ENV_PATH, next.len());
 
     eprintln!();
-    eprintln!("{} regenerating data/cnc-map.json from inventory...", "→".cyan());
+    eprintln!(
+        "{} regenerating data/cnc-map.json from inventory...",
+        "→".cyan()
+    );
     if crate::build_map::run() == ExitCode::SUCCESS {
         eprintln!("{} cnc-map regenerated", "✓".green());
     } else {
