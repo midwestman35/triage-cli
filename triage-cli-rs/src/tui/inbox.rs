@@ -187,6 +187,14 @@ enum InboxEvent {
         ticket_id: u64,
         error: String,
     },
+    /// F2: persist a "this ticket has been triaged at <updated_at>" marker
+    /// to `state.triaged`. Emitted only on pipeline success — failures must
+    /// not silently consume an auto-triage attempt, since the next poll
+    /// would then skip the ticket via `watcher::should_triage`.
+    TriagePersistSeen {
+        ticket_id: u64,
+        updated_at_rfc3339: String,
+    },
     SiteInputNeeded {
         ticket_id: u64,
         subject: String,
@@ -553,6 +561,17 @@ impl InboxApp {
                 entry.failure_reason = Some(error);
                 entry.phase_label = None;
                 entry.phase_step = 0;
+                // F2: deliberately do NOT touch `self.state.triaged`. The
+                // next poll cycle must re-attempt this ticket.
+            }
+            InboxEvent::TriagePersistSeen {
+                ticket_id,
+                updated_at_rfc3339,
+            } => {
+                self.state
+                    .triaged
+                    .insert(ticket_id.to_string(), updated_at_rfc3339);
+                let _ = watcher::save_state(&self.opts.state_file, &self.state);
             }
             InboxEvent::SiteInputNeeded {
                 ticket_id,
@@ -1188,29 +1207,24 @@ async fn poll_iteration(
         };
         let no_logs = opts.no_logs;
         let tid_copy = *tid;
+        let updated_at_rfc3339 = updated.to_rfc3339();
         let _ = tx.send(InboxEvent::TriagePhase {
             ticket_id: tid_copy,
             label: "Triaging".into(),
             step: 1,
         });
 
+        // F2: the `triaged` insert that used to live here has moved into the
+        // success arm of the spawned task. Marking a ticket as seen before
+        // the pipeline returns swallowed transient failures (the next poll
+        // would then skip the ticket via `should_triage`).
+
         tokio::spawn(async move {
-            match run_pipeline(ticket, opts_inner, no_logs, tx_inner.clone()).await {
-                Ok(outcome) => {
-                    let _ = tx_inner.send(InboxEvent::TriageComplete {
-                        ticket_id: tid_copy,
-                        folder: outcome.paths.folder,
-                    });
-                }
-                Err(e) => {
-                    let _ = tx_inner.send(InboxEvent::TriageFailed {
-                        ticket_id: tid_copy,
-                        error: e,
-                    });
-                }
-            }
+            let result = run_pipeline(ticket, opts_inner, no_logs, tx_inner.clone())
+                .await
+                .map(|o| o.paths.folder);
+            emit_triage_outcome_events(tid_copy, updated_at_rfc3339, result, &tx_inner);
         });
-        new_state.triaged.insert(key, updated.to_rfc3339());
     }
     let live_set: HashSet<String> = view_set.iter().map(|id| id.to_string()).collect();
     new_state =
@@ -1290,6 +1304,35 @@ fn opts_to_investigate(opts: WatcherOptions) -> InvestigateOptions {
         memory_hits_override: None,
         followup_mode: false,
         tickets_root: None,
+    }
+}
+
+/// F2: route a pipeline result into the right inbox events.
+///
+/// Extracted as a free function so it can be unit-tested without standing
+/// up a real `run_pipeline` invocation (which requires Zendesk + Datadog).
+/// On success, emits `TriageComplete` (so the row repaints from disk) then
+/// `TriagePersistSeen` (so `handle_event` updates `state.triaged` and
+/// fsyncs the state file). On failure, emits only `TriageFailed` — the
+/// next poll cycle will re-attempt because `state.triaged` was never
+/// updated.
+fn emit_triage_outcome_events(
+    ticket_id: u64,
+    updated_at_rfc3339: String,
+    result: Result<PathBuf, String>,
+    tx: &mpsc::UnboundedSender<InboxEvent>,
+) {
+    match result {
+        Ok(folder) => {
+            let _ = tx.send(InboxEvent::TriageComplete { ticket_id, folder });
+            let _ = tx.send(InboxEvent::TriagePersistSeen {
+                ticket_id,
+                updated_at_rfc3339,
+            });
+        }
+        Err(error) => {
+            let _ = tx.send(InboxEvent::TriageFailed { ticket_id, error });
+        }
     }
 }
 
@@ -2258,6 +2301,80 @@ status: open
         assert_eq!(
             atts[0].extracted_text.as_deref().unwrap_or(""),
             "FILE_CONTENT_SENTINEL\n"
+        );
+    }
+
+    /// F2: a failing pipeline must NOT cause the ticket to be persisted as
+    /// "seen". Previously `poll_iteration` inserted the ticket into
+    /// `state.triaged` immediately after spawning the pipeline task, so a
+    /// transient failure was permanently swallowed.
+    #[tokio::test]
+    async fn triage_outcome_failure_does_not_emit_persist_seen() {
+        use std::path::PathBuf;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        emit_triage_outcome_events(
+            44671,
+            "2026-05-12T06:30:30+00:00".into(),
+            Err::<PathBuf, String>("boom".into()),
+            &tx,
+        );
+        drop(tx);
+        let mut got = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            got.push(ev);
+        }
+        assert!(
+            got.iter().any(|e| matches!(
+                e,
+                InboxEvent::TriageFailed {
+                    ticket_id: 44671,
+                    ..
+                }
+            )),
+            "expected TriageFailed, got {got:?}"
+        );
+        assert!(
+            !got.iter()
+                .any(|e| matches!(e, InboxEvent::TriagePersistSeen { .. })),
+            "TriagePersistSeen MUST NOT fire on pipeline failure; got {got:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn triage_outcome_success_emits_complete_then_persist_seen() {
+        use std::path::PathBuf;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        emit_triage_outcome_events(
+            44671,
+            "2026-05-12T06:30:30+00:00".into(),
+            Ok::<PathBuf, String>(PathBuf::from("/tmp/Tickets/44671")),
+            &tx,
+        );
+        drop(tx);
+        let mut got = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            got.push(ev);
+        }
+        // Order: TriageComplete first (refreshes row from disk) then
+        // TriagePersistSeen (persists state to disk). Tests pin both
+        // presence and order.
+        assert!(
+            matches!(
+                got.first(),
+                Some(InboxEvent::TriageComplete {
+                    ticket_id: 44671,
+                    ..
+                })
+            ),
+            "first event should be TriageComplete; got {got:?}"
+        );
+        assert!(
+            got.iter().any(|e| matches!(
+                e,
+                InboxEvent::TriagePersistSeen { ticket_id: 44671, updated_at_rfc3339 }
+                    if updated_at_rfc3339 == "2026-05-12T06:30:30+00:00"
+            )),
+            "expected TriagePersistSeen with the resolved updated_at; got {got:?}"
         );
     }
 }
