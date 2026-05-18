@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # triage-cli installer for macOS and Linux.
-# Usage:  curl -fsSL https://raw.githubusercontent.com/midwestman35/triage-cli/main/install.sh | sh
+# Usage:  curl -fsSL https://raw.githubusercontent.com/midwestman35/triage-cli/main/install.sh | bash
 # Flags:  --version v0.2.0       Pin to a specific release tag.
-#         --channel prerelease   Allow prereleases when picking "latest".
+#         --channel prerelease   Select the newest release whose "prerelease" flag is true.
 #         --dry-run              Print actions without executing them.
 
 set -euo pipefail
@@ -58,8 +58,19 @@ fi
 step "Querying $API"
 release_json="$(curl -fsSL "$API")"
 if [ "$CHANNEL" = "prerelease" ]; then
-    # Take the first element of the array.
-    TAG="$(printf '%s' "$release_json" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n1)"
+    # Select the newest release whose "prerelease" field is true.
+    # GitHub returns /releases newest-first; we want the first entry where "prerelease":true.
+    if command -v jq >/dev/null 2>&1; then
+        TAG="$(printf '%s' "$release_json" | jq -r '[.[] | select(.prerelease == true)] | first | .tag_name // empty')"
+    else
+        # Pure sed/grep fallback: split on "},{" to isolate each release object,
+        # then pick the first object that contains both "prerelease":true and a tag_name.
+        TAG="$(printf '%s' "$release_json" \
+            | tr -d '\n' \
+            | grep -o '{[^}]*"prerelease": *true[^}]*}' \
+            | head -n1 \
+            | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p')"
+    fi
 else
     TAG="$(printf '%s' "$release_json" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n1)"
 fi
