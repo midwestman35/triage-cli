@@ -103,38 +103,59 @@ fn render_transcript(turns: &[Turn], area: Rect, buf: &mut Buffer) {
 fn render_input(input: &TextArea, area: Rect, buf: &mut Buffer) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" ASK (Ctrl-S send, Esc cancel) ");
+        .title(input_box_title());
     let inner = block.inner(area);
     block.render(area, buf);
     input.render(inner, buf);
 }
 
-fn render_status_line(in_flight: Option<&InFlightState>, area: Rect, buf: &mut Buffer) {
-    let text = match in_flight {
+/// F11-label: title of the chat input box. "Esc" exits the chat
+/// session, but only *after* an in-flight provider call returns —
+/// so labelling it "cancel" misleads the user into thinking the
+/// keystroke aborts the network call.
+fn input_box_title() -> &'static str {
+    " ASK (Ctrl-S send, Esc exit chat) "
+}
+
+/// F11-label: the throbber text shown while a provider call is in
+/// flight. Previously suffixed with "(Esc to cancel)" — Esc is
+/// buffered, not actioned, during the blocking await. Drop the
+/// false affordance and just report elapsed time.
+fn throbber_status_line(in_flight: Option<&InFlightState>) -> String {
+    match in_flight {
         Some(s) => {
             let frame = THROBBER_FRAMES[s.frame_idx % THROBBER_FRAMES.len()];
-            format!(
-                " {frame} codex is thinking… {:.1}s elapsed (Esc to cancel)",
-                s.elapsed_s
-            )
+            format!(" {frame} codex is thinking… {:.1}s elapsed", s.elapsed_s)
         }
-        None => "".to_string(),
-    };
+        None => String::new(),
+    }
+}
+
+fn render_status_line(in_flight: Option<&InFlightState>, area: Rect, buf: &mut Buffer) {
+    let text = throbber_status_line(in_flight);
     Paragraph::new(text)
         .style(Style::default().fg(CODEX_HEADER))
         .render(area, buf);
 }
 
-fn render_command_bar(area: Rect, buf: &mut Buffer) {
-    let cmds = [
+/// F11-label: keystrokes shown in the bottom command bar. Esc is now
+/// labelled "exit chat" to match what it actually does — close the
+/// chat session — rather than the previous "cancel" wording that
+/// implied it interrupts an in-flight provider call.
+fn command_bar_labels() -> &'static [(&'static str, &'static str)] {
+    &[
         ("Ctrl-S", "send"),
         ("Ctrl-F", "file"),
         ("Ctrl-V", "paste"),
         ("Ctrl-R", "/revise"),
         ("Ctrl-T", "retry"),
-        ("Esc", "cancel"),
+        ("Esc", "exit chat"),
         ("Ctrl-C", "quit"),
-    ];
+    ]
+}
+
+fn render_command_bar(area: Rect, buf: &mut Buffer) {
+    let cmds = command_bar_labels();
     let mut spans = vec![Span::raw(" ")];
     for (i, (key, desc)) in cmds.iter().enumerate() {
         if i > 0 {
@@ -315,5 +336,58 @@ mod tests {
             ChatCommand::Body(s) => assert_eq!(s, "what happened?"),
             _ => panic!("expected Body"),
         }
+    }
+
+    /// F11-label: the chat TUI claimed "Esc to cancel" in three places —
+    /// the input-box title, the in-flight throbber, and the command bar.
+    /// Esc *does* close the chat session, but only after the in-flight
+    /// `provider.followup().await` returns: the single-threaded event
+    /// loop is blocked, so an "Esc cancel" press is buffered, not acted
+    /// on. These tests pin the labels to behavior the user can actually
+    /// expect.
+    #[test]
+    fn command_bar_labels_do_not_advertise_cancel() {
+        let labels = command_bar_labels();
+        let esc = labels
+            .iter()
+            .find(|(k, _)| *k == "Esc")
+            .expect("Esc must be in the bar");
+        assert!(
+            !esc.1.eq_ignore_ascii_case("cancel"),
+            "Esc must not claim to 'cancel' — provider calls aren't interruptible: {esc:?}"
+        );
+        assert!(
+            !esc.1.contains("cancel"),
+            "any 'cancel' wording is misleading: {esc:?}"
+        );
+    }
+
+    #[test]
+    fn throbber_in_flight_does_not_claim_cancel() {
+        let s = InFlightState {
+            elapsed_s: 2.3,
+            frame_idx: 0,
+        };
+        let line = throbber_status_line(Some(&s));
+        assert!(
+            !line.contains("cancel"),
+            "in-flight throbber must not advertise Esc cancel — provider call is uninterruptible: {line:?}"
+        );
+        // It must still display elapsed time so the user knows the call is running.
+        assert!(line.contains("2.3"), "elapsed time missing: {line:?}");
+    }
+
+    #[test]
+    fn throbber_with_no_in_flight_is_empty() {
+        assert_eq!(throbber_status_line(None), "");
+    }
+
+    #[test]
+    fn input_box_title_does_not_claim_cancel() {
+        let title = input_box_title();
+        assert!(
+            !title.contains("cancel"),
+            "input box title must not advertise cancel: {title:?}"
+        );
     }
 }
