@@ -1,0 +1,136 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build (e.g., v0.2.0)'
+        required: true
+
+permissions:
+  contents: write  # required to create a GitHub Release
+
+env:
+  RUSTFLAGS: "-D warnings"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: triage-cli-x86_64-windows.zip
+            binary: triage-cli.exe
+          - runner: macos-14
+            target: aarch64-apple-darwin
+            archive: triage-cli-aarch64-macos.tar.gz
+            binary: triage-cli
+          - runner: macos-13
+            target: x86_64-apple-darwin
+            archive: triage-cli-x86_64-macos.tar.gz
+            binary: triage-cli
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: triage-cli-x86_64-linux.tar.gz
+            binary: triage-cli
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (1.95.0)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: triage-cli-rs -> triage-cli-rs/target
+          key: ${{ matrix.target }}
+
+      - name: cargo build --release
+        working-directory: triage-cli-rs
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Assemble archive (Windows)
+        if: matrix.runner == 'windows-latest'
+        shell: pwsh
+        run: |
+          $stage = "stage"
+          New-Item -ItemType Directory -Path $stage | Out-Null
+          Copy-Item "triage-cli-rs/target/${{ matrix.target }}/release/${{ matrix.binary }}" $stage
+          Copy-Item "apex-cnc-inventory.md" $stage
+          Compress-Archive -Path "$stage/*" -DestinationPath "${{ matrix.archive }}"
+
+      - name: Assemble archive (Unix)
+        if: matrix.runner != 'windows-latest'
+        run: |
+          mkdir -p stage
+          cp "triage-cli-rs/target/${{ matrix.target }}/release/${{ matrix.binary }}" stage/
+          cp apex-cnc-inventory.md stage/
+          tar -C stage -czf "${{ matrix.archive }}" .
+
+      - name: Upload archive as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archive }}
+          path: ${{ matrix.archive }}
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    name: release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (for changelog generation)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history so the changelog walk works
+
+      - name: Download all archives
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Flatten and compute SHA256SUMS
+        run: |
+          mkdir -p release
+          find artifacts -type f \( -name '*.zip' -o -name '*.tar.gz' \) -exec mv {} release/ \;
+          cd release
+          sha256sum *.zip *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Generate changelog from git log
+        id: changelog
+        run: |
+          PREV=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          {
+            echo 'body<<EOF'
+            if [ -n "$PREV" ]; then
+              echo "Changes since $PREV:"
+              echo ""
+              git log "$PREV..HEAD" --pretty=format:'- %s'
+            else
+              echo "Initial release."
+            fi
+            echo ""
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          body: ${{ steps.changelog.outputs.body }}
+          draft: false
+          prerelease: false
