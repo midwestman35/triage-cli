@@ -15,7 +15,7 @@ use owo_colors::OwoColorize;
 
 const ENV_PATH: &str = ".env";
 
-pub fn doctor() -> ExitCode {
+pub async fn doctor() -> ExitCode {
     let mut ok = true;
     let home = crate::paths::triage_home();
     eprintln!("triage_home: {}", home.display());
@@ -106,6 +106,15 @@ pub fn doctor() -> ExitCode {
                 );
             }
         }
+    }
+
+    if let Some(newer) = check_for_update().await {
+        eprintln!(
+            "{}: update available: {} (you have {}). re-run install.ps1 (or install.sh) to upgrade.",
+            "note".yellow().bold(),
+            newer,
+            env!("CARGO_PKG_VERSION"),
+        );
     }
 
     if ok {
@@ -270,4 +279,93 @@ fn write_env_file(path: &Path, entries: &[(String, String)]) -> std::io::Result<
         }
     }
     Ok(())
+}
+
+/// Best-effort check against the latest GitHub Release tag. Returns the new
+/// version string if a strictly-newer release exists, else `None`. Any
+/// failure (network, timeout, JSON parse, semver compare, GH rate limit)
+/// resolves to `None` — this is opportunistic icing on doctor, not a
+/// critical check.
+async fn check_for_update() -> Option<String> {
+    let current = env!("CARGO_PKG_VERSION");
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .user_agent(format!("triage-cli/{}", current))
+        .build()
+        .ok()?;
+    let resp = client
+        .get("https://api.github.com/repos/midwestman35/triage-cli/releases/latest")
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let json: serde_json::Value = resp.json().await.ok()?;
+    let tag = json.get("tag_name")?.as_str()?.trim_start_matches('v');
+    if is_strictly_newer(tag, current) {
+        Some(tag.to_string())
+    } else {
+        None
+    }
+}
+
+/// Naive semver compare: split on `.`, compare numeric components
+/// left-to-right. Returns true if `a` is strictly greater than `b`.
+/// Pre-release suffixes (e.g., `-rc1`) are stripped before comparison —
+/// we only nudge users between stable releases, not from `0.2.0-rc1` to
+/// `0.2.0`.
+fn is_strictly_newer(a: &str, b: &str) -> bool {
+    fn parts(s: &str) -> Vec<u32> {
+        s.split('-')
+            .next()
+            .unwrap_or("")
+            .split('.')
+            .filter_map(|p| p.parse().ok())
+            .collect()
+    }
+    let ap = parts(a);
+    let bp = parts(b);
+    let n = ap.len().max(bp.len());
+    for i in 0..n {
+        let av = ap.get(i).copied().unwrap_or(0);
+        let bv = bp.get(i).copied().unwrap_or(0);
+        if av > bv {
+            return true;
+        }
+        if av < bv {
+            return false;
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::is_strictly_newer;
+
+    #[test]
+    fn newer_patch() {
+        assert!(is_strictly_newer("0.2.1", "0.2.0"));
+    }
+    #[test]
+    fn newer_minor() {
+        assert!(is_strictly_newer("0.3.0", "0.2.5"));
+    }
+    #[test]
+    fn same_version() {
+        assert!(!is_strictly_newer("0.2.0", "0.2.0"));
+    }
+    #[test]
+    fn older() {
+        assert!(!is_strictly_newer("0.1.9", "0.2.0"));
+    }
+    #[test]
+    fn pre_release_a() {
+        assert!(!is_strictly_newer("0.2.0-rc1", "0.2.0"));
+    }
+    #[test]
+    fn pre_release_b() {
+        assert!(!is_strictly_newer("0.2.0", "0.2.0-rc1"));
+    }
 }

@@ -200,7 +200,7 @@ struct WatchCmd {
 pub fn run() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
-        Cmd::Doctor => setup::doctor(),
+        Cmd::Doctor => async_run(setup::doctor),
         Cmd::Setup => setup::setup(),
         Cmd::BuildMap => cmd_build_map(),
         Cmd::MigrateHome => cmd_migrate_home(),
