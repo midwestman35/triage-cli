@@ -17,6 +17,16 @@ const ENV_PATH: &str = ".env";
 
 pub fn doctor() -> ExitCode {
     let mut ok = true;
+    let home = crate::paths::triage_home();
+    eprintln!("triage_home: {}", home.display());
+    eprintln!("  .env:                  {}", home.join(".env").display());
+    eprintln!("  MEMORY.md:             {}", home.join("MEMORY.md").display());
+    eprintln!("  apex-cnc-inventory.md: {}", home.join("apex-cnc-inventory.md").display());
+    eprintln!("  data/cnc-map.json:     {}", home.join("data/cnc-map.json").display());
+    eprintln!("  data/memory.db:        {}", home.join("data/memory.db").display());
+    eprintln!("  Tickets/:              {}", crate::ticket_folder::tickets_root().display());
+    eprintln!();
+
     eprintln!("Zendesk:");
     for var in ["ZENDESK_SUBDOMAIN", "ZENDESK_EMAIL", "ZENDESK_API_TOKEN"] {
         if env::var(var).map(|v| !v.is_empty()).unwrap_or(false) {
@@ -80,6 +90,22 @@ pub fn doctor() -> ExitCode {
             "  {} Datadog not configured — --no-logs will be forced",
             "⚠".yellow()
         );
+    }
+
+    let inv = home.join("apex-cnc-inventory.md");
+    let map = home.join("data/cnc-map.json");
+    if let (Ok(inv_md), Ok(map_md)) = (
+        std::fs::metadata(&inv),
+        std::fs::metadata(&map),
+    ) {
+        if let (Ok(inv_mt), Ok(map_mt)) = (inv_md.modified(), map_md.modified()) {
+            if inv_mt > map_mt {
+                eprintln!(
+                    "{}: cnc-map is stale; run triage-cli build-map to refresh.",
+                    "warning".yellow().bold()
+                );
+            }
+        }
     }
 
     if ok {
