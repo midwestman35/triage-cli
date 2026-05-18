@@ -650,8 +650,9 @@ fn collect_base_evidence_entries(bundle: &TriageBundle) -> Vec<crate::models::Ba
 }
 
 /// The current analyst's identifier for `STATE.md`. Falls back through
-/// `TRIAGE_OWNER` → `USER` → "unknown" so the soft-lock has a useful value
-/// even in headless / CI environments.
+/// `TRIAGE_OWNER` → `USER` (unix) → `USERNAME` (Windows) → "unknown" so the
+/// soft-lock has a useful value even in headless / CI environments and on
+/// Windows where `$USER` does not exist.
 fn current_owner() -> String {
     if let Ok(v) = std::env::var("TRIAGE_OWNER") {
         if !v.trim().is_empty() {
@@ -659,6 +660,11 @@ fn current_owner() -> String {
         }
     }
     if let Ok(v) = std::env::var("USER") {
+        if !v.trim().is_empty() {
+            return v;
+        }
+    }
+    if let Ok(v) = std::env::var("USERNAME") {
         if !v.trim().is_empty() {
             return v;
         }
@@ -2897,5 +2903,33 @@ validator_warnings: []\n---\n";
         assert!(result.contains("[truncated]"));
         // Marker overage is documented; allow ~14 bytes slack.
         assert!(result.len() <= BODY_SNAPSHOT_CAP_BYTES + 32);
+    }
+
+    #[test]
+    fn current_owner_falls_back_to_username_when_user_unset() {
+        // Save and clear both vars so we test in a known state.
+        let prev_user = std::env::var("USER").ok();
+        let prev_username = std::env::var("USERNAME").ok();
+        let prev_triage_owner = std::env::var("TRIAGE_OWNER").ok();
+
+        std::env::remove_var("USER");
+        std::env::remove_var("TRIAGE_OWNER");
+        std::env::set_var("USERNAME", "alice");
+
+        assert_eq!(current_owner(), "alice");
+
+        // Restore.
+        match prev_user {
+            Some(v) => std::env::set_var("USER", v),
+            None => std::env::remove_var("USER"),
+        }
+        match prev_username {
+            Some(v) => std::env::set_var("USERNAME", v),
+            None => std::env::remove_var("USERNAME"),
+        }
+        match prev_triage_owner {
+            Some(v) => std::env::set_var("TRIAGE_OWNER", v),
+            None => std::env::remove_var("TRIAGE_OWNER"),
+        }
     }
 }

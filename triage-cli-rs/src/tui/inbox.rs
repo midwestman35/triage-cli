@@ -1962,6 +1962,7 @@ async fn send_analyst_turn(
             ts: chrono::Utc::now(),
             author: std::env::var("TRIAGE_OWNER")
                 .or_else(|_| std::env::var("USER"))
+                .or_else(|_| std::env::var("USERNAME"))
                 .ok(),
             body: body.to_string(),
             evidence,
