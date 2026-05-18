@@ -120,6 +120,13 @@ if (-not $DryRun) {
             Write-Host "warning: existing apex-cnc-inventory.md has local edits; new copy saved as apex-cnc-inventory.md.new" -ForegroundColor Yellow
         }
     }
+
+    # Seed .env.example if not already present.
+    $envSrc = Join-Path $unpack '.env.example'
+    $envDst = Join-Path $DataDir '.env.example'
+    if ((Test-Path $envSrc) -and (-not (Test-Path $envDst))) {
+        Copy-Item $envSrc $envDst
+    }
 }
 
 # 8. PATH management.

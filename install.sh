@@ -1,11 +1,11 @@
-#!/usr/bin/env sh
+#!/usr/bin/env bash
 # triage-cli installer for macOS and Linux.
 # Usage:  curl -fsSL https://raw.githubusercontent.com/midwestman35/triage-cli/main/install.sh | sh
 # Flags:  --version v0.2.0       Pin to a specific release tag.
 #         --channel prerelease   Allow prereleases when picking "latest".
 #         --dry-run              Print actions without executing them.
 
-set -eu
+set -euo pipefail
 
 REPO="midwestman35/triage-cli"
 VERSION=""
@@ -129,6 +129,13 @@ if [ -z "$DRY_RUN" ]; then
             cp "$INV_SRC" "$INV_DST.new"
             echo "warning: existing apex-cnc-inventory.md has local edits; new copy saved as apex-cnc-inventory.md.new" >&2
         fi
+    fi
+
+    # Seed .env.example if not already present.
+    ENVEX_SRC="$TMP/unpack/.env.example"
+    ENVEX_DST="$DATA_DIR/.env.example"
+    if [ -f "$ENVEX_SRC" ] && [ ! -f "$ENVEX_DST" ]; then
+        cp "$ENVEX_SRC" "$ENVEX_DST"
     fi
 fi
 

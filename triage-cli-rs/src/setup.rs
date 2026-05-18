@@ -205,6 +205,16 @@ pub fn setup() -> ExitCode {
         return ExitCode::FAILURE;
     }
     eprintln!("{} wrote {} ({} keys)", "✓".green(), ENV_PATH, next.len());
+
+    eprintln!();
+    eprintln!("{} regenerating data/cnc-map.json from inventory...", "→".cyan());
+    if crate::build_map::run() == ExitCode::SUCCESS {
+        eprintln!("{} cnc-map regenerated", "✓".green());
+    } else {
+        eprintln!("{} build-map failed", "⚠".yellow());
+        eprintln!("  (you can re-run `triage-cli build-map` manually)");
+    }
+
     eprintln!("Run `triage-cli doctor` next to verify.");
     ExitCode::SUCCESS
 }

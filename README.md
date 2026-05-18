@@ -69,7 +69,7 @@ The script does not require admin privileges and never modifies machine-wide set
 ### macOS / Linux
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/midwestman35/triage-cli/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/midwestman35/triage-cli/main/install.sh | bash
 ```
 
 Installs the binary into `~/.local/bin/triage-cli` and seeds the data directory at `~/Library/Application Support/triage-cli/` (macOS) or `${XDG_DATA_HOME:-~/.local/share}/triage-cli/` (Linux).

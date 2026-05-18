@@ -69,6 +69,7 @@ jobs:
           New-Item -ItemType Directory -Path $stage | Out-Null
           Copy-Item "triage-cli-rs/target/${{ matrix.target }}/release/${{ matrix.binary }}" $stage
           Copy-Item "apex-cnc-inventory.md" $stage
+          Copy-Item ".env.example" $stage
           Compress-Archive -Path "$stage/*" -DestinationPath "${{ matrix.archive }}"
 
       - name: Assemble archive (Unix)
@@ -77,6 +78,7 @@ jobs:
           mkdir -p stage
           cp "triage-cli-rs/target/${{ matrix.target }}/release/${{ matrix.binary }}" stage/
           cp apex-cnc-inventory.md stage/
+          cp .env.example stage/
           tar -C stage -czf "${{ matrix.archive }}" .
 
       - name: Upload archive as workflow artifact
