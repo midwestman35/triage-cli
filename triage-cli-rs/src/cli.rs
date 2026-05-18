@@ -61,7 +61,7 @@ enum Cmd {
     /// Copy data files from the current directory into `$TRIAGE_HOME`
     /// (or the platform default). Use this once after upgrading from
     /// cwd-coupled installs.
-    MigrateHome,
+    MigrateHome(MigrateHomeCmd),
 }
 
 #[derive(Debug, Args)]
@@ -197,13 +197,22 @@ struct WatchCmd {
     verbose: bool,
 }
 
+#[derive(Debug, Args)]
+struct MigrateHomeCmd {
+    /// Overwrite files that already exist at the destination instead of
+    /// skipping them. Without this flag, existing files are kept and a
+    /// "kept existing <name>" notice is printed to stderr.
+    #[arg(long, default_value_t = false)]
+    force: bool,
+}
+
 pub fn run() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
         Cmd::Doctor => async_run(setup::doctor),
         Cmd::Setup => setup::setup(),
         Cmd::BuildMap => cmd_build_map(),
-        Cmd::MigrateHome => cmd_migrate_home(),
+        Cmd::MigrateHome(c) => cmd_migrate_home(c),
         Cmd::Triage(c) => async_run(|| cmd_triage(c)),
         Cmd::Investigate(c) => async_run(|| cmd_investigate(c)),
         Cmd::Watch(c) => async_run(|| cmd_watch(c)),
@@ -322,13 +331,13 @@ fn cmd_build_map() -> ExitCode {
     build_map::run()
 }
 
-fn cmd_migrate_home() -> ExitCode {
+fn cmd_migrate_home(c: MigrateHomeCmd) -> ExitCode {
     let src = match std::env::current_dir() {
         Ok(d) => d,
         Err(e) => die(&format!("migrate-home: could not determine cwd: {e}")),
     };
     let dest = crate::paths::migrate_home_dest();
-    match crate::paths::migrate_home(&src, &dest) {
+    match crate::paths::migrate_home(&src, &dest, c.force) {
         Ok(path) => {
             eprintln!("Done. You can now run triage-cli from any directory.");
             eprintln!("Files migrated to: {}", path.display());
