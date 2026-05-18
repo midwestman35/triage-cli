@@ -12,7 +12,6 @@
 //! Soft-lock semantics (Anchor C, spec § 7) are handled by task #5; this
 //! module only writes — the caller decides whether overwriting is OK.
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
@@ -125,14 +124,14 @@ pub fn write_ticket_folder(
         }
     }
 
-    atomic_write(&intake, &render_intake_md(&report.intake))?;
-    atomic_write(
+    atomic_write_str(&intake, &render_intake_md(&report.intake))?;
+    atomic_write_str(
         &evidence_preflight,
         &render_evidence_preflight_md(&report.evidence_preflight),
     )?;
-    atomic_write(&fork_packet, &render_fork_packet_md(&report.fork_packet))?;
-    atomic_write(&drafts, &render_drafts_md(&report.drafts))?;
-    atomic_write(&state, &new_state_content)?;
+    atomic_write_str(&fork_packet, &render_fork_packet_md(&report.fork_packet))?;
+    atomic_write_str(&drafts, &render_drafts_md(&report.drafts))?;
+    atomic_write_str(&state, &new_state_content)?;
 
     Ok(TicketFolderPaths {
         folder,
@@ -156,26 +155,36 @@ pub fn stash_debug_response(
     std::fs::create_dir_all(&folder)?;
     let stamp = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
     let path = folder.join(format!("llm-response-{stamp}.json"));
-    atomic_write(&path, raw_response)?;
+    atomic_write_str(&path, raw_response)?;
     Ok(path)
 }
 
-fn atomic_write(target: &Path, contents: &str) -> Result<(), TicketFolderError> {
+/// Atomically write `contents` to `target` (tempfile + fsync + rename).
+/// Reused by `chat.rs` for CONVERSATION.md regeneration and snapshot
+/// files; do not extend with ticket-folder-specific logic.
+pub(crate) fn atomic_write(target: &Path, contents: &[u8]) -> std::io::Result<()> {
     let parent = target.parent().ok_or_else(|| {
-        TicketFolderError::Io(std::io::Error::other(format!(
-            "target {} has no parent directory",
-            target.display()
-        )))
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("destination has no parent directory: {}", target.display()),
+        )
     })?;
+    std::fs::create_dir_all(parent)?;
     let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
-    tmp.write_all(contents.as_bytes())?;
-    if !contents.ends_with('\n') {
-        tmp.write_all(b"\n")?;
-    }
-    tmp.flush()?;
-    tmp.persist(target)
-        .map_err(|e| TicketFolderError::Io(e.error))?;
+    use std::io::Write;
+    tmp.as_file_mut().write_all(contents)?;
+    tmp.as_file_mut().sync_all()?;
+    tmp.persist(target).map_err(std::io::Error::other)?;
     Ok(())
+}
+
+/// Wrapper around atomic_write for ticket-folder string contents.
+fn atomic_write_str(target: &Path, contents: &str) -> Result<(), TicketFolderError> {
+    let mut buf = contents.as_bytes().to_vec();
+    if !contents.ends_with('\n') {
+        buf.push(b'\n');
+    }
+    atomic_write(target, &buf).map_err(TicketFolderError::Io)
 }
 
 //
@@ -926,7 +935,7 @@ mod tests {
     fn atomic_write_creates_target() {
         let tmp = TempDir::new().unwrap();
         let target = tmp.path().join("out.txt");
-        atomic_write(&target, "hello").unwrap();
+        atomic_write_str(&target, "hello").unwrap();
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "hello\n");
     }
 
@@ -934,7 +943,7 @@ mod tests {
     fn atomic_write_appends_trailing_newline() {
         let tmp = TempDir::new().unwrap();
         let target = tmp.path().join("a.txt");
-        atomic_write(&target, "line\n").unwrap();
+        atomic_write_str(&target, "line\n").unwrap();
         // Should not double up newlines.
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "line\n");
     }

@@ -10,6 +10,7 @@
 //! in `cli.rs` for `--tui` flags stay as a useful "this was here, now
 //! removed" signal.
 
+pub mod chat;
 pub mod inbox;
 
 use std::io::{self, Stdout};

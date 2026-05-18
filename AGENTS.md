@@ -30,7 +30,7 @@ Controlled by `LLM_PROVIDER` env var (default: `unleash`).
 | `unleash` (default) | HTTP to internal Axon gateway | `UNLEASH_API_KEY`, `UNLEASH_ASSISTANT_ID` |
 | `codex` | Subprocess to `codex exec`; inherits Codex OAuth | `codex` CLI on PATH |
 
-The `claude` and `openai` providers were removed 2026-05-14 in favor of unleash + codex (see `docs/adr/0002-prune-claude-openai-providers.md`); if a future Anthropic API path is added, it must work with the enterprise OAuth seat the operator has — i.e. via the `claude` CLI subprocess, not the SDK. Codex reads `CODEX_MODEL` (default `gpt-5-codex`); Unleash ignores any model parameter — the model is selected server-side by `UNLEASH_ASSISTANT_ID`.
+The `claude` and `openai` providers were removed 2026-05-14 in favor of unleash + codex (see `docs/adr/0002-prune-claude-openai-providers.md`); if a future Anthropic API path is added, it must work with the enterprise OAuth seat the operator has — i.e. via the `claude` CLI subprocess, not the SDK. Codex reads `CODEX_MODEL` (default `gpt-5.5`); Unleash ignores any model parameter — the model is selected server-side by `UNLEASH_ASSISTANT_ID`.
 
 ## Memory layer
 
@@ -234,7 +234,8 @@ Logging during the TUI run is redirected to a per-view file printed at startup s
 | Fork rubric loader (embedded + `TRIAGE_RUBRIC_PATH` override) | `triage-cli-rs/src/playbook.rs` |
 | Embedded rubric file | `triage-cli-rs/playbook/fork-rubric.md` |
 | Investigation session + evidence | `triage-cli-rs/src/investigation.rs` |
-| Memory layer (MEMORY.md + SQLite FTS5, schema v2) | `triage-cli-rs/src/memory.rs`, `MEMORY.md`, `data/memory.db` |
+| Memory layer (MEMORY.md + SQLite FTS5, FTS5 `schema_version=2`) | `triage-cli-rs/src/memory.rs`, `MEMORY.md`, `data/memory.db` |
+| Base-evidence manifest (schema v2 per [ADR-0003](docs/adr/0003-base-evidence-body-snapshots.md)) | `triage-cli-rs/src/pipeline.rs` (`collect_base_evidence_entries`), `triage-cli-rs/src/chat.rs` (`write_base_evidence_manifest`); on-disk at `<ticket_dir>/.session/base-evidence-manifest.json` |
 | LLM provider trait + impls | `triage-cli-rs/src/providers/` (`mod.rs`, `unleash.rs`, `codex.rs`) |
 | LLM structured-output dispatch + validator + retry | `triage-cli-rs/src/llm.rs` (`triage_structured`) |
 | PII redaction | `triage-cli-rs/src/redact.rs` |

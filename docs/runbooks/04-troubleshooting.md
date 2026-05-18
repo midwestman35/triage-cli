@@ -32,7 +32,7 @@ codex CLI not found on PATH.
 ```
 
 - `LLM_PROVIDER=unleash` requires `UNLEASH_API_KEY` and `UNLEASH_ASSISTANT_ID`. The Unleash assistant picks the model server-side; the CLI does not pass a model parameter.
-- `LLM_PROVIDER=codex` requires the `codex` CLI on `PATH` and an existing codex OAuth session (run `codex` once interactively to authenticate). The model defaults to `gpt-5-codex`; override with `CODEX_MODEL`.
+- `LLM_PROVIDER=codex` requires the `codex` CLI on `PATH` and an existing codex OAuth session (run `codex` once interactively to authenticate). The model defaults to `gpt-5.5`; override with `CODEX_MODEL`.
 - Only `unleash` and `codex` are accepted as of 2026-05-14. Any other value (`claude`, `openai`, …) is rejected by `doctor`. See `docs/adr/0002-prune-claude-openai-providers.md` for why those providers were removed.
 
 ## Site resolution

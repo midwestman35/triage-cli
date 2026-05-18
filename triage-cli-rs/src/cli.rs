@@ -7,6 +7,7 @@ use std::process::ExitCode;
 
 use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand};
+use dialoguer::Confirm;
 use owo_colors::OwoColorize;
 
 use crate::build_map;
@@ -15,9 +16,12 @@ use crate::extract;
 use crate::fixture::{self, FixtureDatadogClient, FixtureLoader};
 use crate::interactive;
 use crate::investigation;
-use crate::pipeline::{self, InvestigateOptions, MetricValue, MetricsReporter, StderrReporter};
+use crate::pipeline::{
+    self, InvestigateOptions, MetricValue, MetricsReporter, SpinnerReporter, StderrReporter,
+};
 use crate::playbook::Rubric;
 use crate::setup;
+use crate::ticket_folder;
 use crate::tui;
 use crate::watcher::{self, WatcherOptions};
 use crate::zendesk::ZendeskClient;
@@ -366,6 +370,8 @@ async fn cmd_triage(c: TriageCmd) -> ExitCode {
             force: c.force,
             customer_history_override: None,
             memory_hits_override: Some(memory_hits),
+            followup_mode: false,
+            tickets_root: None,
         };
         let rubric = load_rubric_or_die();
         let reporter = MetricsReporter::new(Box::new(StderrReporter { verbose: c.verbose }));
@@ -453,6 +459,8 @@ async fn cmd_triage(c: TriageCmd) -> ExitCode {
         force: c.force,
         customer_history_override: None,
         memory_hits_override: None,
+        followup_mode: false,
+        tickets_root: None,
     };
 
     let rubric = load_rubric_or_die();
@@ -507,11 +515,48 @@ async fn cmd_investigate(c: InvestigateCmd) -> ExitCode {
         }
     }
 
+    // Pre-flight: if a completed investigation already exists on disk, warn and
+    // prompt before burning a network+LLM round-trip. Skipped when --force is
+    // set, since the caller has explicitly opted in to overwriting.
+    if !c.force {
+        let state_path = ticket_folder::tickets_root()
+            .join(ticket_id.to_string())
+            .join("STATE.md");
+        if let Some(existing) = ticket_folder::read_existing_state(&state_path) {
+            let fork = existing.fork.as_deref().unwrap_or("?");
+            let confidence = existing.confidence.as_deref().unwrap_or("?");
+            let owner = existing.owner.as_deref().unwrap_or("unknown");
+            let folder = ticket_folder::tickets_root().join(ticket_id.to_string());
+            eprintln!(
+                "{} ZD-{ticket_id} already has an investigation.\n   Fork: {}  Confidence: {}  Owner: {}\n   Folder: {}",
+                "⚠".yellow().bold(),
+                fork.bold(),
+                confidence,
+                owner.bold(),
+                folder.display(),
+            );
+            if !Confirm::new()
+                .with_prompt("Re-investigate anyway?")
+                .default(false)
+                .interact()
+                .unwrap_or(false)
+            {
+                return ExitCode::SUCCESS;
+            }
+        }
+    }
+
     let zd = match ZendeskClient::from_env() {
         Ok(z) => z,
         Err(e) => die(&e.to_string()),
     };
-    let ticket = match zd.get_ticket(ticket_id).await {
+    let ticket = match pipeline::spinner(
+        &format!("Fetching ticket #{ticket_id}"),
+        true,
+        zd.get_ticket(ticket_id),
+    )
+    .await
+    {
         Ok(t) => t,
         Err(e) => die(&e.to_string()),
     };
@@ -606,6 +651,8 @@ async fn cmd_investigate(c: InvestigateCmd) -> ExitCode {
         force: c.force,
         customer_history_override: None,
         memory_hits_override: fixture_memory,
+        followup_mode: false,
+        tickets_root: None,
     };
 
     if c.tui {
@@ -614,7 +661,9 @@ async fn cmd_investigate(c: InvestigateCmd) -> ExitCode {
              without `--tui` to produce the ticket folder.");
     }
     let rubric = load_rubric_or_die();
-    let reporter = MetricsReporter::new(Box::new(StderrReporter { verbose: c.verbose }));
+    let reporter = MetricsReporter::new(Box::new(SpinnerReporter::new(Box::new(StderrReporter {
+        verbose: c.verbose,
+    }))));
     let effective_dd: Option<&dyn DatadogSource> = fixture_dd
         .as_ref()
         .map(|d| d as &dyn DatadogSource)
@@ -702,6 +751,8 @@ async fn cmd_demo(c: DemoCmd) -> ExitCode {
         force: false,
         customer_history_override: None,
         memory_hits_override: Some(memory_hits),
+        followup_mode: false,
+        tickets_root: None,
     };
     let rubric = load_rubric_or_die();
     let reporter = StderrReporter { verbose: c.verbose };
