@@ -691,7 +691,7 @@ impl InboxApp {
             self.notify("Copied synth summary", NotifyKind::Success);
         } else {
             self.notify(
-                "No clipboard tool found (install pbcopy/wl-copy/xclip)",
+                "Clipboard not available on this system",
                 NotifyKind::Warning,
             );
         }
@@ -1393,36 +1393,17 @@ fn relative_time(dt: DateTime<Utc>, now: DateTime<Utc>) -> String {
     }
 }
 
+/// Copy `text` to the OS clipboard via the `arboard` crate. Returns `true`
+/// on success. `arboard` handles platform differences internally (uses the
+/// native clipboard API on Windows/macOS/Linux X11+Wayland) and is
+/// synchronous — the call returns only after the OS has accepted the text,
+/// removing the wl-copy fork-and-detach race we used to have on Wayland.
 fn copy_to_clipboard(text: &str) -> bool {
-    let candidates: &[&[&str]] = &[
-        &["pbcopy"],
-        &["wl-copy"],
-        &["xclip", "-selection", "clipboard"],
-    ];
-    for cmd in candidates {
-        let Some((bin, args)) = cmd.split_first() else {
-            continue;
-        };
-        let mut command = std::process::Command::new(bin);
-        command.args(args.iter());
-        command.stdin(Stdio::piped());
-        command.stdout(Stdio::null());
-        command.stderr(Stdio::null());
-        let mut child = match command.spawn() {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-        if let Some(mut stdin) = child.stdin.take() {
-            use std::io::Write;
-            let _ = stdin.write_all(text.as_bytes());
-            drop(stdin);
-        }
-        // We deliberately don't wait — clipboard tools either return quickly
-        // or detach. Truly waiting could block xclip indefinitely (it forks
-        // and holds the selection until X clears it).
-        return true;
+    use arboard::Clipboard;
+    match Clipboard::new().and_then(|mut c| c.set_text(text.to_owned())) {
+        Ok(()) => true,
+        Err(_) => false,
     }
-    false
 }
 
 fn open_url(url: &str) -> bool {
