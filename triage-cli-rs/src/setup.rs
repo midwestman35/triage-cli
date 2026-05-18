@@ -109,14 +109,36 @@ pub async fn doctor() -> ExitCode {
 
     let inv = home.join("apex-cnc-inventory.md");
     let map = home.join("data/cnc-map.json");
-    if let (Ok(inv_md), Ok(map_md)) = (std::fs::metadata(&inv), std::fs::metadata(&map)) {
-        if let (Ok(inv_mt), Ok(map_mt)) = (inv_md.modified(), map_md.modified()) {
-            if inv_mt > map_mt {
-                eprintln!(
-                    "{}: cnc-map is stale; run triage-cli build-map to refresh.",
-                    "warning".yellow().bold()
-                );
-            }
+    // F7: missing inventory was previously a silent skip — `ok` stayed true
+    // and `doctor` exited green even though site lookup would no_match on
+    // every ticket. Now it's a hard failure surfaced with the same red ✗
+    // treatment as a missing credential.
+    match evaluate_inventory(&inv, &map) {
+        InventoryVerdict::Ok => {
+            eprintln!(
+                "  {} apex-cnc-inventory.md + data/cnc-map.json present",
+                "✓".green()
+            );
+        }
+        InventoryVerdict::MapStale => {
+            eprintln!(
+                "{}: cnc-map is stale; run triage-cli build-map to refresh.",
+                "warning".yellow().bold()
+            );
+        }
+        InventoryVerdict::MapMissing => {
+            eprintln!(
+                "  {} data/cnc-map.json missing — run `triage-cli build-map` to regenerate",
+                "⚠".yellow()
+            );
+        }
+        InventoryVerdict::MissingInventory => {
+            eprintln!(
+                "  {} apex-cnc-inventory.md missing at {} — site lookup will fail on every ticket",
+                "✗".red(),
+                inv.display()
+            );
+            ok = false;
         }
     }
 
@@ -134,6 +156,39 @@ pub async fn doctor() -> ExitCode {
     } else {
         ExitCode::FAILURE
     }
+}
+
+/// F7: pure verdict for the inventory+map pair so `doctor` can flip
+/// its `ok` flag deterministically and the logic is unit-testable.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum InventoryVerdict {
+    /// Both files exist and the map is at least as fresh as the inventory.
+    Ok,
+    /// Inventory is newer than the map — needs `triage-cli build-map`.
+    MapStale,
+    /// Inventory present but `data/cnc-map.json` missing entirely.
+    /// Recoverable via `triage-cli build-map`; warn but don't fail.
+    MapMissing,
+    /// `apex-cnc-inventory.md` is missing. Site lookup is broken on every
+    /// investigation; `doctor` must fail.
+    MissingInventory,
+}
+
+pub(crate) fn evaluate_inventory(inv: &Path, map: &Path) -> InventoryVerdict {
+    if !inv.exists() {
+        return InventoryVerdict::MissingInventory;
+    }
+    if !map.exists() {
+        return InventoryVerdict::MapMissing;
+    }
+    if let (Ok(inv_md), Ok(map_md)) = (fs::metadata(inv), fs::metadata(map)) {
+        if let (Ok(inv_mt), Ok(map_mt)) = (inv_md.modified(), map_md.modified()) {
+            if inv_mt > map_mt {
+                return InventoryVerdict::MapStale;
+            }
+        }
+    }
+    InventoryVerdict::Ok
 }
 
 fn check_env(var: &'static str, provider: &str, ok: &mut bool) {
@@ -392,5 +447,65 @@ mod version_tests {
     #[test]
     fn pre_release_b() {
         assert!(!is_strictly_newer("0.2.0", "0.2.0-rc1"));
+    }
+}
+
+#[cfg(test)]
+mod inventory_tests {
+    //! F7: `doctor` previously exited green even when
+    //! `apex-cnc-inventory.md` was missing — the whole inventory check
+    //! short-circuited on `fs::metadata` failure, never flipping the
+    //! `ok` flag. Site lookup would then silently no_match on every
+    //! ticket, with no signal at install time.
+    use super::{evaluate_inventory, InventoryVerdict};
+    use std::fs;
+    use std::thread;
+    use std::time::Duration;
+    use tempfile::TempDir;
+
+    #[test]
+    fn missing_inventory_is_a_hard_failure() {
+        let dir = TempDir::new().unwrap();
+        let inv = dir.path().join("apex-cnc-inventory.md");
+        let map = dir.path().join("data/cnc-map.json");
+        // Neither file exists.
+        assert_eq!(
+            evaluate_inventory(&inv, &map),
+            InventoryVerdict::MissingInventory
+        );
+    }
+
+    #[test]
+    fn missing_map_but_present_inventory_is_recoverable() {
+        let dir = TempDir::new().unwrap();
+        let inv = dir.path().join("apex-cnc-inventory.md");
+        fs::write(&inv, "# inv").unwrap();
+        let map = dir.path().join("data/cnc-map.json");
+        // build-map can regenerate the map from the inventory.
+        assert_eq!(evaluate_inventory(&inv, &map), InventoryVerdict::MapMissing);
+    }
+
+    #[test]
+    fn stale_map_returns_stale_verdict() {
+        let dir = TempDir::new().unwrap();
+        let inv = dir.path().join("apex-cnc-inventory.md");
+        let map = dir.path().join("cnc-map.json");
+        // Write the map first, then the inventory — inventory mtime > map mtime
+        // means the map is stale.
+        fs::write(&map, "{}").unwrap();
+        thread::sleep(Duration::from_millis(20));
+        fs::write(&inv, "# inv").unwrap();
+        assert_eq!(evaluate_inventory(&inv, &map), InventoryVerdict::MapStale);
+    }
+
+    #[test]
+    fn fresh_map_returns_ok() {
+        let dir = TempDir::new().unwrap();
+        let inv = dir.path().join("apex-cnc-inventory.md");
+        let map = dir.path().join("cnc-map.json");
+        fs::write(&inv, "# inv").unwrap();
+        thread::sleep(Duration::from_millis(20));
+        fs::write(&map, "{}").unwrap();
+        assert_eq!(evaluate_inventory(&inv, &map), InventoryVerdict::Ok);
     }
 }
