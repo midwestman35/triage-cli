@@ -980,24 +980,15 @@ fn show_full_state_diff(existing_path: &Path, new_content: &str) -> std::io::Res
         }
     }
 
-    // Fallback: `/usr/bin/diff -u`, captured and printed to stderr.
-    let output = Command::new("diff")
-        .arg("-u")
-        .arg(existing_path)
-        .arg(new_path)
-        .output()?;
-    // `diff` exits 1 when files differ — that's the expected case here, not
-    // an error. Only exit codes >= 2 indicate a real failure.
-    if let Some(code) = output.status.code() {
-        if code >= 2 {
-            return Err(std::io::Error::other(format!(
-                "diff failed (exit {code}): {}",
-                String::from_utf8_lossy(&output.stderr)
-            )));
-        }
-    }
-    eprintln!("--- full STATE.md diff ---");
-    eprintln!("{}", String::from_utf8_lossy(&output.stdout));
+    // Fallback: in-process unified diff via the `similar` crate. This used
+    // to shell out to `/usr/bin/diff -u`, which doesn't exist on Windows.
+    let existing_bytes = std::fs::read_to_string(existing_path)?;
+    let new_bytes = std::fs::read_to_string(new_path)?;
+    let diff = similar::TextDiff::from_lines(&existing_bytes, &new_bytes)
+        .unified_diff()
+        .header("STATE.md (existing)", "STATE.md (new)")
+        .to_string();
+    eprintln!("{}", diff);
     Ok(())
 }
 
