@@ -1828,20 +1828,21 @@ async fn run_chat_session(ticket_id: &str) -> anyhow::Result<()> {
                                 clear_textarea(&mut input);
                             }
                             ChatCommand::Retry => {
+                                // F12: forward the original evidence (file
+                                // attachments, labeled pastes) so the retry
+                                // matches what the analyst originally sent
+                                // — not an evidence-less echo of the body.
                                 let retry_outcome = chat::parse_conversation_jsonl(
                                     &chat::conversation_jsonl_path(&ticket_dir),
                                 )?;
-                                if let Some(last_analyst) =
-                                    retry_outcome.turns.iter().rev().find(|t| {
-                                        matches!(t.turn_kind, crate::models::TurnKind::Analyst)
-                                    })
+                                if let Some((body, evidence)) =
+                                    retry_payload_from_turns(&retry_outcome.turns)
                                 {
-                                    let body_clone = last_analyst.body.clone();
                                     send_analyst_turn(
                                         &ticket_dir,
                                         ticket_id,
-                                        &body_clone,
-                                        Vec::new(),
+                                        &body,
+                                        evidence,
                                         provider.as_ref(),
                                         &mut input,
                                     )
@@ -1881,6 +1882,23 @@ fn next_turn_number(ticket_dir: &Path) -> anyhow::Result<u32> {
 /// Pastes are inlined into the prompt (they have no file path). Files
 /// become Attachment entries; their content flows through the provider's
 /// native attachments channel.
+/// F12: pull the body + original evidence off the most recent analyst
+/// turn so `/retry` can resend the same prompt-and-attachments tuple to
+/// the provider. Previously the retry branch only cloned `body` and
+/// passed `Vec::new()` for evidence, so any file or paste the analyst
+/// had attached to the original turn was silently dropped from the
+/// retry. Codex replies and system turns are skipped because retry
+/// only makes sense for an analyst-initiated turn.
+fn retry_payload_from_turns(
+    turns: &[crate::models::Turn],
+) -> Option<(String, Vec<crate::models::EvidenceProvenance>)> {
+    turns
+        .iter()
+        .rev()
+        .find(|t| matches!(t.turn_kind, crate::models::TurnKind::Analyst))
+        .map(|t| (t.body.clone(), t.evidence.clone()))
+}
+
 fn build_followup_message(
     body: &str,
     evidence: &[crate::models::EvidenceProvenance],
@@ -2259,5 +2277,118 @@ status: open
             atts[0].extracted_text.as_deref().unwrap_or(""),
             "FILE_CONTENT_SENTINEL\n"
         );
+    }
+
+    /// F12: `/retry` re-sends the most recent analyst turn's body to the
+    /// provider, but previously passed `Vec::new()` for evidence — so any
+    /// files or pastes attached to the original turn were silently
+    /// dropped. The retry would then succeed without the context the
+    /// user expected the provider to see again, producing a confusing
+    /// "the model forgot my attachment" experience.
+    use crate::models::{EvidenceProvenance, ExtractionStatus, FileType, Turn, TurnKind};
+
+    fn paste_provenance(label: &str, body: &str) -> EvidenceProvenance {
+        EvidenceProvenance::Paste {
+            label: label.into(),
+            body: body.into(),
+            bytes: body.len() as u64,
+            sent_to_provider: true,
+        }
+    }
+
+    fn file_provenance(basename: &str) -> EvidenceProvenance {
+        EvidenceProvenance::File {
+            source_path: PathBuf::from(format!("/src/{basename}")),
+            copied_path: PathBuf::from(format!("/copies/{basename}")),
+            basename: basename.into(),
+            sha256: "deadbeef".into(),
+            bytes: 10,
+            detected_type: FileType::Log,
+            extraction: ExtractionStatus::Full,
+            truncated: false,
+            truncation_note: None,
+            sent_to_provider: true,
+        }
+    }
+
+    fn analyst_turn_with_evidence(
+        turn: u32,
+        body: &str,
+        evidence: Vec<EvidenceProvenance>,
+    ) -> Turn {
+        Turn {
+            schema: "triage-cli/conversation".into(),
+            schema_version: 1,
+            ticket_id: "44776".into(),
+            turn,
+            turn_kind: TurnKind::Analyst,
+            ts: chrono::Utc::now(),
+            author: Some("enrique".into()),
+            body: body.into(),
+            evidence,
+            provider: None,
+            model: None,
+            tokens_in: None,
+            tokens_out: None,
+            elapsed_s: None,
+            session_id: None,
+            resumed: None,
+            action: None,
+            outcome: None,
+            drove_revision_from_turns: None,
+            diff: None,
+        }
+    }
+
+    fn codex_reply_turn(turn: u32) -> Turn {
+        Turn {
+            turn_kind: TurnKind::Codex,
+            evidence: vec![],
+            ..analyst_turn_with_evidence(turn, "codex reply", vec![])
+        }
+    }
+
+    #[test]
+    fn retry_payload_preserves_attached_evidence_from_last_analyst_turn() {
+        let turns = vec![analyst_turn_with_evidence(
+            1,
+            "what does this say?",
+            vec![paste_provenance("operator-note", "audio drops at 09:30")],
+        )];
+        let (body, evidence) =
+            retry_payload_from_turns(&turns).expect("a retry-able analyst turn exists");
+        assert_eq!(body, "what does this say?");
+        assert_eq!(
+            evidence.len(),
+            1,
+            "/retry must forward the original evidence, not Vec::new()"
+        );
+        match &evidence[0] {
+            EvidenceProvenance::Paste { label, .. } => assert_eq!(label, "operator-note"),
+            other => panic!("expected Paste, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn retry_payload_picks_last_analyst_skipping_codex_replies() {
+        let turns = vec![
+            analyst_turn_with_evidence(1, "q1", vec![paste_provenance("a", "1")]),
+            codex_reply_turn(2),
+            analyst_turn_with_evidence(3, "q2", vec![file_provenance("diag.log")]),
+            codex_reply_turn(4),
+        ];
+        let (body, evidence) = retry_payload_from_turns(&turns).expect("q2 is retry-able");
+        assert_eq!(body, "q2", "retry must use the most recent analyst body");
+        match &evidence[0] {
+            EvidenceProvenance::File { basename, .. } => assert_eq!(basename, "diag.log"),
+            other => panic!("expected File from q2's attachments, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn retry_payload_returns_none_when_no_analyst_turn_exists() {
+        let only_system: Vec<Turn> = vec![codex_reply_turn(1)];
+        assert!(retry_payload_from_turns(&only_system).is_none());
+        assert!(retry_payload_from_turns(&[]).is_none());
     }
 }
