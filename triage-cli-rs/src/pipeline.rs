@@ -43,6 +43,13 @@ pub enum PipelineError {
     TicketFolder(#[from] TicketFolderError),
     #[error("followup: {0}")]
     Followup(#[from] FollowupError),
+    /// F13: base-ticket or base-evidence-manifest snapshot could not be
+    /// persisted to `<ticket_dir>/.session/`. Surfacing this as a hard
+    /// error rather than a soft warning ensures the deliverable is honest:
+    /// /revise would otherwise fail later with `BaseSnapshotMissing` and
+    /// the user would have no way to recover the original bundle.
+    #[error("base snapshot write failed: {0}")]
+    BaseSnapshot(#[from] crate::chat::ChatError),
 }
 
 #[derive(Debug, Error)]
@@ -477,17 +484,23 @@ pub async fn investigate_one_structured(
 
     // Base snapshots for the interactive investigation feature
     // (spec § 5.4). Skipped when `followup_mode` is true.
+    //
+    // F13: snapshot writes are now load-bearing. `/revise` (in this file)
+    // reads `base-ticket.json` and `base-evidence-manifest.json` with no
+    // fallback, so a silently-skipped snapshot turns into a
+    // `BaseSnapshotMissing` failure later — long after the original
+    // ticket + bundle are gone. Surface the failure here as a hard error
+    // so the analyst can fix the underlying I/O problem (disk full,
+    // permissions, race with a stray file at `.session`) and re-run.
     if !opts.followup_mode {
         let ticket_dir = opts
             .tickets_root
             .clone()
             .unwrap_or_else(ticket_folder::tickets_root)
             .join(ticket.id.to_string());
-        // Best-effort: snapshot write failure is logged but does not
-        // fail the investigation. The /revise path treats missing
-        // snapshots as a re-fetch trigger.
         if let Err(e) = crate::chat::write_base_ticket(&ticket_dir, &ticket) {
             reporter.phase_failed("base_ticket_snapshot", &e.to_string());
+            return Err(PipelineError::BaseSnapshot(e));
         }
         let bem = crate::models::BaseEvidenceManifest {
             schema: "triage-cli/base-evidence".into(),
@@ -498,6 +511,7 @@ pub async fn investigate_one_structured(
         };
         if let Err(e) = crate::chat::write_base_evidence_manifest(&ticket_dir, &bem) {
             reporter.phase_failed("base_evidence_snapshot", &e.to_string());
+            return Err(PipelineError::BaseSnapshot(e));
         }
     }
 
@@ -3412,5 +3426,71 @@ validator_warnings: []\n---\n";
             Some(v) => std::env::set_var("TRIAGE_OWNER", v),
             None => std::env::remove_var("TRIAGE_OWNER"),
         }
+    }
+
+    /// F13: snapshot writes were silently swallowed with `phase_failed`,
+    /// so an investigation could succeed while leaving no base snapshots
+    /// on disk. The `/revise` path then hard-failed later with
+    /// `BaseSnapshotMissing`, by which time the original ticket + bundle
+    /// were unrecoverable. The fix is to surface the failure
+    /// synchronously: the investigation must fail (and not write a
+    /// half-state) when snapshots can't be persisted.
+    #[tokio::test]
+    async fn investigate_fails_when_base_snapshot_cannot_be_written() {
+        let dir = tempfile::tempdir().unwrap();
+        // Force snapshot writes to fail: pre-create `.session` as a regular
+        // file inside the ticket folder so `create_dir_all` on the parent
+        // returns an error.
+        let ticket_dir = dir.path().join("55001");
+        std::fs::create_dir_all(&ticket_dir).unwrap();
+        std::fs::write(ticket_dir.join(".session"), b"not-a-directory").unwrap();
+
+        let fixtures_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let loader = crate::fixture::FixtureLoader::new(fixtures_dir.join("audio-drop"))
+            .expect("audio-drop fixture must exist");
+        let ticket = loader.load_ticket().expect("ticket.json");
+        let logs = loader.load_datadog_logs().expect("datadog-logs.json");
+        let memory_hits = loader.load_memory_hits().expect("memory-hits.json");
+
+        let mut session = crate::investigation::create_session(ticket.clone());
+        let dd = crate::fixture::FixtureDatadogClient::new(logs);
+        let opts = InvestigateOptions {
+            no_llm: true,
+            memory_hits_override: Some(memory_hits),
+            force: true,
+            followup_mode: false,
+            tickets_root: Some(dir.path().to_path_buf()),
+            ..InvestigateOptions::defaults()
+        };
+        let rubric = Rubric::load().expect("embedded rubric");
+
+        let memory_md = dir.path().join("MEMORY.md");
+        let memory_db = dir.path().join("data/memory.db");
+        let _env = crate::memory::MemoryEnvScope::new_with_tickets_root(
+            &memory_md,
+            &memory_db,
+            Some(dir.path()),
+        );
+
+        let result = investigate_one_structured(
+            ticket,
+            &mut session,
+            Some(&dd as &dyn crate::datadog::DatadogSource),
+            &rubric,
+            &SilentReporter,
+            &opts,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(PipelineError::BaseSnapshot(_))),
+            "expected PipelineError::BaseSnapshot on snapshot write failure, got {result:?}"
+        );
+
+        // And the manifests are NOT readable — the failure must be honest:
+        // we did not write half-state.
+        assert!(
+            crate::chat::read_base_ticket(&ticket_dir).is_err(),
+            "base-ticket.json must NOT exist when the pipeline reports a snapshot failure"
+        );
     }
 }
