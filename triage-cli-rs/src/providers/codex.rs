@@ -238,7 +238,7 @@ fn looks_like_session_lost(stderr: &str) -> bool {
     stderr.contains("no rollout found for thread id")
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod followup_tests {
     use super::*;
     use std::env;

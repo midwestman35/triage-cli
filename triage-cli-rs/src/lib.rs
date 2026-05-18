@@ -13,6 +13,7 @@ pub mod investigation;
 pub mod llm;
 pub mod memory;
 pub mod models;
+pub mod paths;
 pub mod pipeline;
 pub mod playbook;
 pub mod providers;

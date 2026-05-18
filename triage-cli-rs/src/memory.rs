@@ -55,15 +55,17 @@ pub enum MemoryError {
 }
 
 fn memory_md_path() -> PathBuf {
-    std::env::var(MEMORY_MD_ENV)
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(MEMORY_MD))
+    if let Ok(v) = std::env::var(MEMORY_MD_ENV) {
+        return PathBuf::from(v);
+    }
+    crate::paths::triage_home().join(MEMORY_MD)
 }
 
 fn memory_db_path() -> PathBuf {
-    std::env::var(MEMORY_DB_ENV)
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(MEMORY_DB))
+    if let Ok(v) = std::env::var(MEMORY_DB_ENV) {
+        return PathBuf::from(v);
+    }
+    crate::paths::triage_home().join(MEMORY_DB)
 }
 
 /// Open (or create) the SQLite database, run the v1 column migration if

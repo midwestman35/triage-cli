@@ -23,7 +23,6 @@ use crate::models::{
 };
 
 pub const TICKETS_ROOT_ENV: &str = "TRIAGE_TICKETS_ROOT";
-pub const DEFAULT_TICKETS_ROOT: &str = "./Tickets";
 
 #[derive(Debug, Error)]
 pub enum TicketFolderError {
@@ -70,11 +69,12 @@ pub struct TicketFolderPaths {
 }
 
 /// Resolve the configured tickets root: `TRIAGE_TICKETS_ROOT` env var,
-/// or `./Tickets` if unset.
+/// or `<triage_home>/Tickets` if unset.
 pub fn tickets_root() -> PathBuf {
-    std::env::var(TICKETS_ROOT_ENV)
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(DEFAULT_TICKETS_ROOT))
+    if let Ok(v) = std::env::var(TICKETS_ROOT_ENV) {
+        return PathBuf::from(v);
+    }
+    crate::paths::triage_home().join("Tickets")
 }
 
 /// Write the five-markdown ticket folder. `owner` (email/identifier) is

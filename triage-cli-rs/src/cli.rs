@@ -58,6 +58,10 @@ enum Cmd {
     /// Run a canned demo fixture without credentials. Lists available fixtures
     /// when called without a name.
     Demo(DemoCmd),
+    /// Copy data files from the current directory into `$TRIAGE_HOME`
+    /// (or the platform default). Use this once after upgrading from
+    /// cwd-coupled installs.
+    MigrateHome,
 }
 
 #[derive(Debug, Args)]
@@ -196,9 +200,10 @@ struct WatchCmd {
 pub fn run() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
-        Cmd::Doctor => setup::doctor(),
+        Cmd::Doctor => async_run(setup::doctor),
         Cmd::Setup => setup::setup(),
         Cmd::BuildMap => cmd_build_map(),
+        Cmd::MigrateHome => cmd_migrate_home(),
         Cmd::Triage(c) => async_run(|| cmd_triage(c)),
         Cmd::Investigate(c) => async_run(|| cmd_investigate(c)),
         Cmd::Watch(c) => async_run(|| cmd_watch(c)),
@@ -296,7 +301,7 @@ fn resolve_view(view: Option<&str>) -> (Option<u64>, String) {
     if let Ok(id) = v.parse::<u64>() {
         return (Some(id), v.to_string());
     }
-    let views_path = PathBuf::from("data/views.json");
+    let views_path = crate::paths::triage_home().join("data/views.json");
     if views_path.exists() {
         if let Ok(text) = std::fs::read_to_string(&views_path) {
             if let Ok(map) =
@@ -315,6 +320,22 @@ fn resolve_view(view: Option<&str>) -> (Option<u64>, String) {
 
 fn cmd_build_map() -> ExitCode {
     build_map::run()
+}
+
+fn cmd_migrate_home() -> ExitCode {
+    let src = match std::env::current_dir() {
+        Ok(d) => d,
+        Err(e) => die(&format!("migrate-home: could not determine cwd: {e}")),
+    };
+    let dest = crate::paths::migrate_home_dest();
+    match crate::paths::migrate_home(&src, &dest) {
+        Ok(path) => {
+            eprintln!("Done. You can now run triage-cli from any directory.");
+            eprintln!("Files migrated to: {}", path.display());
+            ExitCode::SUCCESS
+        }
+        Err(e) => die(&format!("migrate-home failed: {e}")),
+    }
 }
 
 async fn cmd_triage(c: TriageCmd) -> ExitCode {
@@ -566,7 +587,8 @@ async fn cmd_investigate(c: InvestigateCmd) -> ExitCode {
             ticket.id, ticket.subject
         );
     }
-    let workspace = match interactive::ensure_workspace(Path::new("./triage-notes"), ticket.id) {
+    let scratch_root_buf = crate::paths::triage_home().join("scratch");
+    let workspace = match interactive::ensure_workspace(scratch_root_buf.as_path(), ticket.id) {
         Ok(w) => w,
         Err(e) => die(&format!("workspace: {e}")),
     };
@@ -958,16 +980,20 @@ fn show_full_state_diff(existing_path: &Path, new_content: &str) -> std::io::Res
     if let Ok(viewer) = std::env::var("DIFF_VIEWER") {
         let trimmed = viewer.trim();
         if !trimmed.is_empty() {
-            // Honor shell-style commands by going through `sh -c` so users
-            // can set things like `DIFF_VIEWER='code --diff'`.
-            let status = Command::new("sh")
-                .arg("-c")
-                .arg(format!(
-                    "{} {} {}",
-                    trimmed,
-                    shell_escape(&existing_path.to_string_lossy()),
-                    shell_escape(&new_path.to_string_lossy()),
-                ))
+            // Split the user's $DIFF_VIEWER on shell-style word boundaries.
+            // `shlex::split` handles single/double-quoted args and escapes
+            // exactly like POSIX `sh` would, but cross-platform and without
+            // ever spawning a real shell. The file-path args are passed via
+            // `Command::args`, so they never go through a parser at all.
+            let parts = shlex::split(trimmed)
+                .ok_or_else(|| std::io::Error::other("DIFF_VIEWER has unbalanced quoting"))?;
+            let (cmd, args) = parts
+                .split_first()
+                .ok_or_else(|| std::io::Error::other("DIFF_VIEWER is empty after parsing"))?;
+            let status = Command::new(cmd)
+                .args(args)
+                .arg(existing_path)
+                .arg(new_path)
                 .status()?;
             if !status.success() {
                 eprintln!(
@@ -980,39 +1006,24 @@ fn show_full_state_diff(existing_path: &Path, new_content: &str) -> std::io::Res
         }
     }
 
-    // Fallback: `/usr/bin/diff -u`, captured and printed to stderr.
-    let output = Command::new("diff")
-        .arg("-u")
-        .arg(existing_path)
-        .arg(new_path)
-        .output()?;
-    // `diff` exits 1 when files differ — that's the expected case here, not
-    // an error. Only exit codes >= 2 indicate a real failure.
-    if let Some(code) = output.status.code() {
-        if code >= 2 {
-            return Err(std::io::Error::other(format!(
-                "diff failed (exit {code}): {}",
-                String::from_utf8_lossy(&output.stderr)
-            )));
-        }
-    }
-    eprintln!("--- full STATE.md diff ---");
-    eprintln!("{}", String::from_utf8_lossy(&output.stdout));
+    // Fallback: in-process unified diff via the `similar` crate. This used
+    // to shell out to `/usr/bin/diff -u`, which doesn't exist on Windows.
+    let existing_bytes = std::fs::read_to_string(existing_path)?;
+    let new_bytes = std::fs::read_to_string(new_path)?;
+    let diff = similar::TextDiff::from_lines(&existing_bytes, &new_bytes)
+        .unified_diff()
+        .header("STATE.md (existing)", "STATE.md (new)")
+        .to_string();
+    eprintln!("{}", diff);
     Ok(())
-}
-
-fn shell_escape(s: &str) -> String {
-    // Minimal single-quote escape sufficient for filesystem paths handed
-    // to `sh -c`. Wraps in single quotes and escapes embedded single quotes.
-    format!("'{}'", s.replace('\'', r#"'\''"#))
 }
 
 async fn cmd_watch(c: WatchCmd) -> ExitCode {
     let levels = parse_levels(&c.levels);
     let backfill_hours = parse_backfill(&c.backfill);
-    let state_file = c
-        .state_file
-        .unwrap_or_else(|| PathBuf::from(format!("data/watcher-state-{}.json", c.view)));
+    let state_file = c.state_file.unwrap_or_else(|| {
+        crate::paths::triage_home().join(format!("data/watcher-state-{}.json", c.view))
+    });
     let opts = WatcherOptions {
         view_id: Some(c.view),
         interval: c.interval,
@@ -1038,7 +1049,8 @@ async fn cmd_inbox(c: InboxCmd) -> ExitCode {
     let (view_id, view_key) = resolve_view(c.view.as_deref());
     let backfill_hours = parse_backfill(&c.backfill);
     let levels = parse_levels(&c.levels);
-    let state_file = PathBuf::from(format!("data/watcher-state-{view_key}.json"));
+    let state_file =
+        crate::paths::triage_home().join(format!("data/watcher-state-{view_key}.json"));
     let opts = WatcherOptions {
         view_id,
         interval: c.poll,

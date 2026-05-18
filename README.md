@@ -54,20 +54,64 @@ validator behavior — is documented in **`docs/spec/v1-reframe.md`**.
 
 ## Install
 
-```bash
-git clone <repo-url> && cd triage-cli/triage-cli-rs
-cargo build --release
+### Windows (primary platform)
+
+Open PowerShell and run:
+
+```powershell
+irm https://raw.githubusercontent.com/midwestman35/triage-cli/main/install.ps1 | iex
 ```
 
-Produces `triage-cli-rs/target/release/triage-cli` — a ~7 MB static binary.
+This downloads the latest release, verifies its SHA256 against the published `SHA256SUMS`, installs `triage-cli.exe` into `%LOCALAPPDATA%\Programs\triage-cli\bin\`, and seeds the data directory at `%LOCALAPPDATA%\triage-cli\`. Open a new PowerShell window after install for `$PATH` to refresh.
 
-Optional: symlink it onto your PATH so commands work from anywhere:
+The script does not require admin privileges and never modifies machine-wide settings.
+
+### macOS / Linux
+
 ```bash
-ln -s "$PWD/target/release/triage-cli" ~/.local/bin/triage-cli
+curl -fsSL https://raw.githubusercontent.com/midwestman35/triage-cli/main/install.sh | bash
 ```
 
-After install, run from the repo root (`triage-cli/`), which is the cwd the
-binary expects for `data/`, `MEMORY.md`, `apex-cnc-inventory.md`, and `.env`.
+Installs the binary into `~/.local/bin/triage-cli` and seeds the data directory at `~/Library/Application Support/triage-cli/` (macOS) or `${XDG_DATA_HOME:-~/.local/share}/triage-cli/` (Linux).
+
+### Install script flags
+
+Both scripts accept these flags:
+
+| Flag | Purpose |
+|---|---|
+| `-Version v0.2.0` / `--version v0.2.0` | Pin to a specific release tag. |
+| `-Channel prerelease` / `--channel prerelease` | Pick the newest prerelease instead of the latest stable. |
+| `-DryRun` / `--dry-run` | Print every action without executing. Useful for review. |
+
+To pass flags through `iex` on Windows, download the script first:
+
+```powershell
+irm https://raw.githubusercontent.com/midwestman35/triage-cli/main/install.ps1 -OutFile install.ps1
+.\install.ps1 -Version v0.2.0
+```
+
+### Upgrading
+
+Re-run the same install one-liner. The script detects the newer release, verifies SHA256, and replaces the binary in place. Your `.env`, `MEMORY.md`, and other local state are not touched.
+
+### Migrating from a repo-clone install
+
+If you previously installed by cloning the repo and running `cargo build --release`, run once from inside that clone:
+
+```bash
+triage-cli migrate-home
+```
+
+This copies `.env`, `MEMORY.md`, `apex-cnc-inventory.md`, and the `data/` directory into `$TRIAGE_HOME` (or the platform default), after which the binary can be invoked from any directory.
+
+### Uninstall
+
+There is no uninstaller. Delete the binary directory (`%LOCALAPPDATA%\Programs\triage-cli\` on Windows, `~/.local/bin/triage-cli` elsewhere) and the data directory (`%LOCALAPPDATA%\triage-cli\` on Windows, the path printed by `triage-cli doctor` elsewhere).
+
+### Build from source
+
+The "clone and `cargo build --release`" path described in `CLAUDE.md` still works and is the supported developer setup. End users should prefer the install scripts.
 
 ## First-run setup
 
