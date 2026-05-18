@@ -435,7 +435,20 @@ pub fn read_base_evidence_manifest(ticket_dir: &Path) -> Result<BaseEvidenceMani
 /// Total byte cap for the ticket-context preamble after redaction. Bounded
 /// so it never dominates a provider request (esp. Unleash, where it is
 /// prepended on *every* stateless turn). UTF-8-boundary safe.
+///
+/// Note on caps: each component (`build_ticket_context_preamble`,
+/// `build_conversation_replay`) is individually capped at this value, so the
+/// fully-assembled `combined_system_prompt` in `pipeline::followup_turn` may
+/// reach up to `COMBINED_SYSTEM_PROMPT_CAP_BYTES` (2× + caller prompt). The
+/// pipeline applies a final `truncate_on_boundary` pass using that outer cap.
 pub const CONTEXT_PREAMBLE_CAP_BYTES: usize = 8 * 1024;
+
+/// Outer cap applied to the fully-assembled combined system prompt in
+/// `pipeline::followup_turn` — covers the preamble + replay + caller prompt
+/// all stacking on the session-loss path. Two per-component caps plus
+/// a reasonable caller prompt → 20 KiB is a safe ceiling that stays
+/// well under POSIX arg-space limits.
+pub const COMBINED_SYSTEM_PROMPT_CAP_BYTES: usize = 20 * 1024;
 
 /// Per-source cap applied to STATE.md / FORK_PACKET.md before they are
 /// concatenated. Keeps a single oversized file from crowding out the other.
@@ -453,7 +466,7 @@ const CONVERSATION_REPLAY_PER_TURN_BYTES: usize = 1024;
 
 /// Truncate `s` to at most `cap` bytes on a UTF-8 char boundary, appending
 /// a `marker` when truncation occurred. Empty input yields an empty string.
-fn truncate_on_boundary(s: &str, cap: usize, marker: &str) -> String {
+pub(crate) fn truncate_on_boundary(s: &str, cap: usize, marker: &str) -> String {
     if s.len() <= cap {
         return s.to_string();
     }
