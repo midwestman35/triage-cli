@@ -217,7 +217,8 @@ Logging during the TUI run is redirected to a per-view file printed at startup s
 | Fork rubric loader (embedded + `TRIAGE_RUBRIC_PATH` override) | `triage-cli-rs/src/playbook.rs` |
 | Embedded rubric file | `triage-cli-rs/playbook/fork-rubric.md` |
 | Investigation session + evidence | `triage-cli-rs/src/investigation.rs` |
-| Memory layer (MEMORY.md + SQLite FTS5, schema v2) | `triage-cli-rs/src/memory.rs`, `MEMORY.md`, `data/memory.db` |
+| Memory layer (MEMORY.md + SQLite FTS5, FTS5 `schema_version=2`) | `triage-cli-rs/src/memory.rs`, `MEMORY.md`, `data/memory.db` |
+| Base-evidence manifest (schema v2 per [ADR-0003](docs/adr/0003-base-evidence-body-snapshots.md)) | `triage-cli-rs/src/pipeline.rs` (`collect_base_evidence_entries`), `triage-cli-rs/src/chat.rs` (`write_base_evidence_manifest`); on-disk at `<ticket_dir>/.session/base-evidence-manifest.json` |
 | LLM provider trait + impls | `triage-cli-rs/src/providers/` (`mod.rs`, `unleash.rs`, `codex.rs`) |
 | LLM structured-output dispatch + validator + retry | `triage-cli-rs/src/llm.rs` (`triage_structured`) |
 | PII redaction | `triage-cli-rs/src/redact.rs` |
