@@ -193,17 +193,24 @@ fn has_v1_columns(conn: &Connection) -> Result<bool, MemoryError> {
 }
 
 fn needs_rebuild(conn: &Connection, md_path: &Path) -> Result<bool, MemoryError> {
-    if !md_path.exists() {
-        return Ok(false);
-    }
-    let row: Option<String> = conn
+    let last_indexed_row: Option<String> = conn
         .query_row(
             "SELECT value FROM memory_meta WHERE key='last_indexed_at'",
             [],
             |row| row.get(0),
         )
         .ok();
-    let Some(value) = row else { return Ok(true) };
+
+    // F8: if MEMORY.md is gone, the index is out of sync with the canonical
+    // source-of-truth. Only fire a rebuild when `last_indexed_at` is set —
+    // a fresh install with neither md nor index doesn't need one.
+    if !md_path.exists() {
+        return Ok(last_indexed_row.is_some());
+    }
+
+    let Some(value) = last_indexed_row else {
+        return Ok(true);
+    };
     let Ok(last_indexed) = chrono::DateTime::parse_from_rfc3339(&value) else {
         return Ok(true);
     };
@@ -771,5 +778,84 @@ mod tests {
         assert_eq!(fl, "");
         assert_eq!(qrr, "");
         assert_eq!(rv, "");
+    }
+
+    /// F8: when MEMORY.md is deleted but the FTS5 DB still has rows from a
+    /// prior install, `needs_rebuild` previously returned `Ok(false)` —
+    /// the stale rows would survive forever (or until the FTS5 table was
+    /// dropped). The contract is now: missing MEMORY.md plus an existing
+    /// `last_indexed_at` means the index is out of sync and a rebuild
+    /// (which finds an empty md and clears the table) must run.
+    #[test]
+    fn needs_rebuild_true_when_md_deleted_but_db_has_history() {
+        let tmp = TempDir::new().unwrap();
+        let md = tmp.path().join("MEMORY.md");
+        let db = tmp.path().join("data/memory.db");
+        let _scope = EnvScope::new(&md, &db);
+
+        // Pretend a prior install had indexed something — stamp
+        // last_indexed_at and leave a row in FTS5. Do NOT create md.
+        let conn = ensure_db(&db).unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO memory_meta VALUES ('last_indexed_at', '2026-05-01T00:00:00+00:00')",
+            [],
+        )
+        .unwrap();
+        assert!(!md.exists(), "test invariant: MEMORY.md must not exist");
+
+        assert!(
+            needs_rebuild(&conn, &md).unwrap(),
+            "missing MEMORY.md with stale last_indexed_at must trigger rebuild"
+        );
+    }
+
+    #[test]
+    fn needs_rebuild_false_on_fresh_install_with_no_md_and_no_index() {
+        // First-run state: no MEMORY.md, no last_indexed_at row.
+        // Returning true here would force an unnecessary rebuild on a
+        // fresh install. Returning false (current behavior) is correct.
+        let tmp = TempDir::new().unwrap();
+        let md = tmp.path().join("MEMORY.md");
+        let db = tmp.path().join("data/memory.db");
+        let _scope = EnvScope::new(&md, &db);
+
+        let conn = ensure_db(&db).unwrap();
+        // No last_indexed_at row inserted.
+        assert!(!md.exists());
+        assert!(
+            !needs_rebuild(&conn, &md).unwrap(),
+            "fresh install must not force a rebuild"
+        );
+    }
+
+    #[test]
+    fn rebuild_after_md_deletion_clears_stale_fts5_rows() {
+        let tmp = TempDir::new().unwrap();
+        let md = tmp.path().join("MEMORY.md");
+        let db = tmp.path().join("data/memory.db");
+        let _scope = EnvScope::new(&md, &db);
+
+        // Seed an FTS5 row + last_indexed_at, then delete the md
+        // backing it (or rather, never create md).
+        let conn = ensure_db(&db).unwrap();
+        conn.execute(
+            "INSERT INTO investigations VALUES ('99999', 'c', 's', 'sy', 'a', 'r', 'A', '', '')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO memory_meta VALUES ('last_indexed_at', '2026-05-01T00:00:00+00:00')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let count = rebuild_index(Some(&db)).unwrap();
+        assert_eq!(count, 0, "rebuild against missing md must clear the table");
+        let conn = Connection::open(&db).unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM investigations", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(n, 0, "stale row must be gone after rebuild");
     }
 }
