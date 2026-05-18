@@ -965,16 +965,49 @@ pub struct SessionManifest {
     pub codex_capture_method: Option<String>,
 }
 
+/// A single entry in the base evidence snapshot. Wraps `EvidenceItem`
+/// (catalog metadata: id, kind, label, source pointer) with an optional
+/// `body` carrying the actual content captured at the time of the
+/// original investigation. Used only by `BaseEvidenceManifest`.
+///
+/// `EvidenceItem` itself stays lean — `bundle.evidence_index` continues
+/// to be `Vec<EvidenceItem>` (catalog-only) for LLM context. The body
+/// snapshot lives only in the persisted manifest.
+///
+/// The `#[serde(flatten)]` on `item` means the JSON wire format is a
+/// single flat object with the `EvidenceItem` fields plus an optional
+/// `body` field appended. Old v1 manifests (lacking `body`) deserialize
+/// cleanly: `body` defaults to `None` via `#[serde(default)]`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BaseEvidenceEntry {
+    #[serde(flatten)]
+    pub item: EvidenceItem,
+    /// Snapshot of the content this evidence carried at the time of the
+    /// original investigation. `None` for kinds where the body cannot be
+    /// captured (e.g. legacy v1 manifests, or when extraction failed).
+    /// For local files, the body is the extracted UTF-8 text capped at
+    /// `BODY_SNAPSHOT_CAP_BYTES` (see pipeline.rs); for pasted notes,
+    /// it's the full text; for Datadog windows, it's the rendered log
+    /// lines; for Zendesk comments, the comment body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+}
+
 /// Durable evidence snapshot written at the end of the original
 /// `investigate` run (spec § 5.4). `/revise` rebuilds from this — never
 /// from parsed markdown.
+///
+/// Schema v2 (ADR-0003) replaces v1's bare `Vec<EvidenceItem>` with
+/// `Vec<BaseEvidenceEntry>` so the body content captured at the time of
+/// the original investigation is preserved alongside the catalog. Old
+/// v1 manifests deserialize cleanly via serde flatten + defaults.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BaseEvidenceManifest {
     pub schema: String,
     pub schema_version: u32,
     pub ticket_id: String,
     pub captured_at: DateTime<Utc>,
-    pub evidence: Vec<EvidenceItem>,
+    pub evidence: Vec<BaseEvidenceEntry>,
 }
 
 /// Attachment passed to `LlmProvider::followup` (spec § 5.7 — provider

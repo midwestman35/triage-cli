@@ -718,4 +718,56 @@ mod tests {
         let back = read_base_evidence_manifest(dir.path()).unwrap();
         assert_eq!(back.ticket_id, "44776");
     }
+
+    #[test]
+    fn round_trip_base_manifest_preserves_body_field() {
+        // The v2 schema's `body: Option<String>` field must survive a JSON
+        // write→read round trip. Guards the serde-flatten wiring of
+        // BaseEvidenceEntry.
+        use crate::models::{BaseEvidenceEntry, EvidenceItem};
+        let dir = tempdir().unwrap();
+        let bem = BaseEvidenceManifest {
+            schema: "triage-cli/base-evidence".into(),
+            schema_version: 2,
+            ticket_id: "44777".into(),
+            captured_at: Utc::now(),
+            evidence: vec![
+                BaseEvidenceEntry {
+                    item: EvidenceItem {
+                        id: "E-001".into(),
+                        kind: "pasted_note".into(),
+                        label: "note".into(),
+                        source_time: None,
+                        source_path: "pasted:note".into(),
+                    },
+                    body: Some("ROUNDTRIP_BODY_SENTINEL".into()),
+                },
+                BaseEvidenceEntry {
+                    item: EvidenceItem {
+                        id: "E-002".into(),
+                        kind: "datadog_log_window".into(),
+                        label: "window".into(),
+                        source_time: None,
+                        source_path: "datadog:log_window".into(),
+                    },
+                    body: None,
+                },
+            ],
+        };
+        write_base_evidence_manifest(dir.path(), &bem).unwrap();
+        let back = read_base_evidence_manifest(dir.path()).unwrap();
+        assert_eq!(back.evidence.len(), 2);
+        assert_eq!(
+            back.evidence[0].body.as_deref(),
+            Some("ROUNDTRIP_BODY_SENTINEL"),
+            "v2 body field was dropped on round trip"
+        );
+        assert!(
+            back.evidence[1].body.is_none(),
+            "entry without body deserialized with unexpected value"
+        );
+        // Ensure the catalog metadata is preserved as flat fields.
+        assert_eq!(back.evidence[0].item.id, "E-001");
+        assert_eq!(back.evidence[1].item.kind, "datadog_log_window");
+    }
 }

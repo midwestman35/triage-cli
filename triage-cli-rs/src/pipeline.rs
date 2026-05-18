@@ -485,10 +485,10 @@ pub async fn investigate_one_structured(
         }
         let bem = crate::models::BaseEvidenceManifest {
             schema: "triage-cli/base-evidence".into(),
-            schema_version: 1,
+            schema_version: 2,
             ticket_id: ticket.id.to_string(),
             captured_at: chrono::Utc::now(),
-            evidence: bundle.evidence_index.clone(),
+            evidence: collect_base_evidence_entries(&bundle),
         };
         if let Err(e) = crate::chat::write_base_evidence_manifest(&ticket_dir, &bem) {
             reporter.phase_failed("base_evidence_snapshot", &e.to_string());
@@ -500,6 +500,139 @@ pub async fn investigate_one_structured(
         paths,
         validator_warnings,
     })
+}
+
+/// Per-entry cap on body snapshots stored in `BaseEvidenceManifest`
+/// (schema v2). Bodies larger than this are head-truncated. 256 KB
+/// matches the per-zip-entry cap in `investigation.rs`; the JSON-escape
+/// inflation makes the on-disk impact roughly 1.5× that.
+const BODY_SNAPSHOT_CAP_BYTES: usize = 256 * 1024;
+
+/// Truncate `body` to at most `BODY_SNAPSHOT_CAP_BYTES`, preserving the
+/// head. Returns `None` if `body` is empty after trimming. The truncation
+/// respects UTF-8 char boundaries.
+fn cap_body_snapshot(body: String) -> Option<String> {
+    if body.is_empty() {
+        return None;
+    }
+    if body.len() <= BODY_SNAPSHOT_CAP_BYTES {
+        return Some(body);
+    }
+    // Find the last char boundary at or below the cap so we never slice
+    // mid-codepoint.
+    let mut cut = BODY_SNAPSHOT_CAP_BYTES;
+    while cut > 0 && !body.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let mut truncated = body[..cut].to_string();
+    truncated.push_str("\n\n[truncated]");
+    Some(truncated)
+}
+
+/// Build `BaseEvidenceEntry` list from the catalog (`bundle.evidence_index`)
+/// plus the bundle's content fields. Populates `body` per kind; returns
+/// `None` for kinds that can't be matched or that yield an empty body.
+///
+/// Extracted as a free function so the mapping is unit-testable in
+/// isolation from the rest of `investigate_one_structured`.
+fn collect_base_evidence_entries(bundle: &TriageBundle) -> Vec<crate::models::BaseEvidenceEntry> {
+    use crate::models::BaseEvidenceEntry;
+    bundle
+        .evidence_index
+        .iter()
+        .map(|item| {
+            let body = match item.kind.as_str() {
+                "pasted_note" => bundle
+                    .pasted_logs
+                    .iter()
+                    .find(|p| p.label == item.label)
+                    .and_then(|p| cap_body_snapshot(p.text.clone())),
+                "local_file" => bundle
+                    .local_files
+                    .iter()
+                    .find(|lf| {
+                        lf.path
+                            .file_name()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| lf.path.display().to_string())
+                            == item.label
+                    })
+                    .and_then(|lf| lf.extracted_text.clone())
+                    .and_then(cap_body_snapshot),
+                "datadog_log_window" => {
+                    if bundle.log_lines.is_empty() {
+                        None
+                    } else {
+                        let rendered = bundle
+                            .log_lines
+                            .iter()
+                            .map(|l| {
+                                format!(
+                                    "{} [{}] {}",
+                                    crate::models::fmt_ts(&l.timestamp),
+                                    l.level,
+                                    l.message
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        cap_body_snapshot(rendered)
+                    }
+                }
+                "zendesk_comment" => bundle
+                    .ticket
+                    .comments
+                    .iter()
+                    .find(|c| {
+                        format!("comment:{}", crate::models::fmt_ts(&c.created_at))
+                            == item.source_path
+                    })
+                    .and_then(|c| cap_body_snapshot(c.body.clone())),
+                "attachment" => bundle
+                    .downloaded_attachments
+                    .iter()
+                    .find(|a| a.filename == item.label)
+                    .and_then(|a| a.extracted_text.clone())
+                    .and_then(cap_body_snapshot),
+                "customer_history" => bundle.customer_history.as_ref().and_then(|h| {
+                    if h.tickets.is_empty() {
+                        return None;
+                    }
+                    let mut lines = vec![format!("{} prior ticket(s):", h.tickets.len())];
+                    for t in &h.tickets {
+                        lines.push(format!(
+                            "- #{} [{}] {} (created {})",
+                            t.id,
+                            t.status,
+                            t.subject,
+                            crate::models::fmt_ts(&t.created_at)
+                        ));
+                    }
+                    cap_body_snapshot(lines.join("\n"))
+                }),
+                "memory_hit" => bundle.memory_context.as_ref().and_then(|ctx| {
+                    let needle = item
+                        .source_path
+                        .strip_prefix("memory:")
+                        .unwrap_or(&item.source_path);
+                    ctx.entries
+                        .iter()
+                        .find(|e| e.ticket_id == needle)
+                        .and_then(|e| {
+                            cap_body_snapshot(format!(
+                                "ticket_id: {}\nsubject: {}\nassessment: {}",
+                                e.ticket_id, e.subject, e.assessment
+                            ))
+                        })
+                }),
+                _ => None,
+            };
+            BaseEvidenceEntry {
+                item: item.clone(),
+                body,
+            }
+        })
+        .collect()
 }
 
 /// The current analyst's identifier for `STATE.md`. Falls back through
@@ -948,18 +1081,17 @@ pub async fn followup_turn(
 }
 
 /// Build the synthetic `InvestigationSession` that `/revise` feeds into
-/// `investigate_one_structured`. Seeds the session with a catalog summary
-/// of the base evidence (so the LLM is aware of the original signal),
-/// then layers post-base evidence from analyst/automated turns recorded
+/// `investigate_one_structured`. Seeds the session with the base-evidence
+/// catalog (so the LLM re-emission preserves the original `E-NNN`
+/// identifiers and labels) AND, for entries where the v2 manifest carries
+/// a `body` snapshot, injects the captured body as a labeled paste so the
+/// LLM re-emission sees the same signal that drove the original fork.
+/// Then layers post-base evidence from analyst/automated turns recorded
 /// since `last_revise_turn`.
 ///
-/// **Why a catalog summary, not full content:** `BaseEvidenceManifest`
-/// stores `EvidenceItem`s — IDs + kind + label + source pointer — not the
-/// underlying bodies. Datadog log lines, file content, and paste bodies
-/// live in their original sources. We surface the catalog so the
-/// re-emission preserves the original `E-NNN` identifiers and labels;
-/// fully restoring content would require extending the manifest schema to
-/// store body snapshots.
+/// **Schema v1 backward compatibility:** legacy manifests deserialize
+/// into v2 with `entry.body == None`; those entries surface only in the
+/// catalog summary, matching the pre-ADR-0003 behavior.
 ///
 /// Extracted into a free function so it can be unit-tested directly (the
 /// no-llm pipeline path stubs the output and doesn't reveal what the
@@ -975,17 +1107,29 @@ fn build_revise_session(
     // 1. Surface base-evidence catalog as a labeled paste so the LLM
     //    re-emission knows what evidence existed originally.
     if !base_evidence.evidence.is_empty() {
-        let mut catalog = String::from(
-            "Base-evidence catalog from the original investigation \
-             (bodies live in their original sources — not re-fetched here):\n",
-        );
-        for item in &base_evidence.evidence {
-            catalog.push_str(&format!("- {} [{}] {}\n", item.id, item.kind, item.label));
+        let mut catalog = String::from("Base-evidence catalog from the original investigation:\n");
+        for entry in &base_evidence.evidence {
+            catalog.push_str(&format!(
+                "- {} [{}] {}\n",
+                entry.item.id, entry.item.kind, entry.item.label
+            ));
         }
         crate::investigation::add_pasted_evidence(&mut session, "base-evidence-catalog", &catalog);
     }
 
-    // 2. Layer post-base evidence from turns since the last revise.
+    // 2. For each entry that carries a body snapshot (v2 manifests), inject
+    //    the body as a labeled paste so the LLM re-emission has the same
+    //    raw signal the original investigation did. Entries without a body
+    //    (legacy v1 manifests, or kinds where extraction wasn't possible)
+    //    surface only via the catalog above.
+    for entry in &base_evidence.evidence {
+        if let Some(body) = &entry.body {
+            let label = format!("base-{}-{}", entry.item.kind, entry.item.id);
+            crate::investigation::add_pasted_evidence(&mut session, &label, body);
+        }
+    }
+
+    // 3. Layer post-base evidence from turns since the last revise.
     for t in turns.iter().filter(|t| t.turn > last_revise_turn) {
         for ev in &t.evidence {
             match ev {
@@ -2435,23 +2579,29 @@ validator_warnings: []\n---\n";
         };
         let base_evidence = crate::models::BaseEvidenceManifest {
             schema: "triage-cli/base-evidence".into(),
-            schema_version: 1,
+            schema_version: 2,
             ticket_id: "99001".into(),
             captured_at: chrono::Utc::now(),
             evidence: vec![
-                crate::models::EvidenceItem {
-                    id: "E-001".into(),
-                    kind: "datadog_log_window".into(),
-                    label: "JeffCom 2026-05-13T07:00 to 07:30".into(),
-                    source_time: None,
-                    source_path: "datadog:log_window".into(),
+                crate::models::BaseEvidenceEntry {
+                    item: crate::models::EvidenceItem {
+                        id: "E-001".into(),
+                        kind: "datadog_log_window".into(),
+                        label: "JeffCom 2026-05-13T07:00 to 07:30".into(),
+                        source_time: None,
+                        source_path: "datadog:log_window".into(),
+                    },
+                    body: None,
                 },
-                crate::models::EvidenceItem {
-                    id: "E-002".into(),
-                    kind: "local_file".into(),
-                    label: "apex.log".into(),
-                    source_time: None,
-                    source_path: "local:apex.log".into(),
+                crate::models::BaseEvidenceEntry {
+                    item: crate::models::EvidenceItem {
+                        id: "E-002".into(),
+                        kind: "local_file".into(),
+                        label: "apex.log".into(),
+                        source_time: None,
+                        source_path: "local:apex.log".into(),
+                    },
+                    body: None,
                 },
             ],
         };
@@ -2510,5 +2660,199 @@ validator_warnings: []\n---\n";
                 .any(|s| s.contains("NEW_EVIDENCE_SENTINEL")),
             "post-base evidence missing; pasted_logs = {pasted_texts:?}"
         );
+    }
+
+    #[test]
+    fn base_evidence_round_trips_paste_bodies() {
+        // collect_base_evidence_entries must copy a pasted_note's text into
+        // the entry's `body` field — the central guarantee of ADR-0003 for
+        // the pasted_note kind.
+        use chrono::TimeZone;
+        let ticket = crate::models::Ticket {
+            id: 1,
+            subject: "t".into(),
+            description: "d".into(),
+            requester_org: None,
+            requester_email: None,
+            tags: vec![],
+            created_at: chrono::Utc.with_ymd_and_hms(2026, 5, 12, 0, 0, 0).unwrap(),
+            updated_at: None,
+            comments: vec![],
+        };
+        let mut bundle = crate::models::TriageBundle {
+            ticket,
+            site_entry: None,
+            log_lines: vec![],
+            log_truncated: false,
+            anchor: None,
+            anchor_source: None,
+            window_start: None,
+            window_end: None,
+            downloaded_attachments: vec![],
+            local_files: vec![],
+            pasted_logs: vec![crate::models::PastedEvidence {
+                label: "customer-note".into(),
+                text: "PASTE_BODY_SENTINEL_42".into(),
+            }],
+            customer_history: None,
+            memory_context: None,
+            evidence_index: vec![],
+        };
+        bundle.evidence_index = crate::models::assign_evidence_ids(&bundle);
+        // Assign deterministic IDs (E-NNN) as the production pipeline does.
+        // The lookup in `collect_base_evidence_entries` is by label, not id,
+        // but we still set ids for realism.
+        for (counter, it) in (1..).zip(bundle.evidence_index.iter_mut()) {
+            it.id = format!("E-{counter:03}");
+        }
+
+        let entries = collect_base_evidence_entries(&bundle);
+        let paste_entry = entries
+            .iter()
+            .find(|e| e.item.kind == "pasted_note")
+            .expect("pasted_note entry missing");
+        assert_eq!(
+            paste_entry.body.as_deref(),
+            Some("PASTE_BODY_SENTINEL_42"),
+            "pasted_note body was not captured into BaseEvidenceEntry"
+        );
+    }
+
+    #[test]
+    fn base_evidence_legacy_v1_manifest_parses_with_none_bodies() {
+        // Old v1 manifests on disk have no `body` field per entry. They must
+        // deserialize cleanly into the v2 BaseEvidenceEntry shape, with
+        // `body == None` everywhere (serde flatten + default).
+        let dir = tempfile::tempdir().unwrap();
+        let session_dir = dir.path().join(".session");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let manifest_path = session_dir.join("base-evidence-manifest.json");
+        // Hand-rolled v1 JSON: evidence entries are flat EvidenceItem
+        // objects with no `body` field.
+        let v1_json = r#"{
+            "schema": "triage-cli/base-evidence",
+            "schema_version": 1,
+            "ticket_id": "12345",
+            "captured_at": "2026-05-12T00:00:00Z",
+            "evidence": [
+                {
+                    "id": "E-001",
+                    "kind": "datadog_log_window",
+                    "label": "site log window",
+                    "source_path": "datadog:log_window"
+                },
+                {
+                    "id": "E-002",
+                    "kind": "local_file",
+                    "label": "apex.log",
+                    "source_path": "local:apex.log"
+                }
+            ]
+        }"#;
+        std::fs::write(&manifest_path, v1_json).unwrap();
+        let bem =
+            crate::chat::read_base_evidence_manifest(dir.path()).expect("v1 manifest must parse");
+        assert_eq!(bem.evidence.len(), 2);
+        for entry in &bem.evidence {
+            assert!(
+                entry.body.is_none(),
+                "v1 entry {} unexpectedly carries a body: {:?}",
+                entry.item.id,
+                entry.body
+            );
+        }
+    }
+
+    #[test]
+    fn build_revise_session_injects_body_snapshots() {
+        // /revise must inject each non-None body snapshot from the v2
+        // manifest as a labeled paste in the synthetic session, so the LLM
+        // re-emission sees the raw signal that drove the original fork
+        // (not just the E-NNN catalog).
+        let base_ticket = crate::models::Ticket {
+            id: 99002,
+            subject: "audio stutter".into(),
+            description: "".into(),
+            requester_org: None,
+            requester_email: None,
+            tags: vec![],
+            created_at: chrono::Utc::now(),
+            updated_at: None,
+            comments: vec![],
+        };
+        let base_evidence = crate::models::BaseEvidenceManifest {
+            schema: "triage-cli/base-evidence".into(),
+            schema_version: 2,
+            ticket_id: "99002".into(),
+            captured_at: chrono::Utc::now(),
+            evidence: vec![
+                crate::models::BaseEvidenceEntry {
+                    item: crate::models::EvidenceItem {
+                        id: "E-001".into(),
+                        kind: "datadog_log_window".into(),
+                        label: "site window".into(),
+                        source_time: None,
+                        source_path: "datadog:log_window".into(),
+                    },
+                    body: Some("DD_LOG_BODY_SENTINEL".into()),
+                },
+                crate::models::BaseEvidenceEntry {
+                    item: crate::models::EvidenceItem {
+                        id: "E-002".into(),
+                        kind: "local_file".into(),
+                        label: "apex.log".into(),
+                        source_time: None,
+                        source_path: "local:apex.log".into(),
+                    },
+                    body: Some("LOCAL_FILE_BODY_SENTINEL".into()),
+                },
+                crate::models::BaseEvidenceEntry {
+                    item: crate::models::EvidenceItem {
+                        id: "E-003".into(),
+                        kind: "pasted_note".into(),
+                        label: "customer-note".into(),
+                        source_time: None,
+                        source_path: "pasted:customer-note".into(),
+                    },
+                    // Legacy entry without a body should be silently
+                    // dropped from the body-injection pass — only the
+                    // catalog summary mentions it.
+                    body: None,
+                },
+            ],
+        };
+
+        let session = build_revise_session(&base_ticket, &base_evidence, &[], 0);
+        let pasted_texts: Vec<&str> = session
+            .evidence
+            .pasted_logs
+            .iter()
+            .map(|p| p.text.as_str())
+            .collect();
+        assert!(
+            pasted_texts
+                .iter()
+                .any(|s| s.contains("DD_LOG_BODY_SENTINEL")),
+            "datadog body was not injected; pasted_logs = {pasted_texts:?}"
+        );
+        assert!(
+            pasted_texts
+                .iter()
+                .any(|s| s.contains("LOCAL_FILE_BODY_SENTINEL")),
+            "local-file body was not injected; pasted_logs = {pasted_texts:?}"
+        );
+        // The catalog summary must still be present (with all three
+        // E-NNN ids) even though E-003 has no body.
+        let catalog = pasted_texts
+            .iter()
+            .find(|s| s.contains("E-001") && s.contains("E-002") && s.contains("E-003"))
+            .copied()
+            .unwrap_or_else(|| {
+                panic!(
+                    "base-evidence catalog missing or incomplete; pasted_logs = {pasted_texts:?}"
+                )
+            });
+        assert!(catalog.contains("datadog_log_window"));
+        assert!(catalog.contains("pasted_note"));
     }
 }
