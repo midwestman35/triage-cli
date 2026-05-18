@@ -206,14 +206,25 @@ impl DatadogClient {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        let mut logs: Vec<LogLine> = data.iter().map(to_log_line).collect();
-        logs.sort_by_key(|l| l.timestamp);
+        let logs = parse_log_lines(&data);
         let truncated = logs.len() as u32 >= self.max_lines;
         Ok((logs, truncated))
     }
 }
 
-fn to_log_line(item: &Value) -> LogLine {
+/// Parse a JSON array of Datadog v2 log items into chronologically-sorted
+/// `LogLine`s. Entries with a missing, non-string/-number, or unparseable
+/// timestamp are silently dropped — `to_log_line` returning `None` is the
+/// signal. F5: this used to fall back to `Utc::now()`, which both
+/// fabricated evidence timing *and* re-sorted the fabricated row to the
+/// top of the result via `sort_by_key`.
+pub(crate) fn parse_log_lines(data: &[Value]) -> Vec<LogLine> {
+    let mut logs: Vec<LogLine> = data.iter().filter_map(to_log_line).collect();
+    logs.sort_by_key(|l| l.timestamp);
+    logs
+}
+
+fn to_log_line(item: &Value) -> Option<LogLine> {
     // `item.attributes` is the outer object; the v2 schema then nests another
     // `attributes` map inside it for the structured fields.
     let outer = item.get("attributes").cloned().unwrap_or(Value::Null);
@@ -227,12 +238,11 @@ fn to_log_line(item: &Value) -> LogLine {
     let timestamp = match &ts_raw {
         Value::String(s) => DateTime::parse_from_rfc3339(s)
             .map(|d| d.with_timezone(&Utc))
-            .unwrap_or_else(|_| Utc::now()),
+            .ok()?,
         Value::Number(n) => n
             .as_i64()
-            .and_then(DateTime::<Utc>::from_timestamp_millis)
-            .unwrap_or_else(Utc::now),
-        _ => Utc::now(),
+            .and_then(DateTime::<Utc>::from_timestamp_millis)?,
+        _ => return None,
     };
 
     let level = inner
@@ -250,12 +260,12 @@ fn to_log_line(item: &Value) -> LogLine {
 
     let attributes = inner.as_object().cloned().unwrap_or_else(Map::new);
 
-    LogLine {
+    Some(LogLine {
         timestamp,
         level,
         message,
         attributes,
-    }
+    })
 }
 
 /// Boxed future returned by [`DatadogSource::get_logs`].
@@ -306,7 +316,7 @@ mod tests {
                 "message": "console offline"
             }
         });
-        let line = to_log_line(&item);
+        let line = to_log_line(&item).expect("valid RFC3339 timestamp must parse");
         assert_eq!(
             line.timestamp,
             DateTime::parse_from_rfc3339("2026-05-16T08:30:00.123Z")
@@ -333,7 +343,7 @@ mod tests {
                 "message": "retrying"
             }
         });
-        let line = to_log_line(&item);
+        let line = to_log_line(&item).expect("valid millis timestamp must parse");
         assert_eq!(line.timestamp, expected);
         assert_eq!(line.level, "warn");
     }
@@ -355,7 +365,7 @@ mod tests {
                 }
             }
         });
-        let line = to_log_line(&item);
+        let line = to_log_line(&item).expect("valid outer timestamp must parse");
         assert_eq!(
             line.timestamp,
             DateTime::parse_from_rfc3339("2026-05-16T00:00:00Z")
@@ -375,33 +385,52 @@ mod tests {
     #[test]
     fn to_log_line_defaults_level_and_message_when_absent() {
         let item = json!({ "attributes": { "timestamp": "2026-05-16T08:30:00Z" } });
-        let line = to_log_line(&item);
+        let line = to_log_line(&item).expect("valid timestamp must parse");
         assert_eq!(line.level, "info");
         assert_eq!(line.message, "");
         assert!(line.attributes.is_empty());
     }
 
+    /// F5: previously this fell back to `Utc::now()`, and the subsequent
+    /// `sort_by_key(timestamp)` reordered the fabricated row to the top of
+    /// the result set. The pipeline then handed it to the LLM as if it
+    /// were a real entry in the queried window. The contract is now:
+    /// malformed timestamps drop the entry entirely.
     #[test]
-    fn to_log_line_falls_back_to_now_on_missing_or_invalid_timestamp() {
+    fn to_log_line_returns_none_on_missing_or_invalid_timestamp() {
         for ts in [json!("not-a-timestamp"), Value::Null, json!(true)] {
             let item = json!({ "attributes": { "timestamp": ts, "status": "info" } });
-            let before = Utc::now();
-            let line = to_log_line(&item);
-            let after = Utc::now();
             assert!(
-                line.timestamp >= before && line.timestamp <= after,
-                "invalid timestamp should fall back to ~now, got {}",
-                line.timestamp
+                to_log_line(&item).is_none(),
+                "invalid timestamp {ts:?} should drop the entry, not fabricate one"
             );
         }
     }
 
     #[test]
     fn to_log_line_handles_completely_empty_item() {
-        let line = to_log_line(&Value::Null);
-        assert_eq!(line.level, "info");
-        assert_eq!(line.message, "");
-        assert!(line.attributes.is_empty());
+        // No timestamp anywhere → must drop, not fabricate Utc::now().
+        assert!(to_log_line(&Value::Null).is_none());
+    }
+
+    #[test]
+    fn parse_log_lines_filters_malformed_and_sorts_remainder() {
+        let data = vec![
+            json!({ "attributes": { "timestamp": "2026-05-14T15:32:30Z", "status": "error", "message": "B" } }),
+            json!({ "attributes": { "timestamp": "not-a-date", "status": "error", "message": "DROP_ME" } }),
+            json!({ "attributes": { "timestamp": "2026-05-14T15:32:00Z", "status": "warn", "message": "A" } }),
+        ];
+        let out = parse_log_lines(&data);
+        assert_eq!(out.len(), 2, "malformed entry must be filtered out");
+        assert_eq!(
+            out[0].message, "A",
+            "results must remain chronologically sorted"
+        );
+        assert_eq!(out[1].message, "B");
+        assert!(
+            !out.iter().any(|l| l.message == "DROP_ME"),
+            "malformed entry leaked into result"
+        );
     }
 
     // --- input validation: query-injection guard + arg checks --------------
