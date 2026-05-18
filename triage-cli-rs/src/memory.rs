@@ -342,6 +342,19 @@ pub fn find_duplicate(ticket_id: &str) -> Result<Option<MemoryEntry>, MemoryErro
     Ok(row)
 }
 
+/// F8b: replace newlines and standalone `---` substrings so a value can
+/// be safely embedded as a single line inside a `---`-delimited MEMORY.md
+/// block. The transformation is lossy (newlines become ` | `, `---`
+/// becomes `- - -`) but readable, and FTS5 search continues to match
+/// after the sanitization because both halves of the value survive as
+/// distinct tokens.
+fn sanitize_md_value(value: &str) -> String {
+    value
+        .replace("\r\n", "\n")
+        .replace('\n', " | ")
+        .replace("---", "- - -")
+}
+
 /// Append one entry to MEMORY.md and to the FTS5 index.
 ///
 /// `fork_letter`, `quoted_rubric_row`, and `rubric_version` are v1 fields
@@ -364,6 +377,20 @@ pub fn append_investigation(
     let resolution = resolution.unwrap_or("[unknown]");
     let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, false);
     let symptom_clipped: String = symptom.chars().take(500).collect();
+
+    // F8b: MEMORY.md is parsed as `---`-delimited blocks of `key: value`
+    // lines. Field values containing a literal `\n` or a standalone `---`
+    // line would either corrupt the entry or split the block boundary,
+    // breaking every subsequent entry on rebuild. Sanitize everything we
+    // splat into the format string (and into FTS5, so search matches what
+    // MEMORY.md says).
+    let customer = sanitize_md_value(customer);
+    let subject = sanitize_md_value(subject);
+    let symptom_clipped = sanitize_md_value(&symptom_clipped);
+    let assessment = sanitize_md_value(assessment);
+    let resolution = sanitize_md_value(resolution);
+    let quoted_rubric_row = sanitize_md_value(quoted_rubric_row);
+
     let entry_text = format!(
         "\n---\nid: {ticket_id}\ncustomer: {customer}\ndate: {now}\nsubject: {subject}\nsymptom: {symptom_clipped}\nassessment: {assessment}\nresolution: {resolution}\nfork_letter: {fork_letter}\nquoted_rubric_row: {quoted_rubric_row}\nrubric_version: {rubric_version}\n---\n"
     );
@@ -771,5 +798,121 @@ mod tests {
         assert_eq!(fl, "");
         assert_eq!(qrr, "");
         assert_eq!(rv, "");
+    }
+
+    /// F8b: MEMORY.md is parsed as `---`-delimited blocks with `key: value`
+    /// lines inside. A value that contains a literal `\n` was previously
+    /// written into the block raw — the second line then either parsed as
+    /// a stray `key: value` pair (corrupting the entry) or, if the line
+    /// happened to be exactly `---`, split the block boundary and broke
+    /// every subsequent entry. `append_investigation` must sanitize.
+    #[test]
+    fn append_replaces_newlines_in_field_values() {
+        let tmp = TempDir::new().unwrap();
+        let md = tmp.path().join("MEMORY.md");
+        let db = tmp.path().join("data/memory.db");
+        let _scope = EnvScope::new(&md, &db);
+
+        append_investigation(
+            "T_F8B_1",
+            "cust",
+            "line1\nline2",
+            "sym",
+            "asn",
+            None,
+            "",
+            "",
+            "",
+        )
+        .unwrap();
+
+        let entries = parse_memory_md(&md).unwrap();
+        let entry = entries
+            .iter()
+            .find(|e| e.get("id").map(String::as_str) == Some("T_F8B_1"))
+            .expect("entry missing");
+        let subject = entry.get("subject").map(String::as_str).unwrap_or("");
+        assert!(
+            !subject.contains('\n'),
+            "newline must be sanitized: {subject:?}"
+        );
+        assert!(
+            subject.contains("line1") && subject.contains("line2"),
+            "both halves must survive sanitization: {subject:?}"
+        );
+    }
+
+    #[test]
+    fn append_escapes_standalone_dash_line_in_value() {
+        let tmp = TempDir::new().unwrap();
+        let md = tmp.path().join("MEMORY.md");
+        let db = tmp.path().join("data/memory.db");
+        let _scope = EnvScope::new(&md, &db);
+
+        // A field value containing a line that is exactly "---" used to
+        // split the YAML block boundary and corrupt the entry. With
+        // sanitization, a single well-formed block must survive.
+        append_investigation(
+            "T_F8B_2",
+            "cust",
+            "subj",
+            "before\n---\nafter",
+            "asn",
+            None,
+            "",
+            "",
+            "",
+        )
+        .unwrap();
+
+        let entries = parse_memory_md(&md).unwrap();
+        let entry = entries
+            .iter()
+            .find(|e| e.get("id").map(String::as_str) == Some("T_F8B_2"))
+            .expect("entry missing after --- sanitization");
+        let symptom = entry.get("symptom").map(String::as_str).unwrap_or("");
+        assert!(
+            symptom.contains("before") && symptom.contains("after"),
+            "value halves must survive --- sanitization: {symptom:?}"
+        );
+        assert!(
+            !symptom.contains("\n---\n") && !symptom.contains("---"),
+            "literal --- inside a value must be escaped: {symptom:?}"
+        );
+    }
+
+    #[test]
+    fn append_quoted_rubric_row_with_multiline_survives_round_trip() {
+        // quoted_rubric_row is the most likely user-input source for newlines
+        // (LLM-emitted rubric text). Same contract.
+        let tmp = TempDir::new().unwrap();
+        let md = tmp.path().join("MEMORY.md");
+        let db = tmp.path().join("data/memory.db");
+        let _scope = EnvScope::new(&md, &db);
+
+        append_investigation(
+            "T_F8B_3",
+            "cust",
+            "subj",
+            "sym",
+            "asn",
+            None,
+            "A",
+            "first half\nsecond half",
+            "2026-05-13",
+        )
+        .unwrap();
+
+        let entries = parse_memory_md(&md).unwrap();
+        let entry = entries
+            .iter()
+            .find(|e| e.get("id").map(String::as_str) == Some("T_F8B_3"))
+            .expect("entry missing");
+        let row = entry
+            .get("quoted_rubric_row")
+            .map(String::as_str)
+            .unwrap_or("");
+        assert!(!row.contains('\n'));
+        assert!(row.contains("first half") && row.contains("second half"));
     }
 }
