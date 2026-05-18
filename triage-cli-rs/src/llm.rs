@@ -322,11 +322,12 @@ pub async fn triage_structured(
     let system_prompt = build_structured_system_prompt(rubric);
 
     let raw_user = bundle.as_user_message();
-    let (user_prompt, redaction_counts) = if redact_enabled {
+    let (user_prompt, redaction_counts, residual_warning) = if redact_enabled {
         let (r, c) = redact(&raw_user);
-        (r, Some(c))
+        let w = crate::redact::residual_pii_warning(&r, &c);
+        (r, Some(c), w)
     } else {
-        (raw_user, None)
+        (raw_user, None, None)
     };
 
     let provider_name = provider.name().to_string();
@@ -344,6 +345,7 @@ pub async fn triage_structured(
                 bundle.evidence_index.iter().map(|e| e.id.clone()).collect();
             all_warnings.extend(validate_evidence_citations(&report, &valid_ids));
         }
+        all_warnings.extend(residual_warning.clone());
         return Ok(StructuredOutcome {
             report,
             redaction_counts,
@@ -390,6 +392,7 @@ pub async fn triage_structured(
                     bundle.evidence_index.iter().map(|e| e.id.clone()).collect();
                 all_warnings.extend(validate_evidence_citations(&report, &valid_ids));
             }
+            all_warnings.extend(residual_warning);
             Ok(StructuredOutcome {
                 report,
                 redaction_counts,
