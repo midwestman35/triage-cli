@@ -4,7 +4,7 @@
 //! (tests/watcher), `ChannelReporter` (TUI).
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -297,7 +297,8 @@ pub async fn investigate_one_structured(
     let mut log_truncated = false;
 
     if let Some(dd) = dd_client {
-        let sites_path = Path::new("data/cnc-map.json");
+        let sites_path_buf = crate::paths::triage_home().join("data/cnc-map.json");
+        let sites_path = sites_path_buf.as_path();
         if sites_path.exists() {
             match extract::load_site_map(sites_path) {
                 Ok(sites) => {

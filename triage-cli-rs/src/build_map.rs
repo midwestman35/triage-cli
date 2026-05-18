@@ -17,7 +17,7 @@
 //!     stripped (e.g. "Fairfax Pine Ridge (page lists ...)" → "Fairfax Pine Ridge").
 
 use std::fs;
-use std::path::Path;
+
 use std::process::ExitCode;
 
 use chrono::{SecondsFormat, Utc};
@@ -266,8 +266,8 @@ pub fn render_gaps_markdown(gaps: &Gaps) -> String {
 /// Run the build_map flow. Returns an `ExitCode` so callers can propagate
 /// success/failure to the process.
 pub fn run() -> ExitCode {
-    let inventory_path = Path::new(INVENTORY);
-    let Ok(raw_bytes) = fs::read(inventory_path) else {
+    let inventory_path = crate::paths::triage_home().join(INVENTORY);
+    let Ok(raw_bytes) = fs::read(&inventory_path) else {
         eprintln!(
             "Error: could not read {} from the current working directory.",
             INVENTORY
@@ -288,8 +288,8 @@ pub fn run() -> ExitCode {
     }
 
     let (entries, gaps) = build_entries(&per_site_rows, &master_rows);
-    let map_path = Path::new(MAP_OUT);
-    let gaps_path = Path::new(GAPS_OUT);
+    let map_path = crate::paths::triage_home().join(MAP_OUT);
+    let gaps_path = crate::paths::triage_home().join(GAPS_OUT);
     if let Some(parent) = map_path.parent() {
         if let Err(e) = fs::create_dir_all(parent) {
             eprintln!("Error: could not create {}: {e}", parent.display());
@@ -303,12 +303,12 @@ pub fn run() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    if let Err(e) = fs::write(map_path, format!("{json}\n")) {
+    if let Err(e) = fs::write(&map_path, format!("{json}\n")) {
         eprintln!("Error: could not write {}: {e}", map_path.display());
         return ExitCode::FAILURE;
     }
     let gaps_md = render_gaps_markdown(&gaps);
-    if let Err(e) = fs::write(gaps_path, gaps_md) {
+    if let Err(e) = fs::write(&gaps_path, gaps_md) {
         eprintln!("Error: could not write {}: {e}", gaps_path.display());
         return ExitCode::FAILURE;
     }

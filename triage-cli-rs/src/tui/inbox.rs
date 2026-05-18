@@ -1239,7 +1239,8 @@ async fn triage_one_ticket(
     let ticket = zd.get_ticket(ticket_id).await.map_err(|e| e.to_string())?;
 
     // Try resolving site. If both rules + LLM fail, ask the user.
-    let sites = extract::load_site_map(Path::new("data/cnc-map.json")).unwrap_or_default();
+    let cnc_map_path = crate::paths::triage_home().join("data/cnc-map.json");
+    let sites = extract::load_site_map(cnc_map_path.as_path()).unwrap_or_default();
     let effective_override = if let Some(s) = site_override.clone() {
         Some(s)
     } else {

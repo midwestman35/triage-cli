@@ -296,7 +296,7 @@ fn resolve_view(view: Option<&str>) -> (Option<u64>, String) {
     if let Ok(id) = v.parse::<u64>() {
         return (Some(id), v.to_string());
     }
-    let views_path = PathBuf::from("data/views.json");
+    let views_path = crate::paths::triage_home().join("data/views.json");
     if views_path.exists() {
         if let Ok(text) = std::fs::read_to_string(&views_path) {
             if let Ok(map) =
@@ -566,7 +566,8 @@ async fn cmd_investigate(c: InvestigateCmd) -> ExitCode {
             ticket.id, ticket.subject
         );
     }
-    let workspace = match interactive::ensure_workspace(Path::new("./triage-notes"), ticket.id) {
+    let scratch_root_buf = crate::paths::triage_home().join("scratch");
+    let workspace = match interactive::ensure_workspace(scratch_root_buf.as_path(), ticket.id) {
         Ok(w) => w,
         Err(e) => die(&format!("workspace: {e}")),
     };
@@ -1002,7 +1003,7 @@ async fn cmd_watch(c: WatchCmd) -> ExitCode {
     let backfill_hours = parse_backfill(&c.backfill);
     let state_file = c
         .state_file
-        .unwrap_or_else(|| PathBuf::from(format!("data/watcher-state-{}.json", c.view)));
+        .unwrap_or_else(|| crate::paths::triage_home().join(format!("data/watcher-state-{}.json", c.view)));
     let opts = WatcherOptions {
         view_id: Some(c.view),
         interval: c.interval,
@@ -1028,7 +1029,7 @@ async fn cmd_inbox(c: InboxCmd) -> ExitCode {
     let (view_id, view_key) = resolve_view(c.view.as_deref());
     let backfill_hours = parse_backfill(&c.backfill);
     let levels = parse_levels(&c.levels);
-    let state_file = PathBuf::from(format!("data/watcher-state-{view_key}.json"));
+    let state_file = crate::paths::triage_home().join(format!("data/watcher-state-{view_key}.json"));
     let opts = WatcherOptions {
         view_id,
         interval: c.poll,

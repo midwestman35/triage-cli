@@ -343,7 +343,8 @@ pub async fn run_iteration(
 
 /// Main loop. Polls a view, triages new/updated tickets, sleeps, repeats.
 pub async fn run_watch(opts: WatcherOptions) -> Result<(), WatcherError> {
-    let sites = extract::load_site_map(Path::new("data/cnc-map.json"))?;
+    let cnc_map_path = crate::paths::triage_home().join("data/cnc-map.json");
+    let sites = extract::load_site_map(cnc_map_path.as_path())?;
     let mut state = load_state(&opts.state_file)?;
     let rubric = Rubric::load()
         .map_err(|e| WatcherError::Io(std::io::Error::other(format!("rubric load failed: {e}"))))?;

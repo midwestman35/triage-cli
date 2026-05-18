@@ -7,7 +7,7 @@
 use std::env;
 use std::fs;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::ExitCode;
 
 use dialoguer::{Input, Password, Select};
@@ -55,11 +55,11 @@ pub fn doctor() -> ExitCode {
         }
     }
 
-    let notes_dir = PathBuf::from("triage-notes");
-    match probe_writable(&notes_dir) {
-        Ok(_) => eprintln!("  {} triage-notes/ writable", "✓".green()),
+    let scratch_dir = crate::paths::triage_home().join("scratch");
+    match probe_writable(&scratch_dir) {
+        Ok(_) => eprintln!("  {} <triage-home>/scratch/ writable", "✓".green()),
         Err(e) => {
-            eprintln!("  {} triage-notes/ not writable: {e}", "✗".red());
+            eprintln!("  {} <triage-home>/scratch/ not writable: {e}", "✗".red());
             ok = false;
         }
     }
@@ -117,7 +117,8 @@ pub fn setup() -> ExitCode {
         ENV_PATH
     );
 
-    let existing = read_env_file(Path::new(ENV_PATH));
+    let env_path_buf = crate::paths::triage_home().join(ENV_PATH);
+    let existing = read_env_file(env_path_buf.as_path());
     let zd_subdomain = prompt_text("Zendesk subdomain", existing.get("ZENDESK_SUBDOMAIN"));
     let zd_email = prompt_text("Zendesk agent email", existing.get("ZENDESK_EMAIL"));
     let zd_token = prompt_secret("Zendesk API token", existing.get("ZENDESK_API_TOKEN"));
@@ -164,7 +165,7 @@ pub fn setup() -> ExitCode {
         next.push(("DD_APP_KEY".into(), dd_app));
     }
 
-    if let Err(e) = write_env_file(Path::new(ENV_PATH), &next) {
+    if let Err(e) = write_env_file(env_path_buf.as_path(), &next) {
         eprintln!("{} could not write {ENV_PATH}: {e}", "✗".red());
         return ExitCode::FAILURE;
     }
