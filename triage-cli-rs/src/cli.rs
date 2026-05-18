@@ -958,16 +958,21 @@ fn show_full_state_diff(existing_path: &Path, new_content: &str) -> std::io::Res
     if let Ok(viewer) = std::env::var("DIFF_VIEWER") {
         let trimmed = viewer.trim();
         if !trimmed.is_empty() {
-            // Honor shell-style commands by going through `sh -c` so users
-            // can set things like `DIFF_VIEWER='code --diff'`.
-            let status = Command::new("sh")
-                .arg("-c")
-                .arg(format!(
-                    "{} {} {}",
-                    trimmed,
-                    shell_escape(&existing_path.to_string_lossy()),
-                    shell_escape(&new_path.to_string_lossy()),
-                ))
+            // Split the user's $DIFF_VIEWER on shell-style word boundaries.
+            // `shlex::split` handles single/double-quoted args and escapes
+            // exactly like POSIX `sh` would, but cross-platform and without
+            // ever spawning a real shell. The file-path args are passed via
+            // `Command::args`, so they never go through a parser at all.
+            let parts = shlex::split(trimmed).ok_or_else(|| {
+                std::io::Error::other("DIFF_VIEWER has unbalanced quoting")
+            })?;
+            let (cmd, args) = parts.split_first().ok_or_else(|| {
+                std::io::Error::other("DIFF_VIEWER is empty after parsing")
+            })?;
+            let status = Command::new(cmd)
+                .args(args)
+                .arg(existing_path)
+                .arg(new_path)
                 .status()?;
             if !status.success() {
                 eprintln!(
@@ -990,12 +995,6 @@ fn show_full_state_diff(existing_path: &Path, new_content: &str) -> std::io::Res
         .to_string();
     eprintln!("{}", diff);
     Ok(())
-}
-
-fn shell_escape(s: &str) -> String {
-    // Minimal single-quote escape sufficient for filesystem paths handed
-    // to `sh -c`. Wraps in single quotes and escapes embedded single quotes.
-    format!("'{}'", s.replace('\'', r#"'\''"#))
 }
 
 async fn cmd_watch(c: WatchCmd) -> ExitCode {
