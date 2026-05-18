@@ -41,6 +41,53 @@ fn platform_default_dir() -> PathBuf {
         .join("triage-cli")
 }
 
+/// Destination for `migrate-home`: respects `$TRIAGE_HOME` but never falls
+/// back to cwd (the whole point of migrate-home is to LEAVE cwd).
+pub fn migrate_home_dest() -> PathBuf {
+    if let Ok(h) = std::env::var(TRIAGE_HOME_ENV) {
+        if !h.trim().is_empty() {
+            return PathBuf::from(h);
+        }
+    }
+    platform_default_dir()
+}
+
+/// Copy `.env`, `MEMORY.md`, `apex-cnc-inventory.md`, and `data/` from `src`
+/// into `dest`. Refuses if `src == dest`. Does not delete from `src`.
+/// Returns the destination path on success.
+pub fn migrate_home(src: &std::path::Path, dest: &std::path::Path) -> std::io::Result<PathBuf> {
+    if src == dest {
+        return Err(std::io::Error::other(
+            "migrate-home refuses: source and destination are the same",
+        ));
+    }
+    std::fs::create_dir_all(dest)?;
+
+    for name in [".env", "MEMORY.md", "apex-cnc-inventory.md"] {
+        let from = src.join(name);
+        if from.exists() {
+            let to = dest.join(name);
+            std::fs::copy(&from, &to)?;
+        }
+    }
+
+    let data_src = src.join("data");
+    if data_src.is_dir() {
+        let data_dst = dest.join("data");
+        std::fs::create_dir_all(&data_dst)?;
+        for entry in std::fs::read_dir(&data_src)? {
+            let entry = entry?;
+            let from = entry.path();
+            let to = data_dst.join(entry.file_name());
+            if from.is_file() {
+                std::fs::copy(&from, &to)?;
+            }
+        }
+    }
+
+    Ok(dest.to_path_buf())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -80,5 +127,40 @@ mod tests {
     fn platform_default_dir_ends_in_triage_cli() {
         let p = platform_default_dir();
         assert_eq!(p.file_name().and_then(|s| s.to_str()), Some("triage-cli"));
+    }
+
+    #[test]
+    fn migrate_home_copies_files_and_data_dir() {
+        let src = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join(".env"), "FOO=bar").unwrap();
+        std::fs::write(src.path().join("MEMORY.md"), "memory").unwrap();
+        std::fs::create_dir(src.path().join("data")).unwrap();
+        std::fs::write(src.path().join("data").join("memory.db"), "db").unwrap();
+
+        let returned = migrate_home(src.path(), dest.path()).unwrap();
+        assert_eq!(returned, dest.path());
+
+        assert_eq!(
+            std::fs::read_to_string(dest.path().join(".env")).unwrap(),
+            "FOO=bar"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dest.path().join("MEMORY.md")).unwrap(),
+            "memory"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dest.path().join("data").join("memory.db")).unwrap(),
+            "db"
+        );
+        // Source files preserved (not deleted).
+        assert!(src.path().join(".env").exists());
+    }
+
+    #[test]
+    fn migrate_home_refuses_same_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = migrate_home(dir.path(), dir.path());
+        assert!(result.is_err());
     }
 }

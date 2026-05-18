@@ -58,6 +58,10 @@ enum Cmd {
     /// Run a canned demo fixture without credentials. Lists available fixtures
     /// when called without a name.
     Demo(DemoCmd),
+    /// Copy data files from the current directory into `$TRIAGE_HOME`
+    /// (or the platform default). Use this once after upgrading from
+    /// cwd-coupled installs.
+    MigrateHome,
 }
 
 #[derive(Debug, Args)]
@@ -199,6 +203,7 @@ pub fn run() -> ExitCode {
         Cmd::Doctor => setup::doctor(),
         Cmd::Setup => setup::setup(),
         Cmd::BuildMap => cmd_build_map(),
+        Cmd::MigrateHome => cmd_migrate_home(),
         Cmd::Triage(c) => async_run(|| cmd_triage(c)),
         Cmd::Investigate(c) => async_run(|| cmd_investigate(c)),
         Cmd::Watch(c) => async_run(|| cmd_watch(c)),
@@ -315,6 +320,22 @@ fn resolve_view(view: Option<&str>) -> (Option<u64>, String) {
 
 fn cmd_build_map() -> ExitCode {
     build_map::run()
+}
+
+fn cmd_migrate_home() -> ExitCode {
+    let src = match std::env::current_dir() {
+        Ok(d) => d,
+        Err(e) => die(&format!("migrate-home: could not determine cwd: {e}")),
+    };
+    let dest = crate::paths::migrate_home_dest();
+    match crate::paths::migrate_home(&src, &dest) {
+        Ok(path) => {
+            eprintln!("Done. You can now run triage-cli from any directory.");
+            eprintln!("Files migrated to: {}", path.display());
+            ExitCode::SUCCESS
+        }
+        Err(e) => die(&format!("migrate-home failed: {e}")),
+    }
 }
 
 async fn cmd_triage(c: TriageCmd) -> ExitCode {
