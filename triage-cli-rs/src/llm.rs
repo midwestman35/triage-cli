@@ -481,32 +481,9 @@ pub async fn extract_site(
     let resolved_model = model
         .map(str::to_string)
         .unwrap_or_else(|| model_for_provider(provider.name()));
-    let known_names: std::collections::HashMap<String, String> = sites
-        .iter()
-        .filter(|e| !e.site_name.is_empty())
-        .map(|e| (e.site_name.to_ascii_lowercase(), e.site_name.clone()))
-        .collect();
-    if known_names.is_empty() {
+    let Some((prompt, known_names)) = build_site_extraction_prompt(ticket, sites) else {
         return Ok(None);
-    }
-    let site_list: String = sites
-        .iter()
-        .filter(|e| !e.site_name.is_empty())
-        .map(|e| {
-            format!(
-                "  site_name: {}  |  friendly_name: {}",
-                e.site_name, e.friendly_name
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let desc_head: String = ticket.description.chars().take(500).collect();
-    let prompt = format!(
-        "Known sites:\n{site_list}\n\nTicket subject: {}\nOrg: {}\nDescription (first 500 chars): {}",
-        ticket.subject,
-        ticket.requester_org.as_deref().unwrap_or("(none)"),
-        desc_head
-    );
+    };
     let result = provider
         .complete(&prompt, SITE_EXTRACTION_PROMPT, &resolved_model)
         .await?;
@@ -556,6 +533,45 @@ pub async fn extract_anchor(
     Ok(parsed.ok())
 }
 
+/// Build the site-extraction prompt. Returns `None` when no candidate sites
+/// have a non-empty `site_name`. The returned prompt is run through
+/// `redact::redact` so caller PII in the ticket body never reaches the
+/// provider — operational identifiers (site names, CNCs, org names) are
+/// preserved by the redactor's scope.
+fn build_site_extraction_prompt(
+    ticket: &Ticket,
+    sites: &[crate::models::SiteEntry],
+) -> Option<(String, std::collections::HashMap<String, String>)> {
+    let known_names: std::collections::HashMap<String, String> = sites
+        .iter()
+        .filter(|e| !e.site_name.is_empty())
+        .map(|e| (e.site_name.to_ascii_lowercase(), e.site_name.clone()))
+        .collect();
+    if known_names.is_empty() {
+        return None;
+    }
+    let site_list: String = sites
+        .iter()
+        .filter(|e| !e.site_name.is_empty())
+        .map(|e| {
+            format!(
+                "  site_name: {}  |  friendly_name: {}",
+                e.site_name, e.friendly_name
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let desc_head: String = ticket.description.chars().take(500).collect();
+    let prompt = format!(
+        "Known sites:\n{site_list}\n\nTicket subject: {}\nOrg: {}\nDescription (first 500 chars): {}",
+        ticket.subject,
+        ticket.requester_org.as_deref().unwrap_or("(none)"),
+        desc_head
+    );
+    let (redacted, _counts) = redact(&prompt);
+    Some((redacted, known_names))
+}
+
 fn ticket_for_anchor(ticket: &Ticket) -> String {
     let mut lines = vec![
         format!("Subject: {}", ticket.subject),
@@ -575,7 +591,12 @@ fn ticket_for_anchor(ticket: &Ticket) -> String {
             ));
         }
     }
-    lines.join("\n")
+    // F1: redact at the LLM boundary. The redactor only touches caller PII
+    // (phones, addresses, GPS); ticket subject, comment authors, and
+    // timestamps are preserved.
+    let assembled = lines.join("\n");
+    let (redacted, _counts) = redact(&assembled);
+    redacted
 }
 
 #[cfg(test)]
@@ -811,5 +832,92 @@ mod structured_tests {
                 TryOutcome::ValidationError(es) => write!(f, "ValidationError({es:?})"),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod redaction_boundary_tests {
+    //! F1: site- and anchor-extraction prompts must pass through `redact`
+    //! before reaching a provider. CLAUDE.md locks redaction at the LLM
+    //! boundary; previously these two best-effort extractors leaked raw
+    //! caller PII because they predate the redaction contract.
+    use super::*;
+    use crate::models::{Comment, SiteEntry, Ticket};
+    use chrono::TimeZone;
+
+    fn ticket_with(description: &str, comment_body: Option<&str>) -> Ticket {
+        Ticket {
+            id: 42,
+            subject: "audio interruption".into(),
+            description: description.into(),
+            requester_org: Some("JeffCom".into()),
+            requester_email: None,
+            tags: vec![],
+            created_at: Utc.with_ymd_and_hms(2026, 5, 12, 6, 30, 30).unwrap(),
+            updated_at: None,
+            comments: comment_body
+                .map(|body| {
+                    vec![Comment {
+                        author: "analyst".into(),
+                        body: body.into(),
+                        created_at: Utc.with_ymd_and_hms(2026, 5, 12, 6, 31, 0).unwrap(),
+                        is_public: true,
+                        attachments: vec![],
+                    }]
+                })
+                .unwrap_or_default(),
+        }
+    }
+
+    #[test]
+    fn ticket_for_anchor_redacts_phone_in_description() {
+        let t = ticket_with("caller phone (555) 123-4567 reports drop", None);
+        let prompt = ticket_for_anchor(&t);
+        assert!(
+            !prompt.contains("(555) 123-4567"),
+            "raw phone leaked to anchor prompt: {prompt}"
+        );
+        assert!(
+            prompt.contains("<PHONE>"),
+            "expected redaction sentinel in: {prompt}"
+        );
+    }
+
+    #[test]
+    fn ticket_for_anchor_redacts_phone_in_comment_body() {
+        let t = ticket_with("no PII here", Some("caller is (555) 123-4567"));
+        let prompt = ticket_for_anchor(&t);
+        assert!(
+            !prompt.contains("(555) 123-4567"),
+            "raw phone leaked from comment to anchor prompt: {prompt}"
+        );
+    }
+
+    #[test]
+    fn site_extraction_prompt_redacts_caller_phone() {
+        let t = ticket_with("call (555) 123-4567 at the jeffcom-apex site", None);
+        let sites = vec![SiteEntry {
+            friendly_name: "JeffCom".into(),
+            site_name: "us-co-jeffcom-apex".into(),
+            cnc: "abc-123".into(),
+        }];
+        let (prompt, _names) =
+            build_site_extraction_prompt(&t, &sites).expect("known_names non-empty");
+        assert!(
+            !prompt.contains("(555) 123-4567"),
+            "raw phone leaked to site prompt: {prompt}"
+        );
+        // Operational identifier preserved.
+        assert!(
+            prompt.contains("us-co-jeffcom-apex"),
+            "site identifier missing from prompt: {prompt}"
+        );
+    }
+
+    #[test]
+    fn site_extraction_prompt_returns_none_when_no_known_sites() {
+        let t = ticket_with("any description", None);
+        let empty: Vec<SiteEntry> = vec![];
+        assert!(build_site_extraction_prompt(&t, &empty).is_none());
     }
 }

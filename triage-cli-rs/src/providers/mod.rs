@@ -133,6 +133,12 @@ pub(crate) fn base_url(env_name: &str, default: &str) -> String {
 /// Stamp attachment content into a prompt string. Used by providers that
 /// don't have a native multi-part request channel (codex subprocess,
 /// unleash /chats body). Empty attachments → prompt unchanged.
+///
+/// F1: attachment `extracted_text` is run through `redact::redact` before
+/// concatenation. Caller PII in a dropped log or paste must not bypass the
+/// LLM-boundary redaction contract. The caller-supplied `prompt` argument
+/// is the caller's responsibility (callers in `pipeline` and `llm` already
+/// redact before reaching here); the attachment surface was the gap.
 pub(crate) fn stamp_attachments_into_prompt(
     prompt: &str,
     attachments: &[crate::models::Attachment],
@@ -150,8 +156,9 @@ pub(crate) fn stamp_attachments_into_prompt(
         ));
         match &a.extracted_text {
             Some(text) => {
+                let (redacted, _counts) = crate::redact::redact(text);
                 out.push('\n');
-                out.push_str(text);
+                out.push_str(&redacted);
             }
             None => out.push_str("\n[binary or unreadable — content not included]"),
         }
@@ -276,5 +283,26 @@ mod stamp_tests {
             s.contains("[binary or unreadable"),
             "missing fallback note: {s}"
         );
+    }
+
+    /// F1: attachment text was stamped verbatim into the prompt. Caller PII
+    /// in a dropped log file or paste reached the provider unredacted.
+    #[test]
+    fn stamp_attachments_redacts_phone_in_extracted_text() {
+        use crate::models::{Attachment, FileType};
+        let a = Attachment {
+            copied_path: std::path::PathBuf::from("/x/diag.log"),
+            basename: "diag.log".into(),
+            detected_type: FileType::Log,
+            extracted_text: Some("caller reached on (555) 123-4567 at 06:30".into()),
+        };
+        let s = stamp_attachments_into_prompt("q", std::slice::from_ref(&a));
+        assert!(
+            !s.contains("(555) 123-4567"),
+            "raw phone leaked through attachment stamp: {s}"
+        );
+        // Operational structure preserved.
+        assert!(s.contains("diag.log"), "basename missing: {s}");
+        assert!(s.contains("06:30"), "timestamp surface preserved: {s}");
     }
 }
