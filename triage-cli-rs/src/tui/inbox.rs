@@ -1971,6 +1971,13 @@ async fn send_analyst_turn(
         )
         .map_err(|e| anyhow::anyhow!("write_md: {e}"))?;
     }
+    // The caller-supplied `system_prompt` is intentionally empty here:
+    // `pipeline::followup_turn` now owns ticket-context assembly (#22). It
+    // rebuilds a bounded, PII-redacted preamble from STATE.md /
+    // FORK_PACKET.md / the base-evidence catalog (and, on a Codex
+    // session-loss, a bounded replay of prior turns — #23) and prepends it
+    // to whatever we pass here. Building it once inside `followup_turn`
+    // keeps a single assembly point and avoids a double preamble.
     let _result = pipeline::followup_turn(
         ticket_dir,
         ticket_id,

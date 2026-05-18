@@ -211,8 +211,13 @@ pub struct StructuredInvestigation {
 }
 
 /// Investigation that emits a `StructuredTriageReport` and writes the
-/// five-markdown ticket folder. This is the only end-to-end pipeline entry
-/// point in v1 — the legacy single-file `triage-notes/` path was removed.
+/// five-markdown ticket folder. This is the primary structured pipeline
+/// entry point (the legacy single-file `triage-notes/` path was removed),
+/// but it is no longer the *only* public pipeline entry point: [`revise`]
+/// re-runs this pipeline (with `followup_mode=true`) to rewrite the
+/// five-markdown folder from base snapshots, and [`followup_turn`] drives
+/// the conversational chat turns. (Doc-comment portion of #26; the
+/// CLAUDE.md / AGENTS.md prose is corrected in a separate PR.)
 pub async fn investigate_one_structured(
     ticket: Ticket,
     session: &mut InvestigationSession,
@@ -992,13 +997,45 @@ pub async fn followup_turn(
     // site names) are preserved.
     let (redacted_prompt, _redaction_counts) = crate::redact::redact(prompt);
 
+    // Seed ticket context into the system prompt (#22). Without this the
+    // default Unleash provider (stateless HTTP) and the first Codex turn
+    // answered with zero knowledge of the ticket or the fork decision. The
+    // helper is internally PII-redacted and length-capped.
+    //
+    // When a prior Codex session exists, a resume is about to be attempted;
+    // if it fails ("no rollout found for thread id") the codex provider
+    // silently restarts a fresh `codex exec` with no server-side history
+    // (#23). To make that fallback context-aware we additionally fold a
+    // bounded replay of recent turns into the system prompt. Codex prepends
+    // the system prompt on *both* the resume and the fresh-exec path, so
+    // seeding it here covers the session-loss case without a signature
+    // change. (The analyst-facing System warning turn is still appended
+    // below — that behavior is unchanged.)
+    let combined_system_prompt = {
+        let mut parts: Vec<String> = Vec::new();
+        if !system_prompt.trim().is_empty() {
+            parts.push(system_prompt.to_string());
+        }
+        if let Some(ctx) = chat::build_ticket_context_preamble(ticket_dir) {
+            parts.push(ctx);
+        }
+        if last_codex_session.is_some() {
+            if let Some(replay) =
+                chat::build_conversation_replay(&outcome.turns, chat::CONVERSATION_REPLAY_TURNS)
+            {
+                parts.push(replay);
+            }
+        }
+        parts.join("\n\n")
+    };
+
     // Call provider
     let started = std::time::Instant::now();
     let result = provider
         .followup(
             last_codex_session.as_deref(),
             &redacted_prompt,
-            system_prompt,
+            &combined_system_prompt,
             model,
             attachments,
         )
@@ -2144,6 +2181,132 @@ mod tests {
         assert!(
             captured.contains("<PHONE>"),
             "expected <PHONE> sentinel in redacted prompt; got: {captured:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn followup_turn_seeds_ticket_context_into_system_prompt() {
+        // #22: the chat path passes an empty system prompt; followup_turn
+        // must rebuild ticket context (STATE.md / FORK_PACKET.md) and feed
+        // it to the provider so Unleash (stateless) and the first Codex
+        // turn are not context-blind.
+        use std::sync::Mutex;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ticket_dir = dir.path().join("44778");
+        std::fs::create_dir_all(&ticket_dir).unwrap();
+        std::fs::write(
+            ticket_dir.join("STATE.md"),
+            "---\nticket_id: 44778\nfork: A\n---\n",
+        )
+        .unwrap();
+        std::fs::write(
+            ticket_dir.join("FORK_PACKET.md"),
+            "Recommendation: Fork A — FORK_CONTEXT_SENTINEL.\n",
+        )
+        .unwrap();
+
+        // Seed an analyst turn-001 so the conversation file exists.
+        let analyst = crate::models::Turn {
+            schema: "triage-cli/conversation".into(),
+            schema_version: 1,
+            ticket_id: "44778".into(),
+            turn: 1,
+            turn_kind: crate::models::TurnKind::Analyst,
+            ts: chrono::Utc::now(),
+            author: Some("enrique".into()),
+            body: "does the fork still hold?".into(),
+            evidence: vec![],
+            provider: None,
+            model: None,
+            tokens_in: None,
+            tokens_out: None,
+            elapsed_s: None,
+            session_id: None,
+            resumed: None,
+            action: None,
+            outcome: None,
+            drove_revision_from_turns: None,
+            diff: None,
+        };
+        let conv = crate::chat::conversation_jsonl_path(&ticket_dir);
+        {
+            let _guard = crate::chat::acquire_session_lock(
+                &crate::chat::session_dir(&ticket_dir),
+                std::time::Duration::from_secs(1),
+            )
+            .unwrap();
+            crate::chat::append_turn(&conv, &analyst).unwrap();
+        }
+
+        struct SysCapturingProvider {
+            captured_system: Mutex<Option<String>>,
+        }
+        impl crate::providers::LlmProvider for SysCapturingProvider {
+            fn name(&self) -> &'static str {
+                "fake-sys-capturing"
+            }
+            fn complete<'a>(
+                &'a self,
+                _prompt: &'a str,
+                system: &'a str,
+                _model: &'a str,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<
+                                crate::providers::CompletionResult,
+                                crate::providers::ProviderError,
+                            >,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async move {
+                    *self.captured_system.lock().unwrap() = Some(system.to_string());
+                    Ok(crate::providers::CompletionResult {
+                        text: "context-seed reply".into(),
+                        tokens_in: Some(5),
+                        tokens_out: Some(5),
+                    })
+                })
+            }
+        }
+
+        let provider = SysCapturingProvider {
+            captured_system: Mutex::new(None),
+        };
+        // Caller passes an empty system prompt, exactly like the inbox.
+        followup_turn(
+            &ticket_dir,
+            "44778",
+            "does the fork still hold?",
+            "",
+            "fake-model",
+            &[],
+            &provider,
+        )
+        .await
+        .unwrap();
+
+        let captured = provider
+            .captured_system
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("provider must have been called");
+        assert!(
+            captured.contains("FORK_CONTEXT_SENTINEL"),
+            "ticket context was not seeded into system prompt; got: {captured:?}"
+        );
+        assert!(
+            captured.contains("STATE.md") && captured.contains("fork: A"),
+            "STATE.md context missing from system prompt; got: {captured:?}"
+        );
+        // No prior Codex session → no replay block on this first turn.
+        assert!(
+            !captured.contains("Prior conversation (replayed"),
+            "unexpected replay block on first turn: {captured:?}"
         );
     }
 

@@ -132,6 +132,15 @@ impl LlmProvider for CodexSubprocessProvider {
                     ));
                 }
                 // Session-lost — fall through to the non-resume path below.
+                // The fresh `codex exec` has no server-side history, so it
+                // would answer with amnesia (#23). Context is reconstructed
+                // via the `system_prompt` the caller seeds:
+                // `pipeline::followup_turn` folds a bounded, PII-redacted
+                // ticket-context preamble plus a replay of recent turns into
+                // `system_prompt` whenever a prior session existed, and the
+                // non-resume branch below prepends it as `## System`. No
+                // extra wiring is needed here — the `combined` string built
+                // above already carries that reconstructed context.
             }
 
             // Non-resume path: no session ID, or resume failed with session-lost.
