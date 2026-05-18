@@ -211,8 +211,13 @@ pub struct StructuredInvestigation {
 }
 
 /// Investigation that emits a `StructuredTriageReport` and writes the
-/// five-markdown ticket folder. This is the only end-to-end pipeline entry
-/// point in v1 — the legacy single-file `triage-notes/` path was removed.
+/// five-markdown ticket folder. This is the primary structured pipeline
+/// entry point (the legacy single-file `triage-notes/` path was removed),
+/// but it is no longer the *only* public pipeline entry point: [`revise`]
+/// re-runs this pipeline (with `followup_mode=true`) to rewrite the
+/// five-markdown folder from base snapshots, and [`followup_turn`] drives
+/// the conversational chat turns. (Doc-comment portion of #26; the
+/// CLAUDE.md / AGENTS.md prose is corrected in a separate PR.)
 pub async fn investigate_one_structured(
     ticket: Ticket,
     session: &mut InvestigationSession,
@@ -992,13 +997,57 @@ pub async fn followup_turn(
     // site names) are preserved.
     let (redacted_prompt, _redaction_counts) = crate::redact::redact(prompt);
 
+    // Seed ticket context into the system prompt (#22). Without this the
+    // default Unleash provider (stateless HTTP) and the first Codex turn
+    // answered with zero knowledge of the ticket or the fork decision. The
+    // helper is internally PII-redacted and length-capped.
+    //
+    // When a prior Codex session exists, a resume is about to be attempted;
+    // if it fails ("no rollout found for thread id") the codex provider
+    // silently restarts a fresh `codex exec` with no server-side history
+    // (#23). To make that fallback context-aware we additionally fold a
+    // bounded replay of recent turns into the system prompt. Codex prepends
+    // the system prompt on *both* the resume and the fresh-exec path, so
+    // seeding it here covers the session-loss case without a signature
+    // change. (The analyst-facing System warning turn is still appended
+    // below — that behavior is unchanged.)
+    let combined_system_prompt = {
+        let mut parts: Vec<String> = Vec::new();
+        // Redact caller system_prompt at the LLM boundary: `followup_turn` is
+        // `pub`, so any future non-empty caller string must be scrubbed
+        // regardless of caller convention.
+        if !system_prompt.trim().is_empty() {
+            let (redacted_sys, _) = crate::redact::redact(system_prompt);
+            parts.push(redacted_sys);
+        }
+        if let Some(ctx) = chat::build_ticket_context_preamble(ticket_dir) {
+            parts.push(ctx);
+        }
+        if last_codex_session.is_some() {
+            if let Some(replay) =
+                chat::build_conversation_replay(&outcome.turns, chat::CONVERSATION_REPLAY_TURNS)
+            {
+                parts.push(replay);
+            }
+        }
+        // Apply an outer cap on the fully assembled prompt so that the
+        // preamble + replay + caller string cannot exceed the combined ceiling
+        // even when all three components are at their individual limits.
+        let assembled = parts.join("\n\n");
+        chat::truncate_on_boundary(
+            &assembled,
+            chat::COMBINED_SYSTEM_PROMPT_CAP_BYTES,
+            "\n\n[system prompt truncated]",
+        )
+    };
+
     // Call provider
     let started = std::time::Instant::now();
     let result = provider
         .followup(
             last_codex_session.as_deref(),
             &redacted_prompt,
-            system_prompt,
+            &combined_system_prompt,
             model,
             attachments,
         )
@@ -2144,6 +2193,437 @@ mod tests {
         assert!(
             captured.contains("<PHONE>"),
             "expected <PHONE> sentinel in redacted prompt; got: {captured:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn followup_turn_seeds_ticket_context_into_system_prompt() {
+        // #22: the chat path passes an empty system prompt; followup_turn
+        // must rebuild ticket context (STATE.md / FORK_PACKET.md) and feed
+        // it to the provider so Unleash (stateless) and the first Codex
+        // turn are not context-blind.
+        use std::sync::Mutex;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ticket_dir = dir.path().join("44778");
+        std::fs::create_dir_all(&ticket_dir).unwrap();
+        std::fs::write(
+            ticket_dir.join("STATE.md"),
+            "---\nticket_id: 44778\nfork: A\n---\n",
+        )
+        .unwrap();
+        std::fs::write(
+            ticket_dir.join("FORK_PACKET.md"),
+            "Recommendation: Fork A — FORK_CONTEXT_SENTINEL.\n",
+        )
+        .unwrap();
+
+        // Seed an analyst turn-001 so the conversation file exists.
+        let analyst = crate::models::Turn {
+            schema: "triage-cli/conversation".into(),
+            schema_version: 1,
+            ticket_id: "44778".into(),
+            turn: 1,
+            turn_kind: crate::models::TurnKind::Analyst,
+            ts: chrono::Utc::now(),
+            author: Some("enrique".into()),
+            body: "does the fork still hold?".into(),
+            evidence: vec![],
+            provider: None,
+            model: None,
+            tokens_in: None,
+            tokens_out: None,
+            elapsed_s: None,
+            session_id: None,
+            resumed: None,
+            action: None,
+            outcome: None,
+            drove_revision_from_turns: None,
+            diff: None,
+        };
+        let conv = crate::chat::conversation_jsonl_path(&ticket_dir);
+        {
+            let _guard = crate::chat::acquire_session_lock(
+                &crate::chat::session_dir(&ticket_dir),
+                std::time::Duration::from_secs(1),
+            )
+            .unwrap();
+            crate::chat::append_turn(&conv, &analyst).unwrap();
+        }
+
+        struct SysCapturingProvider {
+            captured_system: Mutex<Option<String>>,
+        }
+        impl crate::providers::LlmProvider for SysCapturingProvider {
+            fn name(&self) -> &'static str {
+                "fake-sys-capturing"
+            }
+            fn complete<'a>(
+                &'a self,
+                _prompt: &'a str,
+                system: &'a str,
+                _model: &'a str,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<
+                                crate::providers::CompletionResult,
+                                crate::providers::ProviderError,
+                            >,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async move {
+                    *self.captured_system.lock().unwrap() = Some(system.to_string());
+                    Ok(crate::providers::CompletionResult {
+                        text: "context-seed reply".into(),
+                        tokens_in: Some(5),
+                        tokens_out: Some(5),
+                    })
+                })
+            }
+        }
+
+        let provider = SysCapturingProvider {
+            captured_system: Mutex::new(None),
+        };
+        // Caller passes an empty system prompt, exactly like the inbox.
+        followup_turn(
+            &ticket_dir,
+            "44778",
+            "does the fork still hold?",
+            "",
+            "fake-model",
+            &[],
+            &provider,
+        )
+        .await
+        .unwrap();
+
+        let captured = provider
+            .captured_system
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("provider must have been called");
+        assert!(
+            captured.contains("FORK_CONTEXT_SENTINEL"),
+            "ticket context was not seeded into system prompt; got: {captured:?}"
+        );
+        assert!(
+            captured.contains("STATE.md") && captured.contains("fork: A"),
+            "STATE.md context missing from system prompt; got: {captured:?}"
+        );
+        // No prior Codex session → no replay block on this first turn.
+        assert!(
+            !captured.contains("Prior conversation (replayed"),
+            "unexpected replay block on first turn: {captured:?}"
+        );
+    }
+
+    // ── Issue 1: caller system_prompt redaction ───────────────────────────
+
+    #[tokio::test]
+    async fn followup_turn_redacts_caller_system_prompt() {
+        // Verifies that PII in the caller-supplied system_prompt is scrubbed
+        // before reaching the provider. The production caller (inbox TUI)
+        // passes "", but followup_turn is pub, so the invariant must hold
+        // structurally (issue raised in pre-merge review).
+        use std::sync::Mutex;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ticket_dir = dir.path().join("44900");
+        std::fs::create_dir_all(&ticket_dir).unwrap();
+
+        // Seed one analyst turn so the conversation file exists.
+        let analyst = crate::models::Turn {
+            schema: "triage-cli/conversation".into(),
+            schema_version: 1,
+            ticket_id: "44900".into(),
+            turn: 1,
+            turn_kind: crate::models::TurnKind::Analyst,
+            ts: chrono::Utc::now(),
+            author: Some("enrique".into()),
+            body: "initial question".into(),
+            evidence: vec![],
+            provider: None,
+            model: None,
+            tokens_in: None,
+            tokens_out: None,
+            elapsed_s: None,
+            session_id: None,
+            resumed: None,
+            action: None,
+            outcome: None,
+            drove_revision_from_turns: None,
+            diff: None,
+        };
+        let conv = crate::chat::conversation_jsonl_path(&ticket_dir);
+        {
+            let _guard = crate::chat::acquire_session_lock(
+                &crate::chat::session_dir(&ticket_dir),
+                std::time::Duration::from_secs(1),
+            )
+            .unwrap();
+            crate::chat::append_turn(&conv, &analyst).unwrap();
+        }
+
+        struct SysCapture {
+            captured_sys: Mutex<Option<String>>,
+        }
+        impl crate::providers::LlmProvider for SysCapture {
+            fn name(&self) -> &'static str {
+                "fake-sys-capture"
+            }
+            fn complete<'a>(
+                &'a self,
+                _prompt: &'a str,
+                system: &'a str,
+                _model: &'a str,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<
+                                crate::providers::CompletionResult,
+                                crate::providers::ProviderError,
+                            >,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async move {
+                    *self.captured_sys.lock().unwrap() = Some(system.to_string());
+                    Ok(crate::providers::CompletionResult {
+                        text: "sys-redact reply".into(),
+                        tokens_in: None,
+                        tokens_out: None,
+                    })
+                })
+            }
+        }
+
+        let provider = SysCapture {
+            captured_sys: Mutex::new(None),
+        };
+
+        // Caller passes a non-empty system_prompt containing a phone number
+        // (same pattern as redact::tests::redacts_phone).
+        let sys_with_pii = "analyst hotline: (555) 123-4567 — do not share";
+        followup_turn(
+            &ticket_dir,
+            "44900",
+            "what is the next step?",
+            sys_with_pii,
+            "fake-model",
+            &[],
+            &provider,
+        )
+        .await
+        .unwrap();
+
+        let captured = provider
+            .captured_sys
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("provider must have been called");
+
+        // The raw phone MUST NOT appear in the system prompt the provider saw.
+        assert!(
+            !captured.contains("123-4567"),
+            "caller system_prompt PII leaked to provider; got: {captured:?}"
+        );
+        // The redaction sentinel MUST be present.
+        assert!(
+            captured.contains("<PHONE>"),
+            "expected <PHONE> sentinel in redacted system prompt; got: {captured:?}"
+        );
+    }
+
+    // ── Issue 2: outer cap on combined system prompt ──────────────────────
+
+    #[tokio::test]
+    async fn followup_turn_combined_system_prompt_is_capped() {
+        // Verifies that when all three components (caller prompt + preamble +
+        // replay) stack up, the assembled combined_system_prompt is truncated
+        // to COMBINED_SYSTEM_PROMPT_CAP_BYTES on a UTF-8 char boundary.
+        use crate::chat;
+        use std::sync::Mutex;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ticket_dir = dir.path().join("44901");
+        std::fs::create_dir_all(&ticket_dir).unwrap();
+
+        // Write STATE.md and FORK_PACKET.md each much larger than the preamble
+        // cap to ensure the preamble component reaches its individual ceiling.
+        let fat_content = "X".repeat(chat::CONTEXT_PREAMBLE_CAP_BYTES * 3);
+        std::fs::write(ticket_dir.join("STATE.md"), &fat_content).unwrap();
+        std::fs::write(ticket_dir.join("FORK_PACKET.md"), &fat_content).unwrap();
+
+        // Seed a prior Codex turn with a session_id to trigger the replay path,
+        // and make its body large enough to fill the replay component.
+        let analyst = crate::models::Turn {
+            schema: "triage-cli/conversation".into(),
+            schema_version: 1,
+            ticket_id: "44901".into(),
+            turn: 1,
+            turn_kind: crate::models::TurnKind::Analyst,
+            ts: chrono::Utc::now(),
+            author: None,
+            body: "Y".repeat(chat::CONTEXT_PREAMBLE_CAP_BYTES),
+            evidence: vec![],
+            provider: None,
+            model: None,
+            tokens_in: None,
+            tokens_out: None,
+            elapsed_s: None,
+            session_id: None,
+            resumed: None,
+            action: None,
+            outcome: None,
+            drove_revision_from_turns: None,
+            diff: None,
+        };
+        let codex = crate::models::Turn {
+            schema: "triage-cli/conversation".into(),
+            schema_version: 1,
+            ticket_id: "44901".into(),
+            turn: 2,
+            turn_kind: crate::models::TurnKind::Codex,
+            ts: chrono::Utc::now(),
+            author: None,
+            body: "Z".repeat(chat::CONTEXT_PREAMBLE_CAP_BYTES),
+            evidence: vec![],
+            provider: Some("codex".into()),
+            model: None,
+            tokens_in: None,
+            tokens_out: None,
+            elapsed_s: None,
+            session_id: Some("01HBIG000001".into()),
+            resumed: Some(false),
+            action: None,
+            outcome: None,
+            drove_revision_from_turns: None,
+            diff: None,
+        };
+        let conv = chat::conversation_jsonl_path(&ticket_dir);
+        {
+            let _guard = chat::acquire_session_lock(
+                &chat::session_dir(&ticket_dir),
+                std::time::Duration::from_secs(1),
+            )
+            .unwrap();
+            chat::append_turn(&conv, &analyst).unwrap();
+            chat::append_turn(&conv, &codex).unwrap();
+        }
+
+        struct SysCap {
+            captured_sys: Mutex<Option<String>>,
+        }
+        impl crate::providers::LlmProvider for SysCap {
+            fn name(&self) -> &'static str {
+                "fake-sys-cap"
+            }
+            fn complete<'a>(
+                &'a self,
+                _p: &'a str,
+                sys: &'a str,
+                _m: &'a str,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<
+                                crate::providers::CompletionResult,
+                                crate::providers::ProviderError,
+                            >,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async move {
+                    *self.captured_sys.lock().unwrap() = Some(sys.to_string());
+                    Ok(crate::providers::CompletionResult {
+                        text: "cap reply".into(),
+                        tokens_in: None,
+                        tokens_out: None,
+                    })
+                })
+            }
+            fn followup<'a>(
+                &'a self,
+                _session_id: Option<&'a str>,
+                _prompt: &'a str,
+                sys: &'a str,
+                _model: &'a str,
+                _attachments: &'a [crate::models::Attachment],
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<
+                                crate::providers::FollowupResult,
+                                crate::providers::ProviderError,
+                            >,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async move {
+                    *self.captured_sys.lock().unwrap() = Some(sys.to_string());
+                    Ok(crate::providers::FollowupResult {
+                        text: "cap reply".into(),
+                        tokens_in: None,
+                        tokens_out: None,
+                        session_id: None,
+                        resumed: false,
+                    })
+                })
+            }
+        }
+
+        let provider = SysCap {
+            captured_sys: Mutex::new(None),
+        };
+
+        // Caller prompt is also oversized to stress the combined ceiling.
+        // Use the combined cap as the caller prompt size so that caller alone
+        // already fills the ceiling; together with even a small preamble it
+        // will reliably exceed COMBINED_SYSTEM_PROMPT_CAP_BYTES and trigger
+        // the outer truncation.
+        let big_caller_sys = "A".repeat(chat::COMBINED_SYSTEM_PROMPT_CAP_BYTES);
+        followup_turn(
+            &ticket_dir,
+            "44901",
+            "question",
+            &big_caller_sys,
+            "fake-model",
+            &[],
+            &provider,
+        )
+        .await
+        .unwrap();
+
+        let captured = provider
+            .captured_sys
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("provider must have been called");
+
+        // The combined system prompt must not exceed the outer cap plus the
+        // truncation marker length (allow a small slack for the marker).
+        assert!(
+            captured.len() <= chat::COMBINED_SYSTEM_PROMPT_CAP_BYTES + 64,
+            "combined system prompt exceeded cap: {} bytes (cap={}, slack=64); \
+            first 120 bytes: {:?}",
+            captured.len(),
+            chat::COMBINED_SYSTEM_PROMPT_CAP_BYTES,
+            &captured[..captured.len().min(120)],
+        );
+        // Truncation marker must be present (confirms truncation ran).
+        assert!(
+            captured.contains("[system prompt truncated]"),
+            "expected '[system prompt truncated]' in capped system prompt; got: {captured:?}"
         );
     }
 

@@ -419,6 +419,193 @@ pub fn read_base_evidence_manifest(ticket_dir: &Path) -> Result<BaseEvidenceMani
     read_json(&base_evidence_path(ticket_dir))
 }
 
+// ──────────────────────────────────────────────────────────────────────
+//  Chat ticket-context preamble (issues #22, #23)
+//
+//  The chat surface (`tui::inbox::send_analyst_turn` →
+//  `pipeline::followup_turn`) used to pass an empty `system_prompt`, so the
+//  default Unleash provider (stateless HTTP — every turn is independent) and
+//  the first Codex turn answered with zero knowledge of the ticket or the
+//  fork decision. On a Codex session-loss the fresh `codex exec` was equally
+//  context-blind. These helpers rebuild a *bounded*, PII-redacted context
+//  block from the ticket folder (and, for the session-loss safety net, a
+//  short replay of prior turns) that callers seed into `system_prompt`.
+// ──────────────────────────────────────────────────────────────────────
+
+/// Total byte cap for the ticket-context preamble after redaction. Bounded
+/// so it never dominates a provider request (esp. Unleash, where it is
+/// prepended on *every* stateless turn). UTF-8-boundary safe.
+///
+/// Note on caps: each component (`build_ticket_context_preamble`,
+/// `build_conversation_replay`) is individually capped at this value, so the
+/// fully-assembled `combined_system_prompt` in `pipeline::followup_turn` may
+/// reach up to `COMBINED_SYSTEM_PROMPT_CAP_BYTES` (2× + caller prompt). The
+/// pipeline applies a final `truncate_on_boundary` pass using that outer cap.
+pub const CONTEXT_PREAMBLE_CAP_BYTES: usize = 8 * 1024;
+
+/// Outer cap applied to the fully-assembled combined system prompt in
+/// `pipeline::followup_turn` — covers the preamble + replay + caller prompt
+/// all stacking on the session-loss path. Two per-component caps plus
+/// a reasonable caller prompt → 20 KiB is a safe ceiling that stays
+/// well under POSIX arg-space limits.
+pub const COMBINED_SYSTEM_PROMPT_CAP_BYTES: usize = 20 * 1024;
+
+/// Per-source cap applied to STATE.md / FORK_PACKET.md before they are
+/// concatenated. Keeps a single oversized file from crowding out the other.
+const CONTEXT_SECTION_CAP_BYTES: usize = 4 * 1024;
+
+/// Max base-evidence catalog rows folded into the preamble summary.
+const CONTEXT_EVIDENCE_ROWS: usize = 20;
+
+/// Default number of most-recent prior turns replayed on the Codex
+/// session-loss safety net (issue #23).
+pub const CONVERSATION_REPLAY_TURNS: usize = 8;
+
+/// Per-turn body cap inside a conversation replay block.
+const CONVERSATION_REPLAY_PER_TURN_BYTES: usize = 1024;
+
+/// Truncate `s` to at most `cap` bytes on a UTF-8 char boundary, appending
+/// a `marker` when truncation occurred. Empty input yields an empty string.
+pub(crate) fn truncate_on_boundary(s: &str, cap: usize, marker: &str) -> String {
+    if s.len() <= cap {
+        return s.to_string();
+    }
+    let mut cut = cap;
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let mut out = s[..cut].to_string();
+    out.push_str(marker);
+    out
+}
+
+/// Build a bounded, PII-redacted ticket-context preamble from the ticket
+/// folder for seeding an LLM chat `system_prompt` (issues #22, #23).
+///
+/// Sources, in order: `STATE.md`, `FORK_PACKET.md`, and a short
+/// base-evidence catalog summary (`<ticket_dir>/.session/base-evidence-manifest.json`).
+/// Every source is best-effort: a missing or unreadable file is skipped
+/// rather than erroring, because the chat surface must keep working even
+/// before a full investigation has been written.
+///
+/// The assembled text is run through [`crate::redact::redact`] (the PII
+/// boundary rule — operational identifiers are preserved; caller PII is
+/// scrubbed) and then capped at [`CONTEXT_PREAMBLE_CAP_BYTES`].
+///
+/// Returns `None` when no usable context could be assembled, so callers
+/// can fall back to an empty `system_prompt`.
+pub fn build_ticket_context_preamble(ticket_dir: &Path) -> Option<String> {
+    let mut sections: Vec<String> = Vec::new();
+
+    // STATE.md — the committed fork decision (YAML frontmatter).
+    if let Ok(state) = fs::read_to_string(ticket_dir.join("STATE.md")) {
+        let state = state.trim();
+        if !state.is_empty() {
+            sections.push(format!(
+                "## Ticket state (STATE.md)\n{}",
+                truncate_on_boundary(state, CONTEXT_SECTION_CAP_BYTES, "\n[truncated]")
+            ));
+        }
+    }
+
+    // FORK_PACKET.md — the committed routing decision + reasoning.
+    if let Ok(fp) = fs::read_to_string(ticket_dir.join("FORK_PACKET.md")) {
+        let fp = fp.trim();
+        if !fp.is_empty() {
+            sections.push(format!(
+                "## Fork packet (FORK_PACKET.md)\n{}",
+                truncate_on_boundary(fp, CONTEXT_SECTION_CAP_BYTES, "\n[truncated]")
+            ));
+        }
+    }
+
+    // Base-evidence catalog summary — id / kind / label rows only (bodies
+    // are intentionally excluded; they are large and the provider already
+    // gets the analyst's freshly attached evidence on the live turn).
+    if let Ok(bem) = read_base_evidence_manifest(ticket_dir) {
+        if !bem.evidence.is_empty() {
+            let mut block =
+                String::from("## Base evidence catalog (from the original investigation)\n");
+            for entry in bem.evidence.iter().take(CONTEXT_EVIDENCE_ROWS) {
+                block.push_str(&format!(
+                    "- {} [{}] {}\n",
+                    entry.item.id, entry.item.kind, entry.item.label
+                ));
+            }
+            if bem.evidence.len() > CONTEXT_EVIDENCE_ROWS {
+                block.push_str(&format!(
+                    "- … and {} more evidence item(s)\n",
+                    bem.evidence.len() - CONTEXT_EVIDENCE_ROWS
+                ));
+            }
+            sections.push(block.trim_end().to_string());
+        }
+    }
+
+    if sections.is_empty() {
+        return None;
+    }
+
+    let preamble = format!(
+        "You are assisting an analyst with a triage ticket. The following \
+is the committed context for this ticket; treat it as ground truth and \
+answer the analyst's questions with it in mind.\n\n{}",
+        sections.join("\n\n")
+    );
+
+    // PII boundary: anything heading to a provider goes through redact.
+    let (redacted, _counts) = crate::redact::redact(&preamble);
+    let capped = truncate_on_boundary(
+        &redacted,
+        CONTEXT_PREAMBLE_CAP_BYTES,
+        "\n\n[context truncated]",
+    );
+    Some(capped)
+}
+
+/// Build a bounded, PII-redacted replay of the most recent prior
+/// conversation turns. Used as the Codex session-loss safety net (#23):
+/// when `codex exec resume` fails ("no rollout found for thread id"), the
+/// provider starts a fresh process with no server-side history, so the
+/// model would otherwise answer with amnesia. Seeding this replay into the
+/// `system_prompt` reconstructs the recent thread.
+///
+/// Only `Analyst` and `Codex` turns are replayed (System/Automated turns
+/// are bookkeeping). At most `max_turns` of the most-recent turns are
+/// included, each body capped at [`CONVERSATION_REPLAY_PER_TURN_BYTES`].
+/// The whole block is redacted and returned, or `None` if there is nothing
+/// to replay.
+pub fn build_conversation_replay(turns: &[Turn], max_turns: usize) -> Option<String> {
+    let relevant: Vec<&Turn> = turns
+        .iter()
+        .filter(|t| matches!(t.turn_kind, TurnKind::Analyst | TurnKind::Codex))
+        .collect();
+    if relevant.is_empty() || max_turns == 0 {
+        return None;
+    }
+    let start = relevant.len().saturating_sub(max_turns);
+    let mut block = String::from(
+        "## Prior conversation (replayed — the live session was lost)\n\
+Earlier turns in this analyst chat, oldest first:\n",
+    );
+    for t in &relevant[start..] {
+        let speaker = match t.turn_kind {
+            TurnKind::Analyst => "analyst",
+            TurnKind::Codex => "assistant",
+            // unreachable given the filter above, but keep total.
+            _ => "other",
+        };
+        let body = truncate_on_boundary(t.body.trim(), CONVERSATION_REPLAY_PER_TURN_BYTES, " […]");
+        block.push_str(&format!("\n### turn {} ({})\n{}\n", t.turn, speaker, body));
+    }
+    let (redacted, _counts) = crate::redact::redact(&block);
+    Some(truncate_on_boundary(
+        &redacted,
+        CONTEXT_PREAMBLE_CAP_BYTES,
+        "\n\n[replay truncated]",
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -769,5 +956,155 @@ mod tests {
         // Ensure the catalog metadata is preserved as flat fields.
         assert_eq!(back.evidence[0].item.id, "E-001");
         assert_eq!(back.evidence[1].item.kind, "datadog_log_window");
+    }
+
+    // ── ticket-context preamble (#22, #23) ───────────────────────────
+
+    #[test]
+    fn preamble_none_when_folder_empty() {
+        let dir = tempdir().unwrap();
+        // No STATE.md / FORK_PACKET.md / manifest → nothing to assemble.
+        assert!(build_ticket_context_preamble(dir.path()).is_none());
+    }
+
+    #[test]
+    fn preamble_includes_state_fork_and_evidence() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("STATE.md"),
+            "---\nticket_id: 44776\nfork: B\nconfidence: medium\n---\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("FORK_PACKET.md"),
+            "# FORK PACKET\n\nRecommendation: Fork B — vendor/IT.\n",
+        )
+        .unwrap();
+        let bem = BaseEvidenceManifest {
+            schema: "triage-cli/base-evidence".into(),
+            schema_version: 2,
+            ticket_id: "44776".into(),
+            captured_at: Utc::now(),
+            evidence: vec![crate::models::BaseEvidenceEntry {
+                item: crate::models::EvidenceItem {
+                    id: "E-001".into(),
+                    kind: "zendesk_comment".into(),
+                    label: "first comment".into(),
+                    source_time: None,
+                    source_path: "zendesk:comment/1".into(),
+                },
+                body: Some("a body that must NOT appear in the catalog summary".into()),
+            }],
+        };
+        write_base_evidence_manifest(dir.path(), &bem).unwrap();
+
+        let p = build_ticket_context_preamble(dir.path()).expect("preamble must build");
+        assert!(p.contains("STATE.md"), "missing STATE section: {p}");
+        assert!(p.contains("fork: B"), "missing state body: {p}");
+        assert!(p.contains("FORK_PACKET.md"), "missing fork section: {p}");
+        assert!(p.contains("Fork B — vendor/IT"), "missing fork body: {p}");
+        assert!(
+            p.contains("E-001 [zendesk_comment] first comment"),
+            "missing evidence catalog row: {p}"
+        );
+        // Bodies are intentionally excluded from the catalog summary.
+        assert!(
+            !p.contains("a body that must NOT appear"),
+            "evidence body leaked into preamble: {p}"
+        );
+    }
+
+    #[test]
+    fn preamble_redacts_pii() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("FORK_PACKET.md"),
+            "Reporter left a callback at (555) 123-4567 in the notes.\n",
+        )
+        .unwrap();
+        let p = build_ticket_context_preamble(dir.path()).expect("preamble must build");
+        assert!(
+            !p.contains("123-4567"),
+            "raw phone leaked through the preamble: {p}"
+        );
+        assert!(p.contains("<PHONE>"), "redaction sentinel missing: {p}");
+    }
+
+    #[test]
+    fn preamble_respects_byte_cap() {
+        let dir = tempdir().unwrap();
+        // Two oversized files; total well over the cap.
+        fs::write(
+            dir.path().join("STATE.md"),
+            "S".repeat(CONTEXT_PREAMBLE_CAP_BYTES * 2),
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("FORK_PACKET.md"),
+            "F".repeat(CONTEXT_PREAMBLE_CAP_BYTES * 2),
+        )
+        .unwrap();
+        let p = build_ticket_context_preamble(dir.path()).expect("preamble must build");
+        // Cap + the truncation marker (~22 bytes) — allow a small slack.
+        assert!(
+            p.len() <= CONTEXT_PREAMBLE_CAP_BYTES + 32,
+            "preamble exceeded cap: {} bytes",
+            p.len()
+        );
+        assert!(
+            p.ends_with("[context truncated]"),
+            "expected truncation marker; tail: {:?}",
+            &p[p.len().saturating_sub(40)..]
+        );
+    }
+
+    #[test]
+    fn replay_none_without_analyst_or_codex_turns() {
+        // Only a System turn → nothing replayable.
+        let mut t = sample_analyst_turn(1);
+        t.turn_kind = TurnKind::System;
+        assert!(build_conversation_replay(&[t], CONVERSATION_REPLAY_TURNS).is_none());
+        assert!(build_conversation_replay(&[], CONVERSATION_REPLAY_TURNS).is_none());
+    }
+
+    #[test]
+    fn replay_keeps_only_last_n_turns_and_redacts() {
+        let mut turns = Vec::new();
+        for i in 1..=12 {
+            let mut t = sample_analyst_turn(i);
+            t.body = format!("analyst turn {i}");
+            t.evidence.clear();
+            turns.push(t);
+        }
+        // Inject PII into the newest turn.
+        let n = turns.len();
+        turns[n - 1].body = "ring me at (555) 123-4567".into();
+
+        let replay = build_conversation_replay(&turns, 8).expect("replay must build");
+        // Only the last 8 turns (5..=12) are present.
+        assert!(replay.contains("turn 12"), "newest turn missing: {replay}");
+        assert!(replay.contains("turn 5"), "8th-from-last missing: {replay}");
+        assert!(
+            !replay.contains("analyst turn 4"),
+            "older turn leaked into replay: {replay}"
+        );
+        // PII scrubbed.
+        assert!(
+            !replay.contains("123-4567"),
+            "PII leaked into replay: {replay}"
+        );
+        assert!(replay.contains("<PHONE>"), "redaction missing: {replay}");
+    }
+
+    #[test]
+    fn replay_caps_each_turn_body() {
+        let mut t = sample_analyst_turn(1);
+        t.body = "x".repeat(CONVERSATION_REPLAY_PER_TURN_BYTES * 4);
+        t.evidence.clear();
+        let replay = build_conversation_replay(&[t], 8).expect("replay must build");
+        assert!(
+            replay.contains(" […]"),
+            "per-turn truncation marker missing: {replay}"
+        );
     }
 }
