@@ -18,8 +18,8 @@ use crate::extract::{self, ExtractError, SiteStrategy};
 use crate::llm::{self, LlmError};
 use crate::memory;
 use crate::models::{
-    AnchorSource, Confidence, CustomerHistoryEvidence, DraftsBlock, ForkCommitment, ForkLetter,
-    ForkPacket, HandoffBlock, InitialRoute, IntakeBlock, IntakeDecision, IntakeTicketFacts,
+    Confidence, CustomerHistoryEvidence, DraftsBlock, ForkCommitment, ForkLetter, ForkPacket,
+    HandoffBlock, InitialRoute, IntakeBlock, IntakeDecision, IntakeTicketFacts,
     InvestigationSession, LogLine, MemoryContext, MemoryEntry, PreflightBlock, RelatedWork,
     SiteEntry, StructuredTriageReport, Ticket, TriageBundle,
 };
@@ -295,11 +295,32 @@ pub async fn investigate_one_structured(
         &format!("{} event(s)", session.timeline.len()),
     );
 
-    // Phase: enrichment (optional Datadog) — same as legacy
+    // Phase: enrichment (optional Datadog)
+    //
+    // F6: the resolved anchor + window are computed *unconditionally* here
+    // (regardless of whether Datadog will be queried) so the bundle's
+    // metadata reflects the actual timeframe the analyst is investigating.
+    // Previously the bundle recorded `created_at` and `window=None` even
+    // when DD had been queried with an LLM-extracted anchor — so
+    // `TriageBundle::as_user_message` told the model "no Datadog window"
+    // and the extracted anchor was thrown away.
+    //
+    // The LLM `extract_anchor` call stays gated on `dd_client.is_some()`
+    // to preserve cost: there is no point spending an LLM round-trip on
+    // anchor extraction when no log query will follow.
     reporter.phase_started("enrichment", "");
     let mut site_entry: Option<SiteEntry> = None;
     let mut log_lines: Vec<LogLine> = Vec::new();
     let mut log_truncated = false;
+
+    let extracted_anchor = if opts.anchor_override.is_none() && dd_client.is_some() {
+        llm::extract_anchor(&ticket, None).await.unwrap_or(None)
+    } else {
+        None
+    };
+    let (anchor_dt, anchor_src) =
+        extract::resolve_anchor(&ticket, opts.anchor_override, extracted_anchor);
+    let (window_start, window_end) = extract::build_window(anchor_dt, opts.window_minutes)?;
 
     if let Some(dd) = dd_client {
         let sites_path_buf = crate::paths::triage_home().join("data/cnc-map.json");
@@ -316,16 +337,9 @@ pub async fn investigate_one_structured(
                     )
                     .await?;
                     if let Some(entry) = resolved {
-                        let extracted_dt = if opts.anchor_override.is_none() {
-                            llm::extract_anchor(&ticket, None).await.unwrap_or(None)
-                        } else {
-                            None
-                        };
-                        let (anchor_dt, _src) =
-                            extract::resolve_anchor(&ticket, opts.anchor_override, extracted_dt);
-                        let (start, end) = extract::build_window(anchor_dt, opts.window_minutes)?;
-                        let (logs, truncated) =
-                            dd.get_logs(&entry.site_name, &levels, start, end).await?;
+                        let (logs, truncated) = dd
+                            .get_logs(&entry.site_name, &levels, window_start, window_end)
+                            .await?;
                         log_lines = logs;
                         log_truncated = truncated;
                         site_entry = Some(entry);
@@ -338,6 +352,20 @@ pub async fn investigate_one_structured(
     } else {
         reporter.phase_done("enrichment", "skipped (no Datadog client)");
     }
+
+    // F6: surface the resolved anchor/window via the Reporter so
+    // operators can observe them in `--metrics-out` JSON and tests can
+    // assert against them without changing the public return type.
+    reporter.record_metric("anchor.unix", MetricValue::Int(anchor_dt.timestamp()));
+    reporter.record_metric(
+        "anchor.source",
+        MetricValue::Str(anchor_src.as_str().to_string()),
+    );
+    reporter.record_metric(
+        "window.start_unix",
+        MetricValue::Int(window_start.timestamp()),
+    );
+    reporter.record_metric("window.end_unix", MetricValue::Int(window_end.timestamp()));
 
     // Record evidence counts before the LLM call (available regardless of --no-llm).
     reporter.record_metric(
@@ -361,19 +389,20 @@ pub async fn investigate_one_structured(
     // Build the evidence bundle unconditionally so both the LLM path and the
     // --no-llm path have access to the assigned-ID evidence list. The
     // base-snapshot writes (§ 5.4) consume `bundle.evidence_index`.
+    //
+    // F6: anchor / anchor_source / window_* are now taken from the values
+    // computed above (and reused by the DD query). The previous code
+    // re-derived these locally and lost both the LLM-extracted anchor and
+    // the actual window the logs were sampled from.
     let mut bundle = TriageBundle {
         ticket: ticket.clone(),
         site_entry: site_entry.clone(),
         log_lines: log_lines.clone(),
         log_truncated,
-        anchor: Some(opts.anchor_override.unwrap_or(ticket.created_at)),
-        anchor_source: Some(if opts.anchor_override.is_some() {
-            AnchorSource::Flag
-        } else {
-            AnchorSource::CreatedAt
-        }),
-        window_start: None,
-        window_end: None,
+        anchor: Some(anchor_dt),
+        anchor_source: Some(anchor_src),
+        window_start: Some(window_start),
+        window_end: Some(window_end),
         downloaded_attachments: session.evidence.attachments.clone(),
         local_files: session.evidence.local_files.clone(),
         pasted_logs: session.evidence.pasted_logs.clone(),
@@ -3411,6 +3440,98 @@ validator_warnings: []\n---\n";
         match prev_triage_owner {
             Some(v) => std::env::set_var("TRIAGE_OWNER", v),
             None => std::env::remove_var("TRIAGE_OWNER"),
+        }
+    }
+
+    /// F6: the bundle handed to the LLM previously recorded the anchor as
+    /// `opts.anchor_override.unwrap_or(ticket.created_at)` and the window
+    /// as `None` — so even when Datadog *was* queried with a real window,
+    /// `TriageBundle::as_user_message` printed `"# Logs (n lines; no
+    /// Datadog window)"` and dropped the LLM-extracted anchor on the
+    /// floor. This test asserts the pipeline records the resolved anchor
+    /// and window via `record_metric` (also the cheapest observable
+    /// surface — adding fields to `StructuredInvestigation` would change
+    /// the public type).
+    #[tokio::test]
+    async fn investigate_records_resolved_anchor_and_window() {
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+
+        struct CapturingReporter {
+            metrics: Mutex<HashMap<String, MetricValue>>,
+        }
+        impl Reporter for CapturingReporter {
+            fn phase_started(&self, _p: &str, _d: &str) {}
+            fn phase_done(&self, _p: &str, _d: &str) {}
+            fn phase_failed(&self, _p: &str, _e: &str) {}
+            fn record_metric(&self, key: &str, value: MetricValue) {
+                self.metrics.lock().unwrap().insert(key.to_string(), value);
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let fixtures_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let loader = crate::fixture::FixtureLoader::new(fixtures_dir.join("audio-drop"))
+            .expect("audio-drop fixture must exist");
+        let ticket = loader.load_ticket().expect("ticket.json");
+        let logs = loader.load_datadog_logs().expect("datadog-logs.json");
+        let memory_hits = loader.load_memory_hits().expect("memory-hits.json");
+
+        let mut session = crate::investigation::create_session(ticket.clone());
+        let dd = crate::fixture::FixtureDatadogClient::new(logs);
+        let opts = InvestigateOptions {
+            no_llm: true,
+            memory_hits_override: Some(memory_hits),
+            force: true,
+            followup_mode: false,
+            ..InvestigateOptions::defaults()
+        };
+        let rubric = Rubric::load().expect("embedded rubric");
+        let reporter = CapturingReporter {
+            metrics: Mutex::new(HashMap::new()),
+        };
+
+        let memory_md = dir.path().join("MEMORY.md");
+        let memory_db = dir.path().join("data/memory.db");
+        let _env = crate::memory::MemoryEnvScope::new_with_tickets_root(
+            &memory_md,
+            &memory_db,
+            Some(dir.path()),
+        );
+
+        investigate_one_structured(
+            ticket.clone(),
+            &mut session,
+            Some(&dd as &dyn crate::datadog::DatadogSource),
+            &rubric,
+            &reporter,
+            &opts,
+        )
+        .await
+        .expect("fixture pipeline must succeed");
+
+        let metrics = reporter.metrics.lock().unwrap();
+        let expect_anchor_unix = ticket.created_at.timestamp();
+        let expect_start_unix =
+            (ticket.created_at - chrono::Duration::minutes(opts.window_minutes as i64)).timestamp();
+        let expect_end_unix =
+            (ticket.created_at + chrono::Duration::minutes(opts.window_minutes as i64)).timestamp();
+
+        match metrics.get("anchor.unix") {
+            Some(MetricValue::Int(n)) => assert_eq!(*n, expect_anchor_unix),
+            other => panic!("anchor.unix missing or wrong type: {other:?}"),
+        }
+        match metrics.get("anchor.source") {
+            Some(MetricValue::Str(s)) => assert_eq!(s, "created_at"),
+            other => panic!("anchor.source missing or wrong type: {other:?}"),
+        }
+        match metrics.get("window.start_unix") {
+            Some(MetricValue::Int(n)) => assert_eq!(*n, expect_start_unix),
+            other => panic!("window.start_unix missing or wrong type: {other:?}"),
+        }
+        match metrics.get("window.end_unix") {
+            Some(MetricValue::Int(n)) => assert_eq!(*n, expect_end_unix),
+            other => panic!("window.end_unix missing or wrong type: {other:?}"),
         }
     }
 }
