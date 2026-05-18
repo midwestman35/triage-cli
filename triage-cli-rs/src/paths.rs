@@ -55,7 +55,15 @@ pub fn migrate_home_dest() -> PathBuf {
 /// Copy `.env`, `MEMORY.md`, `apex-cnc-inventory.md`, and `data/` from `src`
 /// into `dest`. Refuses if `src == dest`. Does not delete from `src`.
 /// Returns the destination path on success.
-pub fn migrate_home(src: &std::path::Path, dest: &std::path::Path) -> std::io::Result<PathBuf> {
+///
+/// When `force` is `false` (the default), any file that already exists at the
+/// destination is **skipped** and a `kept existing <name>` notice is emitted to
+/// stderr. Pass `force: true` to restore the original overwrite behaviour.
+pub fn migrate_home(
+    src: &std::path::Path,
+    dest: &std::path::Path,
+    force: bool,
+) -> std::io::Result<PathBuf> {
     if src == dest {
         return Err(std::io::Error::other(
             "migrate-home refuses: source and destination are the same",
@@ -67,7 +75,11 @@ pub fn migrate_home(src: &std::path::Path, dest: &std::path::Path) -> std::io::R
         let from = src.join(name);
         if from.exists() {
             let to = dest.join(name);
-            std::fs::copy(&from, &to)?;
+            if !force && to.exists() {
+                eprintln!("migrate-home: kept existing {name}");
+            } else {
+                std::fs::copy(&from, &to)?;
+            }
         }
     }
 
@@ -80,7 +92,15 @@ pub fn migrate_home(src: &std::path::Path, dest: &std::path::Path) -> std::io::R
             let from = entry.path();
             let to = data_dst.join(entry.file_name());
             if from.is_file() {
-                std::fs::copy(&from, &to)?;
+                if !force && to.exists() {
+                    let name = entry.file_name();
+                    eprintln!(
+                        "migrate-home: kept existing data/{}",
+                        name.to_string_lossy()
+                    );
+                } else {
+                    std::fs::copy(&from, &to)?;
+                }
             }
         }
     }
@@ -138,7 +158,7 @@ mod tests {
         std::fs::create_dir(src.path().join("data")).unwrap();
         std::fs::write(src.path().join("data").join("memory.db"), "db").unwrap();
 
-        let returned = migrate_home(src.path(), dest.path()).unwrap();
+        let returned = migrate_home(src.path(), dest.path(), false).unwrap();
         assert_eq!(returned, dest.path());
 
         assert_eq!(
@@ -160,7 +180,67 @@ mod tests {
     #[test]
     fn migrate_home_refuses_same_dir() {
         let dir = tempfile::tempdir().unwrap();
-        let result = migrate_home(dir.path(), dir.path());
+        let result = migrate_home(dir.path(), dir.path(), false);
         assert!(result.is_err());
+    }
+
+    /// force=false: existing destination files are skipped (preserved), and the
+    /// source is NOT lost.
+    #[test]
+    fn migrate_home_noclobber_preserves_existing_dest() {
+        let src = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+
+        // Populate source.
+        std::fs::write(src.path().join("MEMORY.md"), "new-memory").unwrap();
+        std::fs::create_dir(src.path().join("data")).unwrap();
+        std::fs::write(src.path().join("data").join("memory.db"), "new-db").unwrap();
+
+        // Pre-populate destination with existing content.
+        std::fs::write(dest.path().join("MEMORY.md"), "existing-memory").unwrap();
+        std::fs::create_dir(dest.path().join("data")).unwrap();
+        std::fs::write(dest.path().join("data").join("memory.db"), "existing-db").unwrap();
+
+        migrate_home(src.path(), dest.path(), false).unwrap();
+
+        // Destination files must be unchanged.
+        assert_eq!(
+            std::fs::read_to_string(dest.path().join("MEMORY.md")).unwrap(),
+            "existing-memory"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dest.path().join("data").join("memory.db")).unwrap(),
+            "existing-db"
+        );
+        // Source must still exist (migrate never deletes).
+        assert!(src.path().join("MEMORY.md").exists());
+        assert!(src.path().join("data").join("memory.db").exists());
+    }
+
+    /// force=true: existing destination files ARE overwritten.
+    #[test]
+    fn migrate_home_force_overwrites_existing_dest() {
+        let src = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+
+        std::fs::write(src.path().join("MEMORY.md"), "new-memory").unwrap();
+        std::fs::create_dir(src.path().join("data")).unwrap();
+        std::fs::write(src.path().join("data").join("memory.db"), "new-db").unwrap();
+
+        std::fs::write(dest.path().join("MEMORY.md"), "existing-memory").unwrap();
+        std::fs::create_dir(dest.path().join("data")).unwrap();
+        std::fs::write(dest.path().join("data").join("memory.db"), "existing-db").unwrap();
+
+        migrate_home(src.path(), dest.path(), true).unwrap();
+
+        // Destination files must now reflect the source.
+        assert_eq!(
+            std::fs::read_to_string(dest.path().join("MEMORY.md")).unwrap(),
+            "new-memory"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dest.path().join("data").join("memory.db")).unwrap(),
+            "new-db"
+        );
     }
 }
