@@ -524,6 +524,39 @@ async fn cmd_triage(c: TriageCmd) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// F3: bundled fixture-mode inputs for `investigate`. The fixture flag
+/// previously only partially routed through `cmd_investigate` —
+/// `ZendeskClient::from_env()` was called unconditionally before
+/// reaching the fixture-only DD/memory branches, so `investigate
+/// --fixture <dir>` died at the credential check despite advertising
+/// fixture loading in `--help`. This struct + the loader below pin a
+/// single source-of-truth path that `cmd_investigate` can branch into.
+pub(crate) struct InvestigateFixtureInputs {
+    pub ticket: crate::models::Ticket,
+    pub dd: FixtureDatadogClient,
+    pub memory_hits: Vec<crate::models::MemoryEntry>,
+}
+
+pub(crate) fn load_investigate_inputs_from_fixture(
+    fixture_path: &Path,
+) -> Result<InvestigateFixtureInputs, String> {
+    let loader = FixtureLoader::new(fixture_path).map_err(|e| format!("fixture: {e}"))?;
+    let ticket = loader
+        .load_ticket()
+        .map_err(|e| format!("fixture ticket: {e}"))?;
+    let logs = loader
+        .load_datadog_logs()
+        .map_err(|e| format!("fixture logs: {e}"))?;
+    let memory_hits = loader
+        .load_memory_hits()
+        .map_err(|e| format!("fixture memory-hits: {e}"))?;
+    Ok(InvestigateFixtureInputs {
+        ticket,
+        dd: FixtureDatadogClient::new(logs),
+        memory_hits,
+    })
+}
+
 async fn cmd_investigate(c: InvestigateCmd) -> ExitCode {
     use std::io::IsTerminal;
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
@@ -576,26 +609,61 @@ async fn cmd_investigate(c: InvestigateCmd) -> ExitCode {
         }
     }
 
-    let zd = match ZendeskClient::from_env() {
-        Ok(z) => z,
-        Err(e) => die(&e.to_string()),
-    };
-    let ticket = match pipeline::spinner(
-        &format!("Fetching ticket #{ticket_id}"),
-        true,
-        zd.get_ticket(ticket_id),
-    )
-    .await
+    // F3: fixture mode bypasses Zendesk entirely. The interactive
+    // workspace + paste-drop UI still runs so the analyst can layer new
+    // evidence onto the fixture ticket, but no live network call is
+    // made (and no Zendesk credential is required).
+    let (ticket, fixture_dd, fixture_memory, downloaded_from_zendesk) = if let Some(fixture_path) =
+        c.fixture.clone()
     {
-        Ok(t) => t,
-        Err(e) => die(&e.to_string()),
+        let inputs = match load_investigate_inputs_from_fixture(&fixture_path) {
+            Ok(i) => i,
+            Err(e) => die(&e),
+        };
+        if c.verbose {
+            eprintln!(
+                "Fixture mode: ticket #{} — {}",
+                inputs.ticket.id, inputs.ticket.subject
+            );
+        }
+        (
+            inputs.ticket,
+            Some(inputs.dd),
+            Some(inputs.memory_hits),
+            Vec::new(),
+        )
+    } else {
+        let zd = match ZendeskClient::from_env() {
+            Ok(z) => z,
+            Err(e) => die(&e.to_string()),
+        };
+        let ticket = match pipeline::spinner(
+            &format!("Fetching ticket #{ticket_id}"),
+            true,
+            zd.get_ticket(ticket_id),
+        )
+        .await
+        {
+            Ok(t) => t,
+            Err(e) => die(&e.to_string()),
+        };
+        if c.verbose {
+            eprintln!(
+                "Fetched ticket #{} — subject: {}",
+                ticket.id, ticket.subject
+            );
+        }
+        let scratch_root_buf = crate::paths::triage_home().join("scratch");
+        let zd_workspace =
+            match interactive::ensure_workspace(scratch_root_buf.as_path(), ticket.id) {
+                Ok(w) => w,
+                Err(e) => die(&format!("workspace: {e}")),
+            };
+        let downloaded =
+            interactive::download_attachments(&ticket, &zd, &zd_workspace, 150 * 1024 * 1024).await;
+        (ticket, None, None, downloaded)
     };
-    if c.verbose {
-        eprintln!(
-            "Fetched ticket #{} — subject: {}",
-            ticket.id, ticket.subject
-        );
-    }
+
     let scratch_root_buf = crate::paths::triage_home().join("scratch");
     let workspace = match interactive::ensure_workspace(scratch_root_buf.as_path(), ticket.id) {
         Ok(w) => w,
@@ -614,19 +682,17 @@ async fn cmd_investigate(c: InvestigateCmd) -> ExitCode {
         ticket.comments.len()
     );
 
-    let downloaded =
-        interactive::download_attachments(&ticket, &zd, &workspace, 150 * 1024 * 1024).await;
     let local_files = interactive::prompt_drop_and_wait(&workspace);
     eprintln!(
         "{}",
-        interactive::summarize_workspace(&workspace, &local_files, &downloaded)
+        interactive::summarize_workspace(&workspace, &local_files, &downloaded_from_zendesk)
     );
 
     let mut session = investigation::create_session(ticket.clone());
     for lf in local_files {
         session.evidence.local_files.push(lf);
     }
-    for d in downloaded {
+    for d in downloaded_from_zendesk {
         session.evidence.attachments.push(d);
     }
     for path in &c.files {
@@ -638,34 +704,10 @@ async fn cmd_investigate(c: InvestigateCmd) -> ExitCode {
         investigation::add_pasted_evidence(&mut session, &label, &text);
     }
 
-    let dd = if c.no_logs {
+    let dd = if c.no_logs || c.fixture.is_some() {
         None
     } else {
         DatadogClient::from_env().ok()
-    };
-
-    // Fixture mode: also load fixture logs if --fixture is set.
-    let fixture_dd = if let Some(ref fixture_path) = c.fixture {
-        match FixtureLoader::new(fixture_path) {
-            Ok(loader) => match loader.load_datadog_logs() {
-                Ok(logs) => Some(FixtureDatadogClient::new(logs)),
-                Err(e) => die(&format!("fixture logs: {e}")),
-            },
-            Err(e) => die(&format!("fixture: {e}")),
-        }
-    } else {
-        None
-    };
-    let fixture_memory = if let Some(ref fixture_path) = c.fixture {
-        match FixtureLoader::new(fixture_path) {
-            Ok(loader) => match loader.load_memory_hits() {
-                Ok(hits) => Some(hits),
-                Err(e) => die(&format!("fixture memory-hits: {e}")),
-            },
-            Err(e) => die(&format!("fixture: {e}")),
-        }
-    } else {
-        None
     };
 
     let opts = InvestigateOptions {
@@ -1074,5 +1116,51 @@ async fn cmd_inbox(c: InboxCmd) -> ExitCode {
     match tui::run_inbox(opts).await {
         Ok(_) => ExitCode::SUCCESS,
         Err(e) => die(&e.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod investigate_fixture_tests {
+    //! F3: `investigate --fixture <dir>` advertised in `--help` and parsed
+    //! by clap, but `cmd_investigate` still unconditionally called
+    //! `ZendeskClient::from_env()` and `zd.get_ticket(...)`. The fixture
+    //! flag only partially routed through (logs + memory hits read from
+    //! the fixture, but the ticket itself still came from Zendesk), so
+    //! the command failed without Zendesk credentials despite the flag.
+    //!
+    //! These tests pin the contract on `load_investigate_inputs_from_fixture`:
+    //! the fixture path must yield a complete inputs tuple (ticket + DD
+    //! client + memory hits) without touching any Zendesk surface.
+    use super::*;
+
+    #[test]
+    fn fixture_loader_succeeds_against_audio_drop_without_zendesk() {
+        // The audio-drop fixture ships in-tree. Loading it must not depend
+        // on any Zendesk credential being set in the process env — we
+        // explicitly avoid touching env vars so this test is hermetic.
+        let fixtures_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let inputs = load_investigate_inputs_from_fixture(&fixtures_dir.join("audio-drop"))
+            .expect("audio-drop fixture must load");
+        assert_eq!(inputs.ticket.id, 55001);
+        assert!(
+            !inputs.ticket.subject.is_empty(),
+            "fixture must hydrate the ticket subject"
+        );
+        // Logs and memory hits come from the fixture too — confirms the
+        // full inputs bundle is satisfied without Zendesk.
+        assert!(
+            !inputs.memory_hits.is_empty(),
+            "fixture memory-hits.json must be loaded into the inputs"
+        );
+    }
+
+    #[test]
+    fn fixture_loader_surfaces_missing_fixture_dir_error() {
+        let nonexistent = std::path::PathBuf::from("/this/path/does/not/exist");
+        let result = load_investigate_inputs_from_fixture(&nonexistent);
+        assert!(
+            result.is_err(),
+            "missing fixture dir must surface as Err, not panic"
+        );
     }
 }
