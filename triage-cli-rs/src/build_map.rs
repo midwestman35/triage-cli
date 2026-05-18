@@ -269,8 +269,9 @@ pub fn run() -> ExitCode {
     let inventory_path = crate::paths::triage_home().join(INVENTORY);
     let Ok(raw_bytes) = fs::read(&inventory_path) else {
         eprintln!(
-            "Error: could not read {} from the current working directory.",
-            INVENTORY
+            "Error: could not read {} (looked in {}).",
+            INVENTORY,
+            inventory_path.display()
         );
         return ExitCode::FAILURE;
     };

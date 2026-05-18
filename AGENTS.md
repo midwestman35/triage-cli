@@ -80,13 +80,13 @@ Tests are inline (`#[cfg(test)]`) in the same `.rs` source files. Mocked clients
 
 `triage-cli-rs/` follows one-module-per-file. The binary entry point is `src/main.rs` → `triage_cli::run()` (in `src/lib.rs`) → `cli::run()`. Current modules under `src/`:
 
-`build_map`, `cli`, `datadog`, `extract`, `fixture`, `interactive`, `investigation`, `llm`, `memory`, `models`, `pipeline`, `playbook`, `providers/` (`mod`, `unleash`, `codex`), `redact`, `setup`, `ticket_folder`, `tui/` (`mod`, `inbox`), `watcher`, `zendesk`.
+`build_map`, `chat`, `cli`, `datadog`, `extract`, `fixture`, `interactive`, `investigation`, `llm`, `memory`, `models`, `paths`, `pipeline`, `playbook`, `providers/` (`mod`, `unleash`, `codex`), `redact`, `setup`, `ticket_folder`, `tui/` (`mod`, `chat`, `inbox`), `watcher`, `zendesk`.
 
 The legacy `render` module and `tui/investigate.rs` were removed in the v1 reframe — there is no longer a prose-note renderer or a mid-investigation TUI.
 
 ### Pipeline ownership
 
-`pipeline::investigate_one_structured` is the **only** end-to-end pipeline entry point in v1. It is shared by `cli::cmd_investigate`, `cli::cmd_triage`, and `watcher::run_iteration`. It drives customer-history fetch → memory lookup → site resolution → optional Datadog enrichment → PII redaction → structured LLM call → ticket-folder write. **No I/O outside the injected clients.** Do not reintroduce a parallel prose-output pipeline; the structured path is the contract.
+`pipeline::investigate_one_structured` is the primary end-to-end pipeline entry point, shared by `cli::cmd_investigate`, `cli::cmd_triage`, and `watcher::run_iteration`. It drives customer-history fetch → memory lookup → site resolution → optional Datadog enrichment → PII redaction → structured LLM call → ticket-folder write. `pipeline::revise()` and `pipeline::followup_turn()` are also public pipeline entry points: `revise()` re-runs the structured pipeline and rewrites the five-markdown folder for a ticket that already has a folder; `followup_turn()` adds a chat turn to an existing session. **No I/O outside the injected clients.** Do not reintroduce a parallel prose-output pipeline; the structured path is the contract.
 
 Pipeline errors flow through the `pipeline::PipelineError` enum (`Zendesk`, `Datadog`, `Llm`, `Extract`, `Memory`, `TicketFolder`). Add new variants there rather than reaching for `anyhow::Error` when callers might match on the kind.
 
@@ -148,9 +148,9 @@ The CLI translates that error to a non-zero exit (code **2**, distinct from gene
 
 Internal Zendesk comments **are** sent to the LLM, after passing through `redact`. v1 is terminal-only / local-files-only so residual exposure stays local; if any flow ever posts model output back to Zendesk or an audited system, the redaction scope must be re-evaluated.
 
-### Interactive workspace and doctor (legacy `triage-notes/` scratch path)
+### Interactive workspace and doctor (scratch path under `$TRIAGE_HOME`)
 
-The interactive `investigate` flow uses `./triage-notes/<ticket-id>/` as a **scratch workspace** for downloaded attachments and dropped local files (`cli.rs:cmd_investigate` calls `interactive::ensure_workspace(Path::new("./triage-notes"), ...)`). `doctor` also probes that path for writability. These are leftover code references from the legacy single-file output era; the ticket-folder output itself goes to `Tickets/<id>/`, not here. Treat `./triage-notes/` as an analyst scratch dir, not a deliverable surface.
+The interactive `investigate` flow uses `triage_home().join("scratch")/<ticket-id>/` as a **scratch workspace** for downloaded attachments and dropped local files. `cli.rs:cmd_investigate` resolves this as `crate::paths::triage_home().join("scratch")` and passes it to `interactive::ensure_workspace`. `doctor` (`setup.rs`) probes `triage_home().join("scratch")` for writability. The ticket-folder output itself goes to `TRIAGE_TICKETS_ROOT` (default `./Tickets`), not here. Treat `<triage-home>/scratch/` as a transient analyst workspace, not a deliverable surface.
 
 ### Site map flow
 
@@ -212,6 +212,7 @@ Logging during the TUI run is redirected to a per-view file printed at startup s
 
 | Variable | Purpose |
 | --- | --- |
+| `TRIAGE_HOME` | Root directory for all per-user data: `.env`, `MEMORY.md`, `apex-cnc-inventory.md`, `data/`, and `scratch/`. Resolution order: `$TRIAGE_HOME` (if set and non-empty) → cwd if it looks like a repo (contains `.env` or inventory file) → platform default (`~/.local/share/triage-cli/` on Linux, `%LOCALAPPDATA%\triage-cli\` on Windows, `~/Library/Application Support/triage-cli/` on macOS). |
 | `TRIAGE_TICKETS_ROOT` | Where ticket folders are written. Default `./Tickets`. Set to a Drive-synced path on operator laptops. |
 | `TRIAGE_RUBRIC_PATH` | Dev override: load the fork rubric from this file instead of the embedded copy. Release builds should leave this unset. |
 | `TRIAGE_OWNER` | Identifier recorded in `STATE.md`'s `owner` field; overrides `$USER`. |
