@@ -89,17 +89,57 @@ pub struct ParseOutcome {
 /// per-ticket lock (see [`acquire_session_lock`] in Task 5) while
 /// calling this — append + fsync is not atomic against concurrent
 /// writers.
+///
+/// F10: if the previous writer left torn bytes (no trailing newline, the
+/// classic "killed process" signature), `repair_torn_tail` truncates the
+/// fragment first. Otherwise the new line would get glued onto the torn
+/// bytes and the resulting mid-file unparseable line would break every
+/// subsequent parse — the torn-line recovery rule only tolerates the
+/// LAST non-empty line being unparseable.
 pub fn append_turn(path: &Path, turn: &Turn) -> Result<(), ChatError> {
     let parent = path
         .parent()
         .ok_or_else(|| ChatError::PathMissingParent(path.to_path_buf()))?;
     fs::create_dir_all(parent)?;
+    repair_torn_tail(path)?;
     let mut file = fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)?;
     let line = serde_json::to_string(turn)?;
     writeln!(file, "{line}")?;
+    file.sync_all()?;
+    Ok(())
+}
+
+/// F10: drop any torn fragment at the end of the file so the next append
+/// starts on a clean newline boundary. A torn fragment is detected as
+/// "file exists, is non-empty, and does not end with `\n`" — which is
+/// the only state a killed process can leave the file in (since every
+/// successful `append_turn` ends with `writeln!` + `sync_all`). The
+/// previously-recoverable partial JSON is dropped, because it was
+/// unparseable as a Turn anyway — the alternative is to keep it and
+/// lose every subsequent turn in the file.
+fn repair_torn_tail(path: &Path) -> Result<(), ChatError> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let content = match fs::read_to_string(path) {
+        Ok(s) => s,
+        // Non-UTF-8 file — treat as opaque; the parser's I/O routing
+        // already surfaces this as ChatError::Io on read. Don't truncate
+        // a file we can't reason about.
+        Err(_) => return Ok(()),
+    };
+    if content.is_empty() || content.ends_with('\n') {
+        return Ok(());
+    }
+    // Truncate to the byte after the last `\n` (or to 0 if there is
+    // no prior `\n` at all). `rfind` returns a byte offset into the
+    // UTF-8 string, which is also the on-disk byte offset.
+    let truncate_to = content.rfind('\n').map(|i| i + 1).unwrap_or(0) as u64;
+    let file = fs::OpenOptions::new().write(true).open(path)?;
+    file.set_len(truncate_to)?;
     file.sync_all()?;
     Ok(())
 }
@@ -681,6 +721,54 @@ mod tests {
         let out = parse_conversation_jsonl(&path).unwrap();
         assert_eq!(out.turns.len(), 1);
         assert!(out.torn_final_line);
+    }
+
+    /// F10: torn-line recovery used to be one-shot. After a partial write
+    /// left the file without a trailing newline, the next `append_turn`
+    /// wrote `{new_json}\n` directly after the torn bytes — turning the
+    /// fragment into a mid-file unparseable line. Because the parser's
+    /// tail-rule only tolerates an unparseable line when it is the LAST
+    /// non-empty line, every subsequent parse hit `ChatError::Json` and
+    /// the entire conversation log became unreadable until manually
+    /// edited. The contract is now: `append_turn` repairs any torn tail
+    /// (by truncating up to the last `\n`) before appending, so the file
+    /// always remains parseable after a successful append.
+    #[test]
+    fn append_after_torn_write_repairs_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("CONVERSATION.jsonl");
+        append_turn(&path, &sample_analyst_turn(1)).unwrap();
+
+        // Simulate a killed-process torn write — partial JSON, no trailing \n.
+        {
+            let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
+            write!(f, "{{\"schema\":\"triage-cli/conv").unwrap();
+            f.sync_all().unwrap();
+        }
+
+        // Sanity: before any further append, the parser sees the tear.
+        {
+            let out = parse_conversation_jsonl(&path).unwrap();
+            assert_eq!(out.turns.len(), 1);
+            assert!(out.torn_final_line);
+        }
+
+        // The next successful append must repair the tear, not glue the
+        // new line onto the torn fragment.
+        append_turn(&path, &sample_analyst_turn(2)).unwrap();
+
+        let out = parse_conversation_jsonl(&path).unwrap();
+        assert_eq!(
+            out.turns.len(),
+            2,
+            "torn fragment must be repaired so both well-formed turns survive"
+        );
+        assert_eq!(out.turns[0].turn, 1);
+        assert_eq!(out.turns[1].turn, 2);
+        assert!(
+            !out.torn_final_line,
+            "file ends with a clean newline after the repaired append"
+        );
     }
 
     #[test]
