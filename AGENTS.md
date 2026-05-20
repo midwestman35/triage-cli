@@ -247,7 +247,7 @@ Logging during the TUI run is redirected to a per-view file printed at startup s
 | Watcher loop + state | `triage-cli-rs/src/watcher.rs` |
 | Doctor + setup commands | `triage-cli-rs/src/setup.rs` |
 | Site map builder | `triage-cli-rs/src/build_map.rs` |
-| Interactive workspace (`./triage-notes/<id>/` scratch dir) | `triage-cli-rs/src/interactive.rs` |
+| Interactive workspace (`$TRIAGE_HOME/scratch/<id>/` scratch dir) | `triage-cli-rs/src/interactive.rs` |
 | CLI surface (clap-derive) | `triage-cli-rs/src/cli.rs` |
 | v1 reframe spec | `docs/spec/v1-reframe.md` |
 | Frozen Python source (reference only) | `archive/python-source-2026-05-12.zip` |

@@ -120,16 +120,6 @@ Tests will be Rust `#[test]` functions next to source; no separate lint config
 file. `ruff` rules don't translate; `cargo clippy` is the equivalent and runs
 out-of-the-box.
 
-### R9 — `cli investigate --save` is now always on
-**Python:** `--save/--no-save` toggle; default save=on.
-
-**Rust:** Always saves; the `--save` flag is accepted but ignored (no opposite
-form). The previous "stdout-only" mode was rarely used and complicates the
-ChannelReporter/TUI flow, which both rely on `save_note` always running so the
-markdown/JSON pair is present after the pipeline returns.
-
-**Eval target:** Restore the opposite flag if any caller depends on `--no-save`.
-
 ### R10 — `cli build-map` shells out to `python3 scripts/build_cnc_map.py` *(closed)*
 **Python:** `build-map` is a subprocess to a sibling Python script that parses
 the markdown inventory.
@@ -153,6 +143,16 @@ the core port.
 
 ## CLOSED
 
+### R9 — `cli investigate --save` is removed
+**Python:** `--save/--no-save` toggle; default save=on.
+
+**Rust:** Always writes the v1 five-markdown ticket folder and prints
+`FORK_PACKET.md` to stdout. The stale accepted-but-ignored `--save` flag was
+removed so the CLI surface matches the v1 contract and does not imply a legacy
+`triage-notes` sidecar path.
+
+**Status:** CLOSED.
+
 ### C1 — Cargo `cargo check`, `cargo build --release`, and `cargo test` all pass
 Initial port compiled cleanly on the first invocation with three trivial
 unused-import / unused-variable warnings, all since fixed. All 15 unit tests
@@ -170,7 +170,7 @@ Resolved in this session:
 - ~~TUI depth: full feature parity with Textual inbox~~ (R3 closed)
 - ~~build-map: port to Rust~~ (R10 closed)
 - Memory paths: stay cwd-relative (matches Python)
-- `--save`: keep always-on, no `--no-save`
+- ~~`--save`: keep always-on, no `--no-save`~~ (R9 closed; flag removed)
 - openai provider: removed 2026-05-14 per ADR-0002.
 
 Still open:

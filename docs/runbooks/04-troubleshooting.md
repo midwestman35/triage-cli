@@ -100,9 +100,12 @@ The map hasn't been built yet, or you're running from the wrong cwd. Run from th
 triage-cli build-map
 ```
 
-### `--save` puts the note somewhere unexpected
+### Ticket folder is somewhere unexpected
 
-`./triage-notes/` is **cwd-relative**, not repo-relative. If you ran the command from `~/Desktop`, the note is at `~/Desktop/triage-notes/`. `cd` into the repo first if you want it under the repo tree.
+Ticket folders are written under `${TRIAGE_TICKETS_ROOT:-./Tickets}/<id>/`.
+If `TRIAGE_TICKETS_ROOT` is unset, `./Tickets` is relative to your current
+working directory. Set `TRIAGE_TICKETS_ROOT` to a stable Drive-synced path if
+you do not want output tied to the launch directory.
 
 ## Redactor
 

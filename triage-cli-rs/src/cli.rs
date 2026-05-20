@@ -74,9 +74,6 @@ struct InvestigateCmd {
     /// Pre-supplied pasted evidence as LABEL=TEXT. Repeat for multiple.
     #[arg(long = "paste")]
     pastes: Vec<String>,
-    /// Save markdown/JSON to triage-notes/<id>/. Default: on.
-    #[arg(long, default_value_t = true)]
-    save: bool,
     #[arg(long, default_value_t = false)]
     no_llm: bool,
     #[arg(long, default_value_t = false)]
@@ -918,17 +915,17 @@ fn surface_validator_warnings(warnings: &[String]) {
 /// viewer when `--diff` is set, and exit non-zero without dying via panic.
 fn handle_pipeline_error(e: pipeline::PipelineError, open_full_diff: bool) -> ExitCode {
     use crate::ticket_folder::TicketFolderError;
-    if let pipeline::PipelineError::TicketFolder(TicketFolderError::SoftLockConflict {
-        existing_owner,
-        current_owner,
-        summary,
-        state_path,
-        new_state_content,
-    }) = &e
+    if let pipeline::PipelineError::TicketFolder(TicketFolderError::SoftLockConflict(conflict)) = &e
     {
-        print_soft_lock_summary(existing_owner, current_owner, summary);
+        print_soft_lock_summary(
+            &conflict.existing_owner,
+            &conflict.current_owner,
+            &conflict.summary,
+        );
         if open_full_diff {
-            if let Err(diff_err) = show_full_state_diff(state_path, new_state_content) {
+            if let Err(diff_err) =
+                show_full_state_diff(&conflict.state_path, &conflict.new_state_content)
+            {
                 eprintln!(
                     "{}: could not produce full diff: {}",
                     "warning".yellow().bold(),
@@ -1074,5 +1071,45 @@ async fn cmd_inbox(c: InboxCmd) -> ExitCode {
     match tui::run_inbox(opts).await {
         Ok(_) => ExitCode::SUCCESS,
         Err(e) => die(&e.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::{error::ErrorKind, CommandFactory};
+
+    #[test]
+    fn investigate_help_does_not_advertise_legacy_save_or_triage_notes() {
+        let mut command = Cli::command();
+        let investigate = command
+            .find_subcommand_mut("investigate")
+            .expect("investigate subcommand exists");
+        let help = investigate.render_long_help().to_string();
+
+        assert!(
+            !help.contains("triage-notes"),
+            "investigate help should not mention legacy triage-notes output:\n{help}"
+        );
+        assert!(
+            !help.contains("markdown/JSON"),
+            "investigate help should not mention legacy markdown/JSON sidecars:\n{help}"
+        );
+        assert!(
+            !help.contains("--save"),
+            "investigate help should not advertise removed --save flag:\n{help}"
+        );
+    }
+
+    #[test]
+    fn investigate_rejects_legacy_save_flag() {
+        let err = Cli::try_parse_from(["triage-cli", "investigate", "12345", "--save"])
+            .expect_err("legacy --save should be rejected");
+
+        assert_eq!(err.kind(), ErrorKind::UnknownArgument);
+        assert!(
+            err.to_string().contains("--save"),
+            "clap error should identify the rejected flag: {err}"
+        );
     }
 }
