@@ -35,11 +35,11 @@ pub enum TicketFolderError {
     /// the full diff using `state_path` (existing) vs. `new_state_content`.
     #[error("STATE.md soft-lock conflict: owned by {existing_owner}, current is {current_owner}")]
     SoftLockConflict {
-        existing_owner: String,
-        current_owner: String,
-        summary: Vec<(String, String, String)>,
-        state_path: PathBuf,
-        new_state_content: String,
+        existing_owner: Box<str>,
+        current_owner: Box<str>,
+        summary: Box<[(String, String, String)]>,
+        state_path: Box<PathBuf>,
+        new_state_content: Box<str>,
     },
 }
 
@@ -114,11 +114,11 @@ pub fn write_ticket_folder(
             if !existing_owner.is_empty() && existing_owner != owner {
                 let summary = compute_state_diff(&existing, report, owner);
                 return Err(TicketFolderError::SoftLockConflict {
-                    existing_owner,
-                    current_owner: owner.to_string(),
-                    summary,
-                    state_path: state.clone(),
-                    new_state_content,
+                    existing_owner: existing_owner.into_boxed_str(),
+                    current_owner: owner.to_string().into_boxed_str(),
+                    summary: summary.into_boxed_slice(),
+                    state_path: Box::new(state.clone()),
+                    new_state_content: new_state_content.into_boxed_str(),
                 });
             }
         }
@@ -991,8 +991,8 @@ mod tests {
                 state_path,
                 new_state_content,
             } => {
-                assert_eq!(existing_owner, "alice@example.com");
-                assert_eq!(current_owner, "bob@example.com");
+                assert_eq!(existing_owner.as_ref(), "alice@example.com");
+                assert_eq!(current_owner.as_ref(), "bob@example.com");
                 assert!(summary.iter().any(|(k, _, _)| k == "owner"));
                 assert!(state_path.ends_with("44671/STATE.md"));
                 assert!(new_state_content.contains("owner: \"bob@example.com\""));
