@@ -67,21 +67,22 @@ impl RedactionCounts {
     }
 }
 
-/// Loose coordinate shape: decimal pair with only 2–3 fractional digits.
+/// Loose coordinate shape: decimal pair with only 2-3 fractional digits.
 /// Sits *below* `COORD_PATTERN`'s `\d{4,}` floor, so a match here is a
 /// plausible GPS pair the strict scrubber would not have caught.
 static RESIDUAL_COORD_PATTERN: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?:^|[^\d.])-?\d{1,3}\.\d{2,3}\s*[,;\s]\s*-?\d{1,3}\.\d{2,3}(?:$|[^\d.])")
+    Regex::new(r"(?:^|[^\d.])(-?\d{1,3}\.\d{2,3}\s*[,;\s]\s*-?\d{1,3}\.\d{2,3})(?:$|[^\d.])")
         .expect("residual coord regex")
 });
 
 /// Loose 7-digit local-number shape (`nnn-nnnn`). The strict `PHONE_PATTERN`
 /// only matches the 10/11-digit form, so bare local numbers slip past it.
-/// Boundaries are restricted to whitespace/punctuation (not digits or
-/// hyphens) so hyphenated operational IDs — Call-IDs, ticket numbers,
-/// CNC UUIDs — do not register as residue.
+/// Boundaries are restricted to whitespace/punctuation (not alphanumeric
+/// characters or hyphens) so hyphenated operational IDs - Call-IDs, ticket
+/// numbers, CNC UUIDs - do not register as residue.
 static RESIDUAL_LOCAL_PHONE_PATTERN: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?:^|[\s(])\d{3}[-.\s]\d{4}(?:[\s).,;]|$)").expect("residual local phone regex")
+    Regex::new(r"(?:^|[^A-Za-z0-9_-])(\d{3}[-.\s]\d{4})(?:$|[^A-Za-z0-9_-])")
+        .expect("residual local phone regex")
 });
 
 /// Density floor before a residual soft-warn is raised. Deliberately > 1: a
@@ -105,8 +106,8 @@ pub fn residual_pii_warning(redacted: &str, counts: &RedactionCounts) -> Option<
     if !counts.enabled {
         return None;
     }
-    let residual = RESIDUAL_COORD_PATTERN.find_iter(redacted).count()
-        + RESIDUAL_LOCAL_PHONE_PATTERN.find_iter(redacted).count();
+    let residual = count_capture_group_matches(&RESIDUAL_COORD_PATTERN, redacted, 1)
+        + count_capture_group_matches(&RESIDUAL_LOCAL_PHONE_PATTERN, redacted, 1);
     if residual >= RESIDUAL_PII_WARN_THRESHOLD {
         Some(format!(
             "redaction: {residual} residual caller-PII-shaped token(s) survived scrub \
@@ -115,6 +116,35 @@ pub fn residual_pii_warning(redacted: &str, counts: &RedactionCounts) -> Option<
     } else {
         None
     }
+}
+
+fn count_capture_group_matches(re: &Regex, text: &str, group: usize) -> usize {
+    let mut count = 0;
+    let mut start = 0;
+    while start <= text.len() {
+        let Some(caps) = re.captures_at(text, start) else {
+            break;
+        };
+        let Some(m) = caps.get(group) else {
+            break;
+        };
+        count += 1;
+
+        // The regex consumes the trailing delimiter to enforce a right boundary.
+        // Advance to the end of the captured PII token, not the whole match, so
+        // that delimiter can also serve as the left boundary of the next token.
+        let next = m.end();
+        if next > start {
+            start = next;
+        } else {
+            start += text[start..]
+                .chars()
+                .next()
+                .map(char::len_utf8)
+                .unwrap_or(1);
+        }
+    }
+    count
 }
 
 fn is_pre_redacted(s: &str) -> bool {
@@ -245,9 +275,23 @@ mod tests {
     }
 
     #[test]
+    fn residual_warn_counts_adjacent_loose_coords() {
+        let counts = RedactionCounts::enabled();
+        let text = "36.16, -115.13 36.17, -115.14 36.18, -115.15";
+        assert!(residual_pii_warning(text, &counts).is_some());
+    }
+
+    #[test]
     fn residual_warn_counts_loose_local_phones() {
         let counts = RedactionCounts::enabled();
         let text = "call 555-1234 or 867-5309 then 555-0000 back";
+        assert!(residual_pii_warning(text, &counts).is_some());
+    }
+
+    #[test]
+    fn residual_warn_counts_adjacent_local_phones() {
+        let counts = RedactionCounts::enabled();
+        let text = "555-1234 867-5309 555-0000";
         assert!(residual_pii_warning(text, &counts).is_some());
     }
 
