@@ -18,3 +18,4 @@ MEMORY.md
 Tickets/
 target/
 .superpowers/
+docs/handoff/*.md

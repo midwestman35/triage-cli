@@ -10,9 +10,167 @@ Each entry: **what / why / blocker / sketch of approach / estimated PR shape**.
 
 Tracked in the active branch / open PR — not duplicated here.
 
+## Product direction: live Ratatui console
+
+The next major direction is to make the terminal UI feel like a live
+investigation console instead of a static report viewer. `triage-cli inbox`
+becomes the primary human-facing monitored queue. `triage-cli watch` remains
+the headless/scriptable monitor, but both should share one polling engine.
+
+TachyonFX is the preferred animation candidate, but effects must be isolated
+behind a small internal facade with a no-op path. Animation should explain
+state changes: polling started, ticket updated, phase advanced, fork revised,
+triage completed, warning accepted, or failure surfaced.
+
+Design spec: `docs/spec/2026-05-19-ratatui-live-console-redesign.md`.
+
 ## Next up
 
-### 1. Interactive investigation — inbox TUI chat pane (V1 narrow loop)
+### 1. Ratatui live console and TachyonFX foundation
+
+**What.** Add a small TUI animation layer for Ratatui screens, starting with
+`inbox`. Track named regions such as header, queue list, selected ticket,
+detail pane, phase band, notification, modal, and chat status. TachyonFX can
+then be applied to those regions without coupling domain state to an effect
+library.
+
+**Why.** The CLI already has long-running phases and meaningful state changes,
+but the feedback still reads as static terminal UI. Motion should make the
+operator understand what changed and what is active.
+
+**Blocker.** Dependency compatibility with the current Ratatui version must be
+verified before landing TachyonFX. If compatibility is not clean, land the
+animation facade first with no-op effects.
+
+**Sketch.**
+- Add an internal animation/effects facade for TUI drawing.
+- Add reduced-motion and non-TTY fallbacks.
+- Trigger region-level effects from existing inbox events.
+- Avoid row-precise effects until the ticket list is a custom widget or exposes
+  stable row rectangles.
+
+**Estimated PR shape.** ~300-500 lines depending on TachyonFX compatibility,
+plus focused render/state tests.
+
+---
+
+### 2. Inbox case brief redesign
+
+**What.** Replace the plain selected-ticket summary with a scan-first case
+brief: fork, confidence, status, owner, rubric signal, related work, missing
+evidence, and next action. Keep file tabs and existing ticket-folder artifacts.
+
+**Why.** `inbox` should be the operator console, not just a markdown previewer.
+The right pane should compose an operational picture before the analyst opens
+individual artifact files.
+
+**Blocker.** None, but the animation facade from #1 makes the transition states
+cleaner.
+
+**Sketch.**
+- Refactor summary rendering into a structured case-brief renderer.
+- Add compact variants for small terminals.
+- Add warning band treatment for rubric mismatch and failed triage.
+- Keep `STATE.md` as the primary structured source for the first pass.
+
+**Estimated PR shape.** ~250-400 lines plus tests for case-brief rendering.
+
+---
+
+### 3. Interactive watch merged into inbox
+
+**What.** Make `triage-cli inbox --view <id>` and `triage-cli inbox --assigned`
+the preferred human-facing monitored queue. Preserve `triage-cli watch --view`
+for non-interactive runs, `--print-notes`, scripts, and daemon use.
+
+**Why.** Inbox and watch are the same operator mental model when a person is at
+the terminal: a monitored overview of assigned or specified queue items. The
+split should be interactive versus headless, not two separate product concepts.
+
+**Blocker.** Shared polling/state extraction should happen before command
+behavior changes.
+
+**Sketch.**
+- Extract shared polling/state logic from `watcher.rs` and `tui/inbox.rs`.
+- Keep watcher state file compatibility.
+- Add inbox flags for view-based and assigned-item polling.
+- Keep `watch` output contracts unchanged.
+
+**Estimated PR shape.** ~500-800 lines because it touches command glue,
+watcher internals, inbox events, and tests.
+
+---
+
+### 4. Phase feedback and completion moments
+
+**What.** Enrich active triage feedback in `inbox`: better phase labels,
+elapsed time, evidence counts, completion/failure notifications, and subtle
+effects on phase transitions.
+
+**Why.** The longest waits are the moments most likely to look like hangs.
+Operators need visible progress through customer history, memory lookup,
+timeline, enrichment, LLM call, and save.
+
+**Blocker.** None. This can use existing Ratatui primitives before TachyonFX is
+available.
+
+**Sketch.**
+- Improve `PhaseReporter` labels and step mapping.
+- Add active phase elapsed time where available.
+- Add completion and failure notifications.
+- Keep stderr spinner behavior unchanged.
+
+**Estimated PR shape.** ~200-350 lines plus tests around phase mapping and
+status rendering.
+
+---
+
+### 5. Chat pane polish
+
+**What.** Make the inbox chat pane feel like part of the investigation console:
+clearer turn types, attached-evidence labels, in-flight provider status, and a
+visible `/revise` transition state.
+
+**Why.** Follow-up investigation is where analysts update decisions with new
+evidence. The UI should make added evidence and revised fork decisions obvious.
+
+**Blocker.** The current chat pane should stay JSONL-first and lock-protected.
+If richer throbber dependencies require a Ratatui upgrade, defer them.
+
+**Sketch.**
+- Improve `tui/chat.rs` rendering of analyst, Codex, automated, and system
+  turns.
+- Surface pending evidence compactly.
+- Animate or otherwise highlight provider in-flight status.
+- Show revision completion as a decision delta notification.
+
+**Estimated PR shape.** ~250-500 lines plus chat rendering tests.
+
+---
+
+### 6. `FORK_PACKET.md` decision refinement
+
+**What.** Refine `FORK_PACKET.md` around the committed routing decision while
+leaving `INTAKE.md` unchanged. The top of the file should emphasize decision,
+decision signal, evidence used, missing evidence, related work, and handoff.
+
+**Why.** `FORK_PACKET.md` is both the stdout handoff and the durable routing
+artifact. It should match the console's decision model.
+
+**Blocker.** Golden output tests will make this safer, but the change can ship
+earlier with focused ticket-folder tests.
+
+**Sketch.**
+- Keep `INTAKE.md` untouched.
+- Reorder and rename `FORK_PACKET.md` sections intentionally.
+- Add an optional revision delta only when prior `STATE.md` exists.
+- Do not invent first-run before-content.
+
+**Estimated PR shape.** ~150-300 lines including tests.
+
+---
+
+### 7. Interactive investigation — inbox TUI chat pane (V1 narrow loop)
 
 **What.** A sixth tab in the inbox TUI (`CHAT`) that lets the analyst revisit
 a ticket after the initial `investigate` run, ask follow-up questions to the
@@ -91,7 +249,7 @@ Full design: `docs/superpowers/specs/2026-05-17-interactive-investigation-design
 
 ---
 
-### 2. Automation hooks for chat pane (follow-on to #1)
+### 8. Automation hooks for chat pane (follow-on to #7)
 
 **What.** A small set of automated producers that write `turn_kind: automated`
 turns to `CONVERSATION.md` without analyst intervention, so the inbox chat
@@ -119,7 +277,7 @@ weeks (per user direction 2026-05-17) is to lean into automated triage and
 ticket-fetching; the chat pane is the natural place to surface those
 automated observations to the analyst.
 
-**Blocker.** #1 (chat pane must exist; CONVERSATION.md schema and
+**Blocker.** #7 (chat pane must exist; CONVERSATION.md schema and
 `pipeline::followup_turn` must be public). Also: the watcher needs a
 "which tickets have ongoing investigations" view; that's a 1-LOC change
 since `tickets_root()` already scans for STATE.md.
@@ -146,7 +304,7 @@ reminder are separate PRs against the same hook.
 
 ---
 
-### 3. Evidence-ID model v2
+### 9. Evidence-ID model v2
 
 **What.** Every `EvidenceItem` (Zendesk comment, attachment, Datadog log, local file, pasted note, memory hit) gets a stable `id` of the form `E-001`, `E-002`, …, assigned deterministically by the pipeline. `FORK_PACKET.md` cites these IDs in its "Evidence used" section. The LLM is required to quote IDs, not paraphrase ("according to E-007 the console rebooted at …").
 
@@ -165,7 +323,7 @@ reminder are separate PRs against the same hook.
 
 ---
 
-### 4. Fixture / demo mode
+### 10. Fixture / demo mode
 
 **What.** Ship a small set of canned investigation inputs that exercise the pipeline end-to-end without real Zendesk, Datadog, or LLM calls. Two surfaces:
 
@@ -197,13 +355,13 @@ Initial cases: `audio-drop`, `no-site-map`, `missing-evidence`, `vendor-fork`.
 
 ---
 
-### 5. Golden output tests
+### 11. Golden output tests
 
 **What.** A test runner that, for each fixture, runs the pipeline in `--no-llm` mode and asserts the produced five files are byte-identical to the `expected/` directory. Failure prints a unified diff.
 
 **Why.** This is the safety net the project has been missing. With it, every refactor of `ticket_folder.rs`, `pipeline.rs`, or the report writers is provably non-breaking. Without it, "did this PR change the ticket-folder output?" is an open question on every change.
 
-**Blocker.** #4 (fixtures must exist first).
+**Blocker.** #10 (fixtures must exist first).
 
 **Sketch.** Inline `#[test]` in `ticket_folder.rs` (or a new `tests/golden.rs`). Walk `fixtures/`, run the pipeline, diff. Update-fixture mode behind `UPDATE_GOLDEN=1` env var.
 
@@ -211,7 +369,7 @@ Initial cases: `audio-drop`, `no-site-map`, `missing-evidence`, `vendor-fork`.
 
 ---
 
-### 6. `--metrics-out` flag
+### 12. `--metrics-out` flag
 
 **What.** Every run optionally writes a JSON record to a caller-supplied path:
 
