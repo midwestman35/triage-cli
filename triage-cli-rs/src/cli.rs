@@ -915,16 +915,17 @@ fn surface_validator_warnings(warnings: &[String]) {
 /// viewer when `--diff` is set, and exit non-zero without dying via panic.
 fn handle_pipeline_error(e: pipeline::PipelineError, open_full_diff: bool) -> ExitCode {
     use crate::ticket_folder::TicketFolderError;
-    if let pipeline::PipelineError::TicketFolder(TicketFolderError::SoftLockConflict(conflict)) = &e
+    if let pipeline::PipelineError::TicketFolder(TicketFolderError::SoftLockConflict {
+        existing_owner,
+        current_owner,
+        summary,
+        state_path,
+        new_state_content,
+    }) = &e
     {
-        print_soft_lock_summary(
-            &conflict.existing_owner,
-            &conflict.current_owner,
-            &conflict.summary,
-        );
+        print_soft_lock_summary(existing_owner, current_owner, summary);
         if open_full_diff {
-            if let Err(diff_err) =
-                show_full_state_diff(&conflict.state_path, &conflict.new_state_content)
+            if let Err(diff_err) = show_full_state_diff(state_path, new_state_content)
             {
                 eprintln!(
                     "{}: could not produce full diff: {}",

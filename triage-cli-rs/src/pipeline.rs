@@ -2934,7 +2934,7 @@ validator_warnings: []\n---\n";
             matches!(
                 outcome,
                 Err(PipelineError::TicketFolder(
-                    TicketFolderError::SoftLockConflict(_)
+                    TicketFolderError::SoftLockConflict { .. }
                 ))
             ),
             "expected SoftLockConflict, got {outcome:?}"
