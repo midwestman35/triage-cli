@@ -67,6 +67,86 @@ impl RedactionCounts {
     }
 }
 
+/// Loose coordinate shape: decimal pair with only 2-3 fractional digits.
+/// Sits *below* `COORD_PATTERN`'s `\d{4,}` floor, so a match here is a
+/// plausible GPS pair the strict scrubber would not have caught.
+static RESIDUAL_COORD_PATTERN: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?:^|[^\d.])(-?\d{1,3}\.\d{2,3}\s*[,;\s]\s*-?\d{1,3}\.\d{2,3})(?:$|[^\d.])")
+        .expect("residual coord regex")
+});
+
+/// Loose 7-digit local-number shape (`nnn-nnnn`). The strict `PHONE_PATTERN`
+/// only matches the 10/11-digit form, so bare local numbers slip past it.
+/// Boundaries are restricted to whitespace/punctuation (not alphanumeric
+/// characters or hyphens) so hyphenated operational IDs - Call-IDs, ticket
+/// numbers, CNC UUIDs - do not register as residue.
+static RESIDUAL_LOCAL_PHONE_PATTERN: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?:^|[^A-Za-z0-9_-])(\d{3}[-.\s]\d{4})(?:$|[^A-Za-z0-9_-])")
+        .expect("residual local phone regex")
+});
+
+/// Density floor before a residual soft-warn is raised. Deliberately > 1: a
+/// single loose match is more likely an operational identifier or a version
+/// string than a real caller-PII leak, and this validator is non-blocking by
+/// design (same soft-warn philosophy as the rubric validator). Raising the
+/// floor trades a little leak sensitivity for far fewer false positives;
+/// tightening it later is backward-compatible.
+pub const RESIDUAL_PII_WARN_THRESHOLD: usize = 3;
+
+/// Best-effort residual-PII density check, run on the *already-redacted* text.
+/// Counts caller-PII-shaped tokens the strict scrubbers are known to miss
+/// (sub-`\d{4,}` coord pairs, 7-digit local numbers). Returns a soft-warn
+/// string when the count reaches `RESIDUAL_PII_WARN_THRESHOLD`, else `None`.
+///
+/// This never mutates the payload and never blocks the LLM call — the caller
+/// folds the string into the existing `validator_warnings` channel (stderr +
+/// `STATE.md`). The redaction sentinels carry no digits, so they cannot
+/// self-trigger this scan.
+pub fn residual_pii_warning(redacted: &str, counts: &RedactionCounts) -> Option<String> {
+    if !counts.enabled {
+        return None;
+    }
+    let residual = count_capture_group_matches(&RESIDUAL_COORD_PATTERN, redacted, 1)
+        + count_capture_group_matches(&RESIDUAL_LOCAL_PHONE_PATTERN, redacted, 1);
+    if residual >= RESIDUAL_PII_WARN_THRESHOLD {
+        Some(format!(
+            "redaction: {residual} residual caller-PII-shaped token(s) survived scrub \
+             (soft-warn; payload not blocked)"
+        ))
+    } else {
+        None
+    }
+}
+
+fn count_capture_group_matches(re: &Regex, text: &str, group: usize) -> usize {
+    let mut count = 0;
+    let mut start = 0;
+    while start <= text.len() {
+        let Some(caps) = re.captures_at(text, start) else {
+            break;
+        };
+        let Some(m) = caps.get(group) else {
+            break;
+        };
+        count += 1;
+
+        // The regex consumes the trailing delimiter to enforce a right boundary.
+        // Advance to the end of the captured PII token, not the whole match, so
+        // that delimiter can also serve as the left boundary of the next token.
+        let next = m.end();
+        if next > start {
+            start = next;
+        } else {
+            start += text[start..]
+                .chars()
+                .next()
+                .map(char::len_utf8)
+                .unwrap_or(1);
+        }
+    }
+    count
+}
+
 fn is_pre_redacted(s: &str) -> bool {
     let lower = s.to_ascii_lowercase();
     lower.contains("***") || lower.contains("xxx") || lower.contains("[redacted]")
@@ -167,5 +247,70 @@ mod tests {
         let (out, counts) = redact("abc5551234567xyz");
         assert_eq!(out, "abc5551234567xyz");
         assert_eq!(counts.phones, 0);
+    }
+
+    #[test]
+    fn residual_warn_disabled_when_redaction_off() {
+        let mut counts = RedactionCounts::enabled();
+        counts.enabled = false;
+        assert!(
+            residual_pii_warning("36.16, -115.13 36.17, -115.14 36.18, -115.15", &counts).is_none()
+        );
+    }
+
+    #[test]
+    fn residual_warn_below_threshold_is_none() {
+        let counts = RedactionCounts::enabled();
+        // One loose coord pair only — below the density floor.
+        assert!(residual_pii_warning("loc 36.16, -115.13 reported", &counts).is_none());
+    }
+
+    #[test]
+    fn residual_warn_fires_on_dense_loose_coords() {
+        let counts = RedactionCounts::enabled();
+        let text = "a 36.16, -115.13 b 40.71, -74.00 c 34.05, -118.24 d";
+        let w = residual_pii_warning(text, &counts).expect("expected residual soft-warn");
+        assert!(w.contains("residual caller-PII-shaped"), "{w}");
+        assert!(w.contains("payload not blocked"), "{w}");
+    }
+
+    #[test]
+    fn residual_warn_counts_adjacent_loose_coords() {
+        let counts = RedactionCounts::enabled();
+        let text = "36.16, -115.13 36.17, -115.14 36.18, -115.15";
+        assert!(residual_pii_warning(text, &counts).is_some());
+    }
+
+    #[test]
+    fn residual_warn_counts_loose_local_phones() {
+        let counts = RedactionCounts::enabled();
+        let text = "call 555-1234 or 867-5309 then 555-0000 back";
+        assert!(residual_pii_warning(text, &counts).is_some());
+    }
+
+    #[test]
+    fn residual_warn_counts_adjacent_local_phones() {
+        let counts = RedactionCounts::enabled();
+        let text = "555-1234 867-5309 555-0000";
+        assert!(residual_pii_warning(text, &counts).is_some());
+    }
+
+    #[test]
+    fn residual_warn_ignores_hyphenated_operational_ids() {
+        let counts = RedactionCounts::enabled();
+        // Call-ID / ticket-number style: hyphenated digit groups embedded in
+        // longer tokens must not register as local-phone residue.
+        let text = "CB-911-2024-5551234 ref TICKET-2024-5559999 cnc 2024-5551000-aa";
+        assert!(
+            residual_pii_warning(text, &counts).is_none(),
+            "operational IDs flagged as PII"
+        );
+    }
+
+    #[test]
+    fn residual_warn_does_not_self_trigger_on_sentinels() {
+        let counts = RedactionCounts::enabled();
+        let text = "<PHONE> <ADDR> <COORDS> <PHONE> <ADDR> <COORDS>";
+        assert!(residual_pii_warning(text, &counts).is_none());
     }
 }
