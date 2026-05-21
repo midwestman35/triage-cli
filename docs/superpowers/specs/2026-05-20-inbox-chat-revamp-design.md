@@ -65,6 +65,8 @@ inbox event loop:
 
 Mpsc replaces `JoinHandle::is_finished()` polling as the lifecycle signal. The join handle is still owned (still aborted on Esc, dropped at function exit), but its *terminal* state is no longer how we know the call is done — the channel is.
 
+**Channel lifetime.** One mpsc channel lives for the entire `run_chat_session` call (i.e. the duration the chat tab is open). The sender is cloned into each spawned per-turn task; the receiver is drained by the main event loop on every 80ms tick. This is what lets `SessionOpened` / `SessionClosed` / `KeyCommand` events (which fire from the main loop, not from any spawned task) share the same stream as the per-turn `Phase` events.
+
 ## Module changes
 
 ```
@@ -225,7 +227,7 @@ fn canned_message(stage: ChatStage, rotation_idx: usize) -> &'static str {
 }
 ```
 
-The rotation index is `(elapsed_s_since_phase_start / 4.0) as usize`, so the `ProviderAwait` text changes every ~4 seconds. The underlying `ChatStage` does *not* change while in `ProviderAwait`, so the log records exactly one Phase event for the await, not one per rotation. Rotation is a pure UI cosmetic.
+The rotation index is `(elapsed_s / 4.0) as usize` (overall elapsed since turn start), so the `ProviderAwait` text changes every ~4 seconds. The underlying `ChatStage` does *not* change while in `ProviderAwait`, so the log records exactly one Phase event for the await, not one per rotation. Rotation is a pure UI cosmetic.
 
 ## Progress banner — responsive layout
 
@@ -461,6 +463,6 @@ Total: **~650 lines including tests**. Larger than the original chat-pane V1 (#7
 
 None as of approval. Defaults committed:
 - Dir-attach caps: 25 files, 4 MiB aggregate, single-level by default, `-r` opt-in.
-- ChatStage boundaries: five (Ingesting, ContextAssembled, SessionResumeAttempt, ProviderAwait, ResponseParsed, Saved). Sub-millisecond stages (redaction, markdown render) folded into adjacent ones.
+- ChatStage boundaries: six total (Ingesting + the five pipeline-emitted ones: ContextAssembled, SessionResumeAttempt, ProviderAwait, ResponseParsed, Saved). Sub-millisecond stages (redaction, markdown render) folded into adjacent ones.
 - Banner placement: above the input box, four responsive tiers down to a single-row fallback (<10 rows).
 - Logging destination: per-ticket JSONL at `<ticket_dir>/.session/chat-events.log`. No cross-ticket aggregation.
