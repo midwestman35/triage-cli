@@ -200,7 +200,7 @@ impl ZendeskClient {
     pub async fn list_view_ticket_ids(&self, view_id: u64) -> Result<Vec<u64>, ZendeskError> {
         let mut path: Option<String> = Some(format!("/views/{view_id}/tickets.json"));
         let mut params: Option<Vec<(String, String)>> =
-            Some(vec![("page[size]".into(), PAGE_SIZE.to_string())]);
+            Some(vec![("per_page".into(), PAGE_SIZE.to_string())]);
         let mut ids: Vec<u64> = Vec::new();
 
         for _ in 0..MAX_PAGES {
@@ -254,7 +254,7 @@ impl ZendeskClient {
             ("query".into(), query),
             ("sort_by".into(), "created_at".into()),
             ("sort_order".into(), "desc".into()),
-            ("page[size]".into(), PAGE_SIZE.to_string()),
+            ("per_page".into(), PAGE_SIZE.to_string()),
         ]);
         let mut ids: Vec<u64> = Vec::new();
 
@@ -282,7 +282,7 @@ impl ZendeskClient {
         let mut path: Option<String> = Some(format!("/tickets/{ticket_id}/comments.json"));
         let mut params: Option<Vec<(String, String)>> = Some(vec![
             ("include".into(), "users".into()),
-            ("page[size]".into(), PAGE_SIZE.to_string()),
+            ("per_page".into(), PAGE_SIZE.to_string()),
             ("sort".into(), "created_at".into()),
         ]);
         let mut users_by_id: std::collections::HashMap<u64, Value> =
