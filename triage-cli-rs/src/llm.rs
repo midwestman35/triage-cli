@@ -180,17 +180,17 @@ fn response_preview(s: &str) -> String {
 const STRUCTURED_PROMPT_PREAMBLE: &str =
     "You are a triage assistant for a NOC engineer working on the Carbyne APEX \
 NG911/E911 platform at Axon. You receive a Zendesk ticket, customer history, \
-prior memory hits, optional Datadog logs, and analyst-supplied evidence.\n\n\
+prior memory hits, optional Datadog cluster evidence, and analyst-supplied evidence.\n\n\
 Your job is to produce a SINGLE JSON object (a StructuredTriageReport) that \
-drives a five-markdown ticket folder (INTAKE / EVIDENCE_PREFLIGHT / FORK_PACKET \
-/ DRAFTS / STATE). Do NOT emit prose, commentary, or anything outside the JSON \
+drives analysis only ticket artifacts (INTAKE / EVIDENCE_PREFLIGHT / FORK_PACKET \
+/ STATE). Do NOT emit customer replies, internal notes, Jira drafts, prose, commentary, or anything outside the JSON \
 object. A ```json fence is acceptable; the parser strips it.\n";
 
-const STRUCTURED_PROMPT_SCHEMA: &str = "## Output schema\n\n\
+const STRUCTURED_ANALYSIS_PROMPT_SCHEMA: &str = "## Output schema\n\n\
 ```json\n\
-{\n  \"intake\": {\n    \"housekeeping_complete\": true,\n    \"ticket\": {\n      \"zendesk_id\": <int>,\n      \"url\": \"...\",\n      \"status\": \"...\",\n      \"priority\": \"...\",\n      \"tags\": [\"...\"],\n      \"requester\": \"...\",\n      \"organization\": \"...\",\n      \"site\": \"...\" | null,\n      \"cnc\": \"...\" | null,\n      \"region\": \"...\" | null,\n      \"affected_stations\": [\"...\"],\n      \"affected_agents\": [\"...\"],\n      \"call_id\": \"...\" | null,\n      \"incident_window\": \"...\",\n      \"reported_symptom\": \"...\"\n    },\n    \"one_line_fingerprint\": \"<customer> / <site> / <symptom-class> / <window> / <prior pattern>\",\n    \"ticket_summary\": [\"3-6 prose bullets\"],\n    \"context_pulls\": [{\"pull\":\"<name>\",\"result\":\"<short>\",\"source\":\"<tool/system>\"}],\n    \"initial_route\": {\"hypothesis\":\"<pre-LLM guess>\",\"justification\":\"<one sentence>\"},\n    \"intake_decision\": \"ready_for_evidence_preflight\" | \"known_issue\" | \"needs_clarification\" | \"cannot_proceed\"\n  },\n  \"evidence_preflight\": {\n    \"gathered\": [{\"id\":\"E-001\",\"evidence_type\":\"<type>\",\"source\":\"<src>\",\"time_window\":\"<window>\",\"summary\":\"<terse>\"}],\n    \"decisive_evidence\": [\"bullets that moved the fork\"],\n    \"missing_or_non_decisive\": [\"bullets that would have helped\"]\n  },\n  \"fork_packet\": {\n    \"commitment\": {\n      \"fork_letter\": \"A\" | \"B\" | \"C\" | \"D\",\n      \"confidence\":  \"low\" | \"medium\" | \"high\",\n      \"quoted_rubric_row\": \"<VERBATIM substring from a Fork signals table row above>\",\n      \"rubric_class\":      \"<Symptom Class N — name>\",\n      \"reasoning\":         \"<one sentence; why this signal commits the fork>\"\n    },\n    \"evidence_summary\": [\"strongest evidence bullets\"],\n    \"missing_evidence\": [\"REQUIRED non-empty when fork_letter is D\"],\n    \"related\": {\"zendesk\":[<ids>],\"jira\":[\"REP-...\"],\"master\":null|<id>,\"cluster\":null|\"<key>\"},\n    \"handoff\": {\n      \"engineering_jira_needed\": {\"needed\":true|false,\"reason\":\"<one line>\"},\n      \"vendor_or_it_needed\":     {\"needed\":true|false,\"reason\":\"<one line>\"},\n      \"customer_note_needed\":    {\"needed\":true|false,\"reason\":\"<one line>\"},\n      \"internal_note_needed\":    {\"needed\":true|false,\"reason\":\"<one line>\"}\n    }\n  },\n  \"drafts\": {\n    \"customer_reply\":        \"<plain-language reply; no jargon; no rubric refs>\",\n    \"internal_zendesk_note\": \"<full triage context for next NOC shift>\",\n    \"jira_draft\": null | {\"title\":\"...\",\"description\":\"...\",\"affected_component\":\"...\"|null,\"suspected_area\":\"...\"|null,\"repro_steps\":[\"...\"],\"project\":\"REP\"}\n  },\n  \"rubric_version\": \"<copy the rubric_version from the rubric above>\"\n}\n```\n";
+{\n  \"intake\": {\n    \"housekeeping_complete\": true,\n    \"ticket\": {\n      \"zendesk_id\": <int>,\n      \"url\": \"...\",\n      \"status\": \"...\",\n      \"priority\": \"...\",\n      \"tags\": [\"...\"],\n      \"requester\": \"...\",\n      \"organization\": \"...\",\n      \"site\": \"...\" | null,\n      \"cnc\": \"...\" | null,\n      \"region\": \"...\" | null,\n      \"affected_stations\": [\"...\"],\n      \"affected_agents\": [\"...\"],\n      \"call_id\": \"...\" | null,\n      \"incident_window\": \"...\",\n      \"reported_symptom\": \"...\"\n    },\n    \"one_line_fingerprint\": \"<customer> / <site> / <symptom-class> / <window> / <prior pattern>\",\n    \"ticket_summary\": [\"3-6 evidence-grounded bullets\"],\n    \"context_pulls\": [{\"pull\":\"<name>\",\"result\":\"<short>\",\"source\":\"<tool/system>\"}],\n    \"initial_route\": {\"hypothesis\":\"<pre-LLM guess>\",\"justification\":\"<one sentence>\"},\n    \"intake_decision\": \"ready_for_evidence_preflight\" | \"known_issue\" | \"needs_clarification\" | \"cannot_proceed\"\n  },\n  \"evidence_preflight\": {\n    \"gathered\": [{\"id\":\"E-001\",\"evidence_type\":\"<type>\",\"source\":\"<src>\",\"time_window\":\"<window>\",\"summary\":\"<terse>\"}],\n    \"decisive_evidence\": [\"bullets that moved the fork\"],\n    \"missing_or_non_decisive\": [\"bullets that would have helped\"]\n  },\n  \"fork_packet\": {\n    \"commitment\": {\n      \"fork_letter\": \"A\" | \"B\" | \"C\" | \"D\",\n      \"confidence\":  \"low\" | \"medium\" | \"high\",\n      \"quoted_rubric_row\": \"<VERBATIM substring from a Fork signals table row above>\",\n      \"rubric_class\":      \"<Symptom Class N — name>\",\n      \"reasoning\":         \"<one sentence; why this signal commits the fork>\"\n    },\n    \"evidence_summary\": [\"strongest evidence bullets\"],\n    \"missing_evidence\": [\"REQUIRED non-empty when fork_letter is D\"],\n    \"related\": {\"zendesk\":[<ids>],\"jira\":[\"REP-...\"],\"master\":null|<id>,\"cluster\":null|\"<key>\"},\n    \"handoff\": {\n      \"engineering_jira_needed\": {\"needed\":true|false,\"reason\":\"<one line>\"},\n      \"vendor_or_it_needed\":     {\"needed\":true|false,\"reason\":\"<one line>\"},\n      \"customer_note_needed\":    {\"needed\":true|false,\"reason\":\"<one line>\"},\n      \"internal_note_needed\":    {\"needed\":true|false,\"reason\":\"<one line>\"}\n    }\n  },\n  \"rubric_version\": \"<copy the rubric_version from the rubric above>\"\n}\n```\n";
 
-const STRUCTURED_PROMPT_RULES: &str = "## Forks\n\n\
+const STRUCTURED_ANALYSIS_PROMPT_RULES: &str = "## Forks\n\n\
 - **A** = Engineering Jira (Carbyne-controlled code or infra defect)\n\
 - **B** = Vendor / Internal IT (carrier, customer ISP/LAN/switch/SDWAN, PSTN)\n\
 - **C** = NOC self-resolve (config error, training, working-as-designed)\n\
@@ -200,8 +200,10 @@ const STRUCTURED_PROMPT_RULES: &str = "## Forks\n\n\
 - `quoted_rubric_row` MUST be a verbatim substring of a row from one of the rubric's \"Fork signals\" tables.\n\
 - `fork_letter` = \"D\" MUST have non-empty `missing_evidence` and MUST NOT have `confidence` = \"high\".\n\
 - `intake_decision` = \"known_issue\" should be paired with `related.master` or `related.jira` populated.\n\
-- `drafts.jira_draft` should be populated when `fork_letter` is \"A\", null otherwise.\n\
 - Do NOT invent ticket IDs, Jira keys, error codes, or past incidents.\n\
+- Do NOT draft customer replies, internal Zendesk notes, or Jira text.\n\
+- Do NOT request, search for, or infer additional logs; classify only the bounded evidence in the user message.\n\
+- Treat Datadog cluster rows and samples as the authoritative log evidence; do not quote or reconstruct raw logs beyond those samples.\n\
 - Use empty arrays for fields with no content — do not pad with filler.\n\
 - If you would hedge three times in `commitment.reasoning`, the right `confidence` is \"low\".\n\
 - `gathered[*].id` MUST be the `E-NNN` ID from the Evidence Index in the user message that best matches this row; use `\"\"` when no Evidence Index was provided.\n\
@@ -220,8 +222,8 @@ pub fn build_structured_system_prompt(rubric: &Rubric) -> String {
         preamble = STRUCTURED_PROMPT_PREAMBLE,
         version = rubric.version(),
         rubric_text = rubric.text(),
-        schema = STRUCTURED_PROMPT_SCHEMA,
-        rules = STRUCTURED_PROMPT_RULES,
+        schema = STRUCTURED_ANALYSIS_PROMPT_SCHEMA,
+        rules = STRUCTURED_ANALYSIS_PROMPT_RULES,
     )
 }
 
@@ -714,6 +716,18 @@ mod structured_tests {
     }
 
     #[test]
+    fn system_prompt_does_not_ask_llm_to_draft_replies() {
+        let rubric = Rubric::load().unwrap();
+        let prompt = build_structured_system_prompt(&rubric);
+
+        assert!(!prompt.contains("\"drafts\""));
+        assert!(!prompt.contains("customer_reply"));
+        assert!(!prompt.contains("internal_zendesk_note"));
+        assert!(!prompt.contains("jira_draft"));
+        assert!(prompt.contains("analysis only"));
+    }
+
+    #[test]
     fn corrective_message_includes_parse_error() {
         let out = build_corrective_user_message(
             "ORIGINAL",
@@ -749,6 +763,23 @@ mod structured_tests {
                 assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
             }
             other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn try_parse_defaults_missing_drafts_to_empty_block() {
+        let rubric = Rubric::load().unwrap();
+        let mut value = serde_json::to_value(sample_report(rubric.version())).unwrap();
+        value.as_object_mut().unwrap().remove("drafts");
+
+        match try_parse_and_validate(&value.to_string(), &rubric) {
+            TryOutcome::Ok { report, warnings } => {
+                assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+                assert!(report.drafts.customer_reply.is_empty());
+                assert!(report.drafts.internal_zendesk_note.is_empty());
+                assert!(report.drafts.jira_draft.is_none());
+            }
+            other => panic!("expected Ok with defaulted drafts, got {other:?}"),
         }
     }
 

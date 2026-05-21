@@ -8,8 +8,9 @@ metadata, optionally folds in local files or pasted logs and Datadog
 enrichment, and produces a structured **five-markdown ticket folder**:
 `INTAKE.md`, `EVIDENCE_PREFLIGHT.md`, `FORK_PACKET.md`, `DRAFTS.md`, and
 `STATE.md`. The LLM commits a fork letter (A / B / C / D) against a
-versioned rubric; the analyst reviews and acts on the drafts. Nothing is
-posted back to Zendesk, Jira, or any audited surface.
+versioned rubric; the analyst uses the CONFIRM-gated drafts file as a manual
+response workspace. Nothing is posted back to Zendesk, Jira, or any audited
+surface.
 
 This was originally a Python project (Typer + Textual + pydantic). It was
 ported to Rust in May 2026 and reframed for the v1 contract; the binary is
@@ -150,7 +151,9 @@ cp .env.example .env
 | `DD_APP_KEY` | Optional Datadog application key. |
 | `DD_SITE` | Datadog site host. Default `datadoghq.com`. |
 | `DD_CALL_CENTER_TAG` | Datadog tag key for the call-center filter. Default `@log.machineData.callCenterName`. |
-| `DD_STATION_TAG` | Reserved for future station-level filtering. Currently unused. |
+| `DD_STATION_TAG` | Datadog tag key for focused station filters. Default `@log.machineData.stationName`. |
+| `DD_CALL_ID_TAG` | Datadog tag key for focused call-id filters. Default `@call_id`. |
+| `DD_COMPONENT_TAG` | Datadog tag key for focused component filters. Default `service`. |
 | `LLM_PROVIDER` | `unleash` (default) or `codex`. |
 | `UNLEASH_API_KEY` | Required when `LLM_PROVIDER=unleash`. |
 | `UNLEASH_ASSISTANT_ID` | Required when `LLM_PROVIDER=unleash`. The model is selected server-side by the assistant; the CLI does not pass a model parameter. |
@@ -259,7 +262,7 @@ A successful investigation writes exactly five files atomically under
 | `INTAKE.md` | Housekeeping checklist, ticket facts, one-line fingerprint, LLM-emitted summary bullets, context-pulls table, initial fork hypothesis, intake decision. |
 | `EVIDENCE_PREFLIGHT.md` | Gathered-evidence table, decisive evidence, missing / non-decisive evidence. |
 | `FORK_PACKET.md` | Fork letter (A/B/C/D), confidence, reasoning, quoted rubric row, evidence summary, related work, handoff checklist. |
-| `DRAFTS.md` | CONFIRM-gated drafts: customer-facing reply, internal Zendesk note, Jira draft (fork A only). |
+| `DRAFTS.md` | CONFIRM-gated manual workspace for customer-facing replies, internal Zendesk notes, or Jira text after analyst review. |
 | `STATE.md` | YAML frontmatter only: ticket_id, fork, confidence, quoted_rubric_row, rubric_version, owner, status, related, cluster, validator_warnings. |
 
 Fork letters:
@@ -284,9 +287,10 @@ exact section list inside each file.
    stderr.
 4. **Review** — open `Tickets/12345/` in your editor (or Claude Code).
    Inspect the fork commitment in `FORK_PACKET.md`, the evidence trail in
-   `EVIDENCE_PREFLIGHT.md`, and the prepared drafts in `DRAFTS.md`.
-5. **Act on drafts** — copy-paste the customer reply / internal note /
-   Jira draft after review. The CLI does not post anything autonomously.
+   `EVIDENCE_PREFLIGHT.md`, and the CONFIRM-gated manual workspace in
+   `DRAFTS.md`.
+5. **Act manually** — compose or paste the customer reply / internal note /
+   Jira text after review. The CLI does not post anything autonomously.
 6. **Closure** — manually update `STATE.md` (`status: closed`) when the
    fork is acted on. v1 has no closure automation.
 

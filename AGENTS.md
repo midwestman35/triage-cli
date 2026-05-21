@@ -112,7 +112,7 @@ There is no terminal `Done` event: the caller of `investigate_one_structured` re
 - **`INTAKE.md`** — engine-known facts: housekeeping checklist, ticket facts (ID, URL, status, priority, tags, requester, org, site/CNC, region, affected stations/agents, call ID, incident window, reported symptom), one-line fingerprint, LLM-emitted 3–6 bullet summary, context-pulls table, initial fork hypothesis with justification, intake decision (checklist of: ready / known issue / needs clarification / cannot proceed).
 - **`EVIDENCE_PREFLIGHT.md`** — gathered-evidence table (type / source / time window / summary), decisive-evidence bullets, missing / non-decisive bullets.
 - **`FORK_PACKET.md`** — committed routing decision: recommendation (fork letter, confidence, reasoning), decision signal (rubric class + quoted rubric row), evidence summary, missing evidence (restated), related work (Zendesk siblings, Jira, master ticket, cluster), handoff checklist.
-- **`DRAFTS.md`** — CONFIRM-gated drafts. Customer-facing reply, internal Zendesk note, and (fork A only) a Jira draft. Each draft begins with `<!-- CONFIRM -->`. The CLI never posts these autonomously.
+- **`DRAFTS.md`** — CONFIRM-gated manual workspace for customer-facing replies, internal Zendesk notes, or Jira text after analyst review. The LLM is not asked to author these drafts, and the CLI never posts them autonomously.
 - **`STATE.md`** — YAML frontmatter only (no prose): `ticket_id`, `fork`, `confidence`, `quoted_rubric_row`, `rubric_version`, `owner`, `created_at`, `updated_at`, `status`, `related` (zendesk/jira/master), `cluster`, `validator_warnings`.
 
 Fork letters are: **A** Engineering Jira · **B** Vendor or Internal IT · **C** NOC self-resolve · **D** Cannot fork yet (rubric demands more evidence; next step is gathering it).
@@ -130,7 +130,7 @@ The rubric lives at `triage-cli-rs/playbook/fork-rubric.md` and is **embedded in
 `llm.rs` dispatches to a provider via the `LlmProvider` trait in `providers/mod.rs` (uses native `async fn` in traits, no `async-trait` crate). Implementations: `unleash`, `codex`. Two single-turn async calls:
 
 - `triage_structured(bundle, rubric, ...)` — main path. Asks the provider for a single JSON object deserializable into `StructuredTriageReport`, validates `ForkCommitment` against the rubric (soft-warn), and returns the report plus any validator warnings.
-- `extract_anchor(ticket)` — best-effort timestamp extraction; returns `None` on any failure (invalid JSON, missing key, unparseable timestamp). Only transport errors propagate.
+- `extract::resolve_incident_window(ticket, --at, window_minutes)` is the Rust-owned incident-window resolver. Priority is `--at` flag → explicit RFC3339-style timestamp found in subject/description/comments → ticket `created_at`. The LLM must not choose or revise the Datadog search window.
 
 **Parse / validation retry semantics (spec § 6, decision 6):** on a JSON parse or shape-validation failure, the pipeline retries the LLM call once with a corrective system note. A second failure raises `LlmError::StructuredAfterRetry { raw_response, .. }`; the pipeline catches that variant and stashes the raw response under `${TRIAGE_TICKETS_ROOT}/<id>/.debug/llm-response-<timestamp>.json` (via `ticket_folder::stash_debug_response`) before propagating the error. No ticket folder is written on this failure path.
 
@@ -166,7 +166,7 @@ There is **no `confluence.rs`** by design. Refreshing the inventory from Conflue
 
 ### Datadog query
 
-Site-level only: `<DD_CALL_CENTER_TAG>:<site_name> status:(<levels>)`. Window is `anchor ± window_minutes`, capped at 200 lines (`log_truncated = true` when at the cap). `site_name` is regex-validated (`^[a-zA-Z0-9._-]+$`) before query interpolation — do not loosen this. `DD_STATION_TAG` is read by no code today but is reserved for station-level filtering; leave it in `.env.example`.
+The pipeline builds a Datadog query plan in Rust. The first query is broad site-level: `<DD_CALL_CENTER_TAG>:<site_name> status:(<levels>)`. If deterministic ticket hints exist, focused queries are appended for station (`DD_STATION_TAG`), call ID (`DD_CALL_ID_TAG`), and component (`DD_COMPONENT_TAG`). Window is the deterministic `IncidentWindow` from `extract::resolve_incident_window`, capped at 200 lines per query (`log_truncated = true` when any query hits the cap). `site_name` and focused values are regex-validated before query interpolation — do not loosen this. Returned logs are clustered in Rust by normalized message signature, service, station, call ID, and 5-minute bucket; clusters receive `LC-NNN` IDs and their own `datadog_log_cluster` evidence rows.
 
 ### Fixture / demo mode
 

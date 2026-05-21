@@ -16,14 +16,18 @@ use reqwest::{Client, StatusCode};
 use serde_json::{Map, Value};
 use thiserror::Error;
 
-use crate::models::LogLine;
+use crate::models::{InvestigationHints, LogLine};
 
 const DEFAULT_MAX_LINES: u32 = 200;
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_SITE: &str = "datadoghq.com";
 const DEFAULT_CALL_CENTER_TAG: &str = "@log.machineData.callCenterName";
+const DEFAULT_STATION_TAG: &str = "@log.machineData.stationName";
+const DEFAULT_CALL_ID_TAG: &str = "@call_id";
+const DEFAULT_COMPONENT_TAG: &str = "service";
 
 static SAFE_SITE_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^[a-zA-Z0-9._-]+$").unwrap());
+static SAFE_QUERY_VALUE_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"^[a-zA-Z0-9._@-]+$").unwrap());
 
 fn valid_levels() -> HashSet<&'static str> {
     HashSet::from(["error", "warn", "info", "debug"])
@@ -42,6 +46,11 @@ pub enum DatadogError {
          expected only [a-zA-Z0-9._-]"
     )]
     UnsafeSiteName(String),
+    #[error(
+        "query value {0:?} contains characters that are unsafe for Datadog query interpolation; \
+         expected only [a-zA-Z0-9._@-]"
+    )]
+    UnsafeQueryValue(String),
     #[error("start must be strictly before end")]
     InvalidWindow,
     #[error("Invalid log levels: {0:?}. Valid: [\"debug\", \"error\", \"info\", \"warn\"]")]
@@ -54,6 +63,162 @@ pub enum DatadogError {
     Transport(#[from] reqwest::Error),
     #[error("Datadog returned malformed JSON: {0}")]
     Decode(#[source] serde_json::Error),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DatadogQueryKind {
+    BroadSite,
+    Station,
+    CallId,
+    Component,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatadogQuery {
+    pub kind: DatadogQueryKind,
+    pub label: String,
+    pub query: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DatadogQueryPlan {
+    pub queries: Vec<DatadogQuery>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatadogQueryConfig {
+    pub call_center_tag: String,
+    pub station_tag: String,
+    pub call_id_tag: String,
+    pub component_tag: String,
+}
+
+impl Default for DatadogQueryConfig {
+    fn default() -> Self {
+        Self {
+            call_center_tag: DEFAULT_CALL_CENTER_TAG.into(),
+            station_tag: DEFAULT_STATION_TAG.into(),
+            call_id_tag: DEFAULT_CALL_ID_TAG.into(),
+            component_tag: DEFAULT_COMPONENT_TAG.into(),
+        }
+    }
+}
+
+impl DatadogQueryConfig {
+    pub fn from_env() -> Self {
+        Self {
+            call_center_tag: env::var("DD_CALL_CENTER_TAG")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| DEFAULT_CALL_CENTER_TAG.into()),
+            station_tag: env::var("DD_STATION_TAG")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| DEFAULT_STATION_TAG.into()),
+            call_id_tag: env::var("DD_CALL_ID_TAG")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| DEFAULT_CALL_ID_TAG.into()),
+            component_tag: env::var("DD_COMPONENT_TAG")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| DEFAULT_COMPONENT_TAG.into()),
+        }
+    }
+}
+
+pub fn build_query_plan(
+    site_name: &str,
+    hints: &InvestigationHints,
+    levels: &[String],
+    config: &DatadogQueryConfig,
+) -> Result<DatadogQueryPlan, DatadogError> {
+    let broad = build_broad_query(site_name, levels, &config.call_center_tag)?;
+    let clean_site = site_name.trim();
+    let mut queries = vec![DatadogQuery {
+        kind: DatadogQueryKind::BroadSite,
+        label: format!("site:{clean_site}"),
+        query: broad.clone(),
+    }];
+
+    for station in &hints.stations {
+        let station = safe_query_value(station)?;
+        queries.push(DatadogQuery {
+            kind: DatadogQueryKind::Station,
+            label: format!("station:{station}"),
+            query: format!("{broad} {}:{station}", config.station_tag),
+        });
+    }
+    for call_id in &hints.call_ids {
+        let call_id = safe_query_value(call_id)?;
+        queries.push(DatadogQuery {
+            kind: DatadogQueryKind::CallId,
+            label: format!("call_id:{call_id}"),
+            query: format!("{broad} {}:{call_id}", config.call_id_tag),
+        });
+    }
+    for component in &hints.components {
+        let component = safe_query_value(component)?;
+        queries.push(DatadogQuery {
+            kind: DatadogQueryKind::Component,
+            label: format!("component:{component}"),
+            query: format!("{broad} {}:{component}", config.component_tag),
+        });
+    }
+
+    Ok(DatadogQueryPlan { queries })
+}
+
+fn build_broad_query(
+    site_name: &str,
+    levels: &[String],
+    call_center_tag: &str,
+) -> Result<String, DatadogError> {
+    let (clean_site, norm_levels) = validate_query_inputs(site_name, levels)?;
+    Ok(format!(
+        "{}:{} status:({})",
+        call_center_tag,
+        clean_site,
+        norm_levels.join(" OR ")
+    ))
+}
+
+fn validate_query_inputs<'a>(
+    site_name: &'a str,
+    levels: &[String],
+) -> Result<(&'a str, Vec<String>), DatadogError> {
+    if levels.is_empty() {
+        return Err(DatadogError::EmptyLevels);
+    }
+    let clean_site = site_name.trim();
+    if clean_site.is_empty() {
+        return Err(DatadogError::EmptySiteName);
+    }
+    if !SAFE_SITE_RE.is_match(clean_site) {
+        return Err(DatadogError::UnsafeSiteName(clean_site.to_string()));
+    }
+    let norm_levels: Vec<String> = levels
+        .iter()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .collect();
+    let valid = valid_levels();
+    let invalid: Vec<String> = norm_levels
+        .iter()
+        .filter(|l| !valid.contains(l.as_str()))
+        .cloned()
+        .collect();
+    if !invalid.is_empty() {
+        return Err(DatadogError::InvalidLevels(invalid));
+    }
+    Ok((clean_site, norm_levels))
+}
+
+fn safe_query_value(value: &str) -> Result<String, DatadogError> {
+    let clean = value.trim();
+    if clean.is_empty() || !SAFE_QUERY_VALUE_RE.is_match(clean) {
+        return Err(DatadogError::UnsafeQueryValue(clean.to_string()));
+    }
+    Ok(clean.to_string())
 }
 
 pub struct DatadogClient {
@@ -133,40 +298,28 @@ impl DatadogClient {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
     ) -> Result<(Vec<LogLine>, bool), DatadogError> {
-        if levels.is_empty() {
-            return Err(DatadogError::EmptyLevels);
-        }
-        let clean_site = site_name.trim();
-        if clean_site.is_empty() {
-            return Err(DatadogError::EmptySiteName);
-        }
-        if !SAFE_SITE_RE.is_match(clean_site) {
-            return Err(DatadogError::UnsafeSiteName(clean_site.to_string()));
-        }
+        let query = build_broad_query(site_name, levels, &self.call_center_tag)?;
+        self.execute_query(&query, start, end).await
+    }
+
+    async fn get_logs_for_query_inner(
+        &self,
+        query: &DatadogQuery,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<(Vec<LogLine>, bool), DatadogError> {
+        self.execute_query(&query.query, start, end).await
+    }
+
+    async fn execute_query(
+        &self,
+        query: &str,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<(Vec<LogLine>, bool), DatadogError> {
         if start >= end {
             return Err(DatadogError::InvalidWindow);
         }
-        let norm_levels: Vec<String> = levels
-            .iter()
-            .map(|s| s.trim().to_ascii_lowercase())
-            .collect();
-        let valid = valid_levels();
-        let invalid: Vec<String> = norm_levels
-            .iter()
-            .filter(|l| !valid.contains(l.as_str()))
-            .cloned()
-            .collect();
-        if !invalid.is_empty() {
-            return Err(DatadogError::InvalidLevels(invalid));
-        }
-
-        let query = format!(
-            "{}:{} status:({})",
-            self.call_center_tag,
-            clean_site,
-            norm_levels.join(" OR ")
-        );
-
         let url = format!("https://api.{}/api/v2/logs/events", self.site);
         let resp = self
             .client
@@ -175,7 +328,7 @@ impl DatadogClient {
             .header("DD-APPLICATION-KEY", &self.app_key)
             .header(reqwest::header::ACCEPT, "application/json")
             .query(&[
-                ("filter[query]", query.as_str()),
+                ("filter[query]", query),
                 (
                     "filter[from]",
                     &start.to_rfc3339_opts(SecondsFormat::Millis, true),
@@ -276,6 +429,13 @@ pub trait DatadogSource: Send + Sync {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
     ) -> LogsFuture<'a>;
+
+    fn get_logs_for_query<'a>(
+        &'a self,
+        query: &'a DatadogQuery,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> LogsFuture<'a>;
 }
 
 impl DatadogSource for DatadogClient {
@@ -287,6 +447,15 @@ impl DatadogSource for DatadogClient {
         end: DateTime<Utc>,
     ) -> LogsFuture<'a> {
         Box::pin(self.get_logs_inner(site_name, levels, start, end))
+    }
+
+    fn get_logs_for_query<'a>(
+        &'a self,
+        query: &'a DatadogQuery,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> LogsFuture<'a> {
+        Box::pin(self.get_logs_for_query_inner(query, start, end))
     }
 }
 
@@ -542,5 +711,49 @@ mod tests {
             validate("bad site*", &[], s, e),
             Err(DatadogError::EmptyLevels)
         ));
+    }
+
+    #[test]
+    fn build_query_plan_adds_broad_then_focused_queries() {
+        let hints = crate::models::InvestigationHints {
+            stations: vec!["Jeffcom-74".into()],
+            call_ids: vec!["abc-123@example.net".into()],
+            components: vec!["kamailio".into()],
+        };
+        let levels = vec!["error".to_string(), "warn".to_string()];
+        let plan = build_query_plan(
+            "us-co-jeffcom",
+            &hints,
+            &levels,
+            &DatadogQueryConfig::default(),
+        )
+        .unwrap();
+
+        let labels: Vec<&str> = plan.queries.iter().map(|q| q.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "site:us-co-jeffcom",
+                "station:Jeffcom-74",
+                "call_id:abc-123@example.net",
+                "component:kamailio",
+            ]
+        );
+        assert_eq!(
+            plan.queries[0].query,
+            "@log.machineData.callCenterName:us-co-jeffcom status:(error OR warn)"
+        );
+        assert_eq!(
+            plan.queries[1].query,
+            "@log.machineData.callCenterName:us-co-jeffcom status:(error OR warn) @log.machineData.stationName:Jeffcom-74"
+        );
+        assert_eq!(
+            plan.queries[2].query,
+            "@log.machineData.callCenterName:us-co-jeffcom status:(error OR warn) @call_id:abc-123@example.net"
+        );
+        assert_eq!(
+            plan.queries[3].query,
+            "@log.machineData.callCenterName:us-co-jeffcom status:(error OR warn) service:kamailio"
+        );
     }
 }

@@ -157,4 +157,14 @@ impl DatadogSource for FixtureDatadogClient {
         let result = Ok((self.logs.clone(), self.truncated));
         Box::pin(async move { result })
     }
+
+    fn get_logs_for_query<'a>(
+        &'a self,
+        _query: &'a crate::datadog::DatadogQuery,
+        _start: DateTime<Utc>,
+        _end: DateTime<Utc>,
+    ) -> LogsFuture<'a> {
+        let result = Ok((self.logs.clone(), self.truncated));
+        Box::pin(async move { result })
+    }
 }

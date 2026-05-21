@@ -2,7 +2,9 @@
 
 use std::path::PathBuf;
 
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, SecondsFormat, TimeZone, Utc};
+use once_cell::sync::Lazy;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 pub const EVIDENCE_HEAD_BYTES: usize = 32_000;
@@ -53,6 +55,29 @@ impl AnchorSource {
             Self::CreatedAt => "created_at",
         }
     }
+}
+
+/// Deterministically resolved incident window used for Datadog queries and
+/// bounded LLM context.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IncidentWindow {
+    pub anchor: DateTime<Utc>,
+    pub start: DateTime<Utc>,
+    pub end: DateTime<Utc>,
+    pub source: AnchorSource,
+    pub confidence: Confidence,
+    pub explanation: String,
+}
+
+/// Deterministic hints extracted from ticket text before Datadog enrichment.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InvestigationHints {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stations: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub call_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub components: Vec<String>,
 }
 
 /// Calibrated confidence levels emitted by the LLM. Order is meaningful.
@@ -284,6 +309,27 @@ pub struct LogLine {
     pub attributes: serde_json::Map<String, serde_json::Value>,
 }
 
+/// Deterministic Datadog log cluster catalog entry.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LogCluster {
+    pub id: String,
+    pub signature: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub station: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
+    pub bucket_start: DateTime<Utc>,
+    pub first_seen: DateTime<Utc>,
+    pub last_seen: DateTime<Utc>,
+    pub count: usize,
+    #[serde(default)]
+    pub levels: Vec<String>,
+    #[serde(default)]
+    pub sample_messages: Vec<String>,
+}
+
 /// One entry in `cnc-map.json` mapping a customer to a Datadog site name + CNC UUID.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SiteEntry {
@@ -302,6 +348,8 @@ pub struct TriageBundle {
     pub log_lines: Vec<LogLine>,
     #[serde(default)]
     pub log_truncated: bool,
+    #[serde(default)]
+    pub log_clusters: Vec<LogCluster>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -437,14 +485,67 @@ impl TriageBundle {
 
         if self.log_lines.is_empty() {
             lines.push("(no logs in window)".into());
-        } else {
-            for log in &self.log_lines {
+        } else if self.log_clusters.is_empty() {
+            for log in self.log_lines.iter().take(20) {
                 let msg = indent_continuations(&log.message);
                 lines.push(format!(
                     "- {} [{}] {msg}",
                     fmt_ts(&log.timestamp),
                     log.level
                 ));
+            }
+            if self.log_lines.len() > 20 {
+                lines.push(format!(
+                    "({} additional raw log line(s) omitted; no cluster catalog available)",
+                    self.log_lines.len() - 20
+                ));
+            }
+        } else {
+            lines.push(
+                "(raw Datadog lines retained by the CLI; LLM receives bounded cluster samples below)"
+                    .into(),
+            );
+        }
+        if !self.log_clusters.is_empty() {
+            lines.push(String::new());
+            lines.push("## Datadog Log Clusters".into());
+            lines.push(
+                "| Cluster | Count | Bucket | Service | Station | Call ID | Signature |".into(),
+            );
+            lines.push("|---|---:|---|---|---|---|---|".into());
+            for cluster in &self.log_clusters {
+                lines.push(format!(
+                    "| {} | {} | {} | {} | {} | {} | {} |",
+                    cluster.id,
+                    cluster.count,
+                    fmt_ts(&cluster.bucket_start),
+                    cluster
+                        .service
+                        .as_deref()
+                        .unwrap_or("-")
+                        .replace('|', "\\|"),
+                    cluster
+                        .station
+                        .as_deref()
+                        .unwrap_or("-")
+                        .replace('|', "\\|"),
+                    cluster
+                        .call_id
+                        .as_deref()
+                        .unwrap_or("-")
+                        .replace('|', "\\|"),
+                    cluster.signature.replace('|', "\\|"),
+                ));
+            }
+            for cluster in &self.log_clusters {
+                if cluster.sample_messages.is_empty() {
+                    continue;
+                }
+                lines.push(String::new());
+                lines.push(format!("### Samples for {}", cluster.id));
+                for sample in cluster.sample_messages.iter().take(3) {
+                    lines.push(format!("- {}", indent_continuations(sample)));
+                }
             }
         }
 
@@ -556,6 +657,22 @@ pub fn assign_evidence_ids(bundle: &TriageBundle) -> Vec<EvidenceItem> {
             source_path: "datadog:log_window".into(),
         });
     }
+    for cluster in &bundle.log_clusters {
+        items.push(EvidenceItem {
+            id: String::new(),
+            kind: "datadog_log_cluster".into(),
+            label: format!(
+                "{} count={} service={} station={} call_id={}",
+                cluster.signature,
+                cluster.count,
+                cluster.service.as_deref().unwrap_or("-"),
+                cluster.station.as_deref().unwrap_or("-"),
+                cluster.call_id.as_deref().unwrap_or("-")
+            ),
+            source_time: Some(cluster.first_seen),
+            source_path: format!("datadog:cluster:{}", cluster.id),
+        });
+    }
 
     // Local files (analyst-supplied).
     for lf in &bundle.local_files {
@@ -616,11 +733,12 @@ pub fn assign_evidence_ids(bundle: &TriageBundle) -> Vec<EvidenceItem> {
             "zendesk_comment" => 0,
             "attachment" => 1,
             "datadog_log_window" => 2,
-            "local_file" => 3,
-            "pasted_note" => 4,
-            "customer_history" => 5,
-            "memory_hit" => 6,
-            _ => 7,
+            "datadog_log_cluster" => 3,
+            "local_file" => 4,
+            "pasted_note" => 5,
+            "customer_history" => 6,
+            "memory_hit" => 7,
+            _ => 8,
         }
     }
 
@@ -637,6 +755,115 @@ pub fn assign_evidence_ids(bundle: &TriageBundle) -> Vec<EvidenceItem> {
     }
 
     items
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct LogClusterKey {
+    signature: String,
+    service: Option<String>,
+    station: Option<String>,
+    call_id: Option<String>,
+    bucket_start: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+struct LogClusterAcc {
+    key: LogClusterKey,
+    first_seen: DateTime<Utc>,
+    last_seen: DateTime<Utc>,
+    count: usize,
+    levels: std::collections::BTreeSet<String>,
+    sample_messages: Vec<String>,
+}
+
+static NUMERIC_TOKEN_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\b\d+\b").unwrap());
+static HEXISH_TOKEN_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\b[0-9a-fA-F]{8,}\b").unwrap());
+static WHITESPACE_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\s+").unwrap());
+
+/// Cluster Datadog logs by normalized message signature, service, station,
+/// call ID, and 5-minute time bucket.
+pub fn catalog_log_clusters(logs: &[LogLine]) -> Vec<LogCluster> {
+    let mut by_key: std::collections::BTreeMap<LogClusterKey, LogClusterAcc> =
+        std::collections::BTreeMap::new();
+    for log in logs {
+        let key = LogClusterKey {
+            signature: log_signature(&log.message),
+            service: log_attr(log, &["service"]),
+            station: log_attr(
+                log,
+                &[
+                    "station",
+                    "stationName",
+                    "station_name",
+                    "log.machineData.stationName",
+                    "log.machineData.name",
+                ],
+            ),
+            call_id: log_attr(log, &["call_id", "callId", "call-id", "sip.call_id"]),
+            bucket_start: bucket_start(log.timestamp),
+        };
+        let entry = by_key.entry(key.clone()).or_insert_with(|| LogClusterAcc {
+            key,
+            first_seen: log.timestamp,
+            last_seen: log.timestamp,
+            count: 0,
+            levels: std::collections::BTreeSet::new(),
+            sample_messages: Vec::new(),
+        });
+        entry.count += 1;
+        entry.first_seen = entry.first_seen.min(log.timestamp);
+        entry.last_seen = entry.last_seen.max(log.timestamp);
+        entry.levels.insert(log.level.to_ascii_lowercase());
+        if !entry.sample_messages.iter().any(|m| m == &log.message) {
+            entry.sample_messages.push(log.message.clone());
+            entry.sample_messages.truncate(3);
+        }
+    }
+
+    by_key
+        .into_values()
+        .enumerate()
+        .map(|(i, acc)| LogCluster {
+            id: format!("LC-{:03}", i + 1),
+            signature: acc.key.signature,
+            service: acc.key.service,
+            station: acc.key.station,
+            call_id: acc.key.call_id,
+            bucket_start: acc.key.bucket_start,
+            first_seen: acc.first_seen,
+            last_seen: acc.last_seen,
+            count: acc.count,
+            levels: acc.levels.into_iter().collect(),
+            sample_messages: acc.sample_messages,
+        })
+        .collect()
+}
+
+fn bucket_start(ts: DateTime<Utc>) -> DateTime<Utc> {
+    let bucket = 5 * 60;
+    let secs = ts.timestamp().div_euclid(bucket) * bucket;
+    Utc.timestamp_opt(secs, 0).single().unwrap_or(ts)
+}
+
+fn log_signature(message: &str) -> String {
+    let lower = message.to_ascii_lowercase();
+    let without_hex = HEXISH_TOKEN_RE.replace_all(&lower, "<id>");
+    let without_nums = NUMERIC_TOKEN_RE.replace_all(&without_hex, "<num>");
+    WHITESPACE_RE
+        .replace_all(without_nums.trim(), " ")
+        .into_owned()
+}
+
+fn log_attr(log: &LogLine, keys: &[&str]) -> Option<String> {
+    for key in keys {
+        if let Some(value) = log.attributes.get(*key).and_then(serde_json::Value::as_str) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
 }
 
 fn fmt_size(size_bytes: Option<u64>) -> String {
@@ -1129,7 +1356,9 @@ pub struct JiraDraft {
 /// `DRAFTS.md` content. All sections are CONFIRM-gated by the renderer.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DraftsBlock {
+    #[serde(default)]
     pub customer_reply: String,
+    #[serde(default)]
     pub internal_zendesk_note: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jira_draft: Option<JiraDraft>,
@@ -1142,6 +1371,7 @@ pub struct StructuredTriageReport {
     pub intake: IntakeBlock,
     pub evidence_preflight: PreflightBlock,
     pub fork_packet: ForkPacket,
+    #[serde(default)]
     pub drafts: DraftsBlock,
     /// `rubric_version` the LLM was given. The renderer copies this into
     /// `STATE.md` so inbox can detect mismatches against the shipped rubric.
@@ -1207,6 +1437,7 @@ mod tests {
             site_entry: None,
             log_lines: vec![],
             log_truncated: false,
+            log_clusters: vec![],
             anchor: None,
             anchor_source: None,
             window_start: None,
@@ -1253,6 +1484,7 @@ mod tests {
             site_entry: None,
             log_lines: vec![],
             log_truncated: false,
+            log_clusters: vec![],
             anchor: None,
             anchor_source: None,
             window_start: None,
@@ -1307,6 +1539,7 @@ mod tests {
             site_entry: None,
             log_lines: vec![],
             log_truncated: false,
+            log_clusters: vec![],
             anchor: None,
             anchor_source: None,
             window_start: None,
@@ -1328,6 +1561,200 @@ mod tests {
         assert_eq!(first[0].id, "E-001");
         assert_eq!(first[1].kind, "attachment");
         assert_eq!(first[1].id, "E-002");
+    }
+
+    #[test]
+    fn catalog_log_clusters_groups_by_signature_dimensions_and_time_bucket() {
+        use chrono::TimeZone;
+        use serde_json::{json, Map};
+
+        fn log(
+            ts: DateTime<Utc>,
+            message: &str,
+            service: &str,
+            station: &str,
+            call_id: &str,
+        ) -> LogLine {
+            let mut attributes = Map::new();
+            attributes.insert("service".into(), json!(service));
+            attributes.insert("station".into(), json!(station));
+            attributes.insert("call_id".into(), json!(call_id));
+            LogLine {
+                timestamp: ts,
+                level: "error".into(),
+                message: message.into(),
+                attributes,
+            }
+        }
+
+        let t0 = Utc.with_ymd_and_hms(2026, 5, 16, 8, 30, 0).unwrap();
+        let clusters = catalog_log_clusters(&[
+            log(
+                t0,
+                "WebRTC disconnected after 123 ms",
+                "kamailio",
+                "Acme-01",
+                "call-1",
+            ),
+            log(
+                t0 + chrono::Duration::minutes(1),
+                "WebRTC disconnected after 456 ms",
+                "kamailio",
+                "Acme-01",
+                "call-1",
+            ),
+            log(
+                t0 + chrono::Duration::minutes(6),
+                "WebRTC disconnected after 789 ms",
+                "kamailio",
+                "Acme-01",
+                "call-1",
+            ),
+            log(
+                t0,
+                "WebRTC disconnected after 123 ms",
+                "kamailio",
+                "Acme-02",
+                "call-1",
+            ),
+        ]);
+
+        assert_eq!(clusters.len(), 3);
+        assert_eq!(clusters[0].count, 2);
+        assert_eq!(clusters[0].signature, "webrtc disconnected after <num> ms");
+        assert_eq!(clusters[0].service.as_deref(), Some("kamailio"));
+        assert_eq!(clusters[0].station.as_deref(), Some("Acme-01"));
+        assert_eq!(clusters[0].call_id.as_deref(), Some("call-1"));
+        assert_eq!(clusters[0].bucket_start, t0);
+        assert_eq!(clusters[1].count, 1, "different station must split cluster");
+        assert_eq!(
+            clusters[2].count, 1,
+            "different 5-minute bucket must split cluster"
+        );
+    }
+
+    #[test]
+    fn assign_evidence_ids_includes_log_clusters_after_log_window() {
+        use chrono::TimeZone;
+        use serde_json::{json, Map};
+
+        let t = Utc.with_ymd_and_hms(2026, 5, 16, 8, 30, 0).unwrap();
+        let ticket = Ticket {
+            id: 4,
+            subject: "test".into(),
+            description: "d".into(),
+            requester_org: None,
+            requester_email: None,
+            tags: vec![],
+            created_at: t,
+            updated_at: None,
+            comments: vec![],
+        };
+        let mut attributes = Map::new();
+        attributes.insert("service".into(), json!("kamailio"));
+        attributes.insert("station".into(), json!("Acme-01"));
+        attributes.insert("call_id".into(), json!("call-1"));
+        let log = LogLine {
+            timestamp: t,
+            level: "error".into(),
+            message: "WebRTC disconnected after 123 ms".into(),
+            attributes,
+        };
+        let log_clusters = catalog_log_clusters(std::slice::from_ref(&log));
+        let bundle = TriageBundle {
+            ticket,
+            site_entry: Some(SiteEntry {
+                friendly_name: "Acme".into(),
+                site_name: "us-nv-acme".into(),
+                cnc: "cnc-1".into(),
+            }),
+            log_lines: vec![log],
+            log_truncated: false,
+            log_clusters,
+            anchor: Some(t),
+            anchor_source: Some(AnchorSource::Extracted),
+            window_start: Some(t),
+            window_end: Some(t + chrono::Duration::minutes(30)),
+            downloaded_attachments: vec![],
+            local_files: vec![],
+            pasted_logs: vec![],
+            customer_history: None,
+            memory_context: None,
+            evidence_index: vec![],
+        };
+
+        let ids = assign_evidence_ids(&bundle);
+
+        assert_eq!(ids[0].kind, "datadog_log_window");
+        assert_eq!(ids[0].id, "E-001");
+        assert_eq!(ids[1].kind, "datadog_log_cluster");
+        assert_eq!(ids[1].id, "E-002");
+        assert!(ids[1].label.contains("webrtc disconnected"));
+        assert_eq!(ids[1].source_path, "datadog:cluster:LC-001");
+    }
+
+    #[test]
+    fn user_message_renders_bounded_cluster_samples_not_raw_log_dump() {
+        use chrono::TimeZone;
+        use serde_json::{json, Map};
+
+        let t = Utc.with_ymd_and_hms(2026, 5, 16, 8, 30, 0).unwrap();
+        let ticket = Ticket {
+            id: 5,
+            subject: "test".into(),
+            description: "d".into(),
+            requester_org: None,
+            requester_email: None,
+            tags: vec![],
+            created_at: t,
+            updated_at: None,
+            comments: vec![],
+        };
+        let mut logs = Vec::new();
+        for (i, duration_ms) in [111, 222, 333, 444].iter().enumerate() {
+            let mut attributes = Map::new();
+            attributes.insert("service".into(), json!("kamailio"));
+            attributes.insert("station".into(), json!("Acme-01"));
+            attributes.insert("call_id".into(), json!("call-1"));
+            logs.push(LogLine {
+                timestamp: t + chrono::Duration::seconds(i as i64),
+                level: "error".into(),
+                message: format!("WebRTC disconnected after {duration_ms} ms"),
+                attributes,
+            });
+        }
+        let log_clusters = catalog_log_clusters(&logs);
+        let mut bundle = TriageBundle {
+            ticket,
+            site_entry: None,
+            log_lines: logs,
+            log_truncated: false,
+            log_clusters,
+            anchor: Some(t),
+            anchor_source: Some(AnchorSource::Extracted),
+            window_start: Some(t),
+            window_end: Some(t + chrono::Duration::minutes(30)),
+            downloaded_attachments: vec![],
+            local_files: vec![],
+            pasted_logs: vec![],
+            customer_history: None,
+            memory_context: None,
+            evidence_index: vec![],
+        };
+        bundle.evidence_index = assign_evidence_ids(&bundle);
+
+        let msg = bundle.as_user_message();
+
+        assert!(msg.contains("## Datadog Log Clusters"));
+        assert!(msg.contains("LC-001"));
+        assert!(msg.contains("WebRTC disconnected after 111 ms"));
+        assert!(msg.contains("WebRTC disconnected after 222 ms"));
+        assert!(msg.contains("WebRTC disconnected after 333 ms"));
+        assert!(!msg.contains("WebRTC disconnected after 444 ms"));
+        assert!(
+            !msg.contains("- 2026-05-16T08:30:00Z [error]"),
+            "raw per-log Datadog lines should not be dumped into the LLM prompt"
+        );
     }
 }
 

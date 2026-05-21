@@ -3,7 +3,7 @@
 //! from orchestration: `StderrReporter` (default), `SilentReporter`
 //! (tests/watcher), `ChannelReporter` (TUI).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -13,13 +13,13 @@ use indicatif::{ProgressBar, ProgressStyle};
 use thiserror::Error;
 use tokio::sync::mpsc;
 
-use crate::datadog::{DatadogError, DatadogSource};
+use crate::datadog::{DatadogError, DatadogQueryConfig, DatadogSource};
 use crate::extract::{self, ExtractError, SiteStrategy};
 use crate::llm::{self, LlmError};
 use crate::memory;
 use crate::models::{
-    AnchorSource, Confidence, CustomerHistoryEvidence, DraftsBlock, ForkCommitment, ForkLetter,
-    ForkPacket, HandoffBlock, InitialRoute, IntakeBlock, IntakeDecision, IntakeTicketFacts,
+    Confidence, CustomerHistoryEvidence, DraftsBlock, ForkCommitment, ForkLetter, ForkPacket,
+    HandoffBlock, InitialRoute, IntakeBlock, IntakeDecision, IntakeTicketFacts,
     InvestigationSession, LogLine, MemoryContext, MemoryEntry, PreflightBlock, RelatedWork,
     SiteEntry, StructuredTriageReport, Ticket, TriageBundle,
 };
@@ -293,6 +293,38 @@ pub async fn investigate_one_structured(
         &format!("{} event(s)", session.timeline.len()),
     );
 
+    // Phase: incident_window — deterministic Rust resolution. The LLM is not
+    // allowed to choose or revise the Datadog search window.
+    reporter.phase_started("incident_window", "resolving reported timing");
+    let incident_window =
+        extract::resolve_incident_window(&ticket, opts.anchor_override, opts.window_minutes)?;
+    reporter.phase_done(
+        "incident_window",
+        &format!(
+            "{} from {} ({})",
+            crate::models::fmt_ts(&incident_window.anchor),
+            incident_window.source.as_str(),
+            incident_window.confidence.as_str()
+        ),
+    );
+
+    // Phase: investigation_hints — deterministic Rust extraction before any
+    // Datadog query planning.
+    reporter.phase_started(
+        "investigation_hints",
+        "extracting station/call/component hints",
+    );
+    let investigation_hints = extract::resolve_investigation_hints(&ticket);
+    reporter.phase_done(
+        "investigation_hints",
+        &format!(
+            "{} station(s), {} call-id(s), {} component(s)",
+            investigation_hints.stations.len(),
+            investigation_hints.call_ids.len(),
+            investigation_hints.components.len()
+        ),
+    );
+
     // Phase: enrichment (optional Datadog) — same as legacy
     reporter.phase_started("enrichment", "");
     let mut site_entry: Option<SiteEntry> = None;
@@ -314,18 +346,39 @@ pub async fn investigate_one_structured(
                     )
                     .await?;
                     if let Some(entry) = resolved {
-                        let extracted_dt = if opts.anchor_override.is_none() {
-                            llm::extract_anchor(&ticket, None).await.unwrap_or(None)
-                        } else {
-                            None
-                        };
-                        let (anchor_dt, _src) =
-                            extract::resolve_anchor(&ticket, opts.anchor_override, extracted_dt);
-                        let (start, end) = extract::build_window(anchor_dt, opts.window_minutes)?;
-                        let (logs, truncated) =
-                            dd.get_logs(&entry.site_name, &levels, start, end).await?;
-                        log_lines = logs;
-                        log_truncated = truncated;
+                        let plan = crate::datadog::build_query_plan(
+                            &entry.site_name,
+                            &investigation_hints,
+                            &levels,
+                            &DatadogQueryConfig::from_env(),
+                        )?;
+                        let mut seen = HashSet::new();
+                        for query in &plan.queries {
+                            let (logs, truncated) = dd
+                                .get_logs_for_query(
+                                    query,
+                                    incident_window.start,
+                                    incident_window.end,
+                                )
+                                .await?;
+                            log_truncated |= truncated;
+                            for log in logs {
+                                let key =
+                                    format!("{}|{}|{}", log.timestamp, log.level, log.message);
+                                if seen.insert(key) {
+                                    log_lines.push(log);
+                                }
+                            }
+                        }
+                        log_lines.sort_by_key(|l| l.timestamp);
+                        reporter.record_metric(
+                            "datadog.query_count",
+                            MetricValue::Int(plan.queries.len() as i64),
+                        );
+                        reporter.record_metric(
+                            "datadog.focused_query_count",
+                            MetricValue::Int(plan.queries.len().saturating_sub(1) as i64),
+                        );
                         site_entry = Some(entry);
                     }
                 }
@@ -355,6 +408,11 @@ pub async fn investigate_one_structured(
         MetricValue::Int(log_lines.len() as i64),
     );
     reporter.record_metric("evidence.memory_hits", MetricValue::Int(prior.len() as i64));
+    let log_clusters = crate::models::catalog_log_clusters(&log_lines);
+    reporter.record_metric(
+        "evidence.datadog_clusters",
+        MetricValue::Int(log_clusters.len() as i64),
+    );
 
     // Build the evidence bundle unconditionally so both the LLM path and the
     // --no-llm path have access to the assigned-ID evidence list. The
@@ -364,14 +422,11 @@ pub async fn investigate_one_structured(
         site_entry: site_entry.clone(),
         log_lines: log_lines.clone(),
         log_truncated,
-        anchor: Some(opts.anchor_override.unwrap_or(ticket.created_at)),
-        anchor_source: Some(if opts.anchor_override.is_some() {
-            AnchorSource::Flag
-        } else {
-            AnchorSource::CreatedAt
-        }),
-        window_start: None,
-        window_end: None,
+        log_clusters,
+        anchor: Some(incident_window.anchor),
+        anchor_source: Some(incident_window.source),
+        window_start: Some(incident_window.start),
+        window_end: Some(incident_window.end),
         downloaded_attachments: session.evidence.attachments.clone(),
         local_files: session.evidence.local_files.clone(),
         pasted_logs: session.evidence.pasted_logs.clone(),
@@ -597,6 +652,32 @@ fn collect_base_evidence_entries(bundle: &TriageBundle) -> Vec<crate::models::Ba
                         cap_body_snapshot(rendered)
                     }
                 }
+                "datadog_log_cluster" => item
+                    .source_path
+                    .strip_prefix("datadog:cluster:")
+                    .and_then(|cluster_id| bundle.log_clusters.iter().find(|c| c.id == cluster_id))
+                    .map(|c| {
+                            let samples = if c.sample_messages.is_empty() {
+                                "(no samples)".to_string()
+                            } else {
+                                c.sample_messages.join("\n")
+                            };
+                            format!(
+                                "cluster: {}\nsignature: {}\ncount: {}\nservice: {}\nstation: {}\ncall_id: {}\nbucket_start: {}\nfirst_seen: {}\nlast_seen: {}\nlevels: {}\nsamples:\n{}",
+                                c.id,
+                                c.signature,
+                                c.count,
+                                c.service.as_deref().unwrap_or("-"),
+                                c.station.as_deref().unwrap_or("-"),
+                                c.call_id.as_deref().unwrap_or("-"),
+                                crate::models::fmt_ts(&c.bucket_start),
+                                crate::models::fmt_ts(&c.first_seen),
+                                crate::models::fmt_ts(&c.last_seen),
+                                c.levels.join(", "),
+                                samples
+                            )
+                        })
+                    .and_then(cap_body_snapshot),
                 "zendesk_comment" => bundle
                     .ticket
                     .comments
@@ -1399,8 +1480,69 @@ pub async fn revise(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::datadog::{DatadogSource, LogsFuture};
     use crate::fixture::{FixtureDatadogClient, FixtureLoader};
+    use crate::models::LogLine;
     use crate::playbook::Rubric;
+    use chrono::{DateTime, TimeZone, Utc};
+    use std::sync::{Arc, Mutex};
+
+    static TRIAGE_HOME_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    struct RecordingDatadog {
+        call: Arc<Mutex<Option<(String, DateTime<Utc>, DateTime<Utc>)>>>,
+        labels: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl RecordingDatadog {
+        fn new(call: Arc<Mutex<Option<(String, DateTime<Utc>, DateTime<Utc>)>>>) -> Self {
+            Self {
+                call,
+                labels: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn recorded_labels(&self) -> Vec<String> {
+            self.labels.lock().unwrap().clone()
+        }
+    }
+
+    impl DatadogSource for RecordingDatadog {
+        fn get_logs<'a>(
+            &'a self,
+            site_name: &'a str,
+            _levels: &'a [String],
+            start: DateTime<Utc>,
+            end: DateTime<Utc>,
+        ) -> LogsFuture<'a> {
+            let call = Arc::clone(&self.call);
+            let site_name = site_name.to_string();
+            Box::pin(async move {
+                *call.lock().unwrap() = Some((site_name, start, end));
+                Ok((Vec::<LogLine>::new(), false))
+            })
+        }
+
+        fn get_logs_for_query<'a>(
+            &'a self,
+            query: &'a crate::datadog::DatadogQuery,
+            start: DateTime<Utc>,
+            end: DateTime<Utc>,
+        ) -> LogsFuture<'a> {
+            let call = Arc::clone(&self.call);
+            let labels = Arc::clone(&self.labels);
+            let label = query.label.clone();
+            Box::pin(async move {
+                labels.lock().unwrap().push(label.clone());
+                let site = label
+                    .strip_prefix("site:")
+                    .map(str::to_string)
+                    .unwrap_or(label);
+                *call.lock().unwrap() = Some((site, start, end));
+                Ok((Vec::<LogLine>::new(), false))
+            })
+        }
+    }
 
     /// Run the pipeline against the audio-drop fixture (ticket #55001) using
     /// `no_llm: true` so no network calls are made. Returns the pipeline result.
@@ -1491,6 +1633,153 @@ mod tests {
         let bem = crate::chat::read_base_evidence_manifest(&ticket_dir)
             .expect("base-evidence-manifest.json must round-trip");
         let _ = bem.ticket_id; // round-trip asserted by successful read
+    }
+
+    #[tokio::test]
+    async fn investigate_uses_deterministic_ticket_timestamp_for_datadog_window() {
+        let _guard = TRIAGE_HOME_TEST_LOCK.lock().unwrap();
+        let prev_home = std::env::var(crate::paths::TRIAGE_HOME_ENV).ok();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("data")).unwrap();
+        std::fs::write(
+            home.path().join("data/cnc-map.json"),
+            r#"[{"friendly_name":"Acme PD","site_name":"us-nv-acme","cnc":"cnc-1"}]"#,
+        )
+        .unwrap();
+        std::env::set_var(crate::paths::TRIAGE_HOME_ENV, home.path());
+
+        let created = Utc.with_ymd_and_hms(2026, 5, 1, 0, 0, 0).unwrap();
+        let anchor = Utc.with_ymd_and_hms(2026, 5, 16, 8, 30, 0).unwrap();
+        let ticket = Ticket {
+            id: 901,
+            subject: "Audio dropped".into(),
+            description: "Caller reported audio dropped at 2026-05-16T08:30:00Z.".into(),
+            requester_org: Some("Acme PD".into()),
+            requester_email: None,
+            tags: vec![],
+            created_at: created,
+            updated_at: None,
+            comments: vec![],
+        };
+        let mut session = crate::investigation::create_session(ticket.clone());
+        let call = Arc::new(Mutex::new(None));
+        let dd = RecordingDatadog::new(Arc::clone(&call));
+        let tickets_root = tempfile::tempdir().unwrap();
+        let memory_md = tickets_root.path().join("MEMORY.md");
+        let memory_db = tickets_root.path().join("data/memory.db");
+        let _env = crate::memory::MemoryEnvScope::new_with_tickets_root(
+            &memory_md,
+            &memory_db,
+            Some(tickets_root.path()),
+        );
+        let opts = InvestigateOptions {
+            no_llm: true,
+            force: true,
+            memory_hits_override: Some(vec![]),
+            window_minutes: 15,
+            tickets_root: Some(tickets_root.path().to_path_buf()),
+            ..InvestigateOptions::defaults()
+        };
+        let rubric = Rubric::load().expect("embedded rubric must parse");
+        let reporter = SilentReporter;
+
+        let outcome = investigate_one_structured(
+            ticket,
+            &mut session,
+            None,
+            Some(&dd as &dyn DatadogSource),
+            &rubric,
+            &reporter,
+            &opts,
+        )
+        .await;
+
+        match prev_home {
+            Some(v) => std::env::set_var(crate::paths::TRIAGE_HOME_ENV, v),
+            None => std::env::remove_var(crate::paths::TRIAGE_HOME_ENV),
+        }
+
+        assert!(outcome.is_ok(), "pipeline failed: {:?}", outcome.err());
+        let (site, start, end) = call.lock().unwrap().clone().expect("Datadog called");
+        assert_eq!(site, "us-nv-acme");
+        assert_eq!(start, anchor - chrono::Duration::minutes(15));
+        assert_eq!(end, anchor + chrono::Duration::minutes(15));
+    }
+
+    #[tokio::test]
+    async fn investigate_runs_broad_and_focused_datadog_queries_when_hints_exist() {
+        let _guard = TRIAGE_HOME_TEST_LOCK.lock().unwrap();
+        let prev_home = std::env::var(crate::paths::TRIAGE_HOME_ENV).ok();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("data")).unwrap();
+        std::fs::write(
+            home.path().join("data/cnc-map.json"),
+            r#"[{"friendly_name":"Acme PD","site_name":"us-nv-acme","cnc":"cnc-1"}]"#,
+        )
+        .unwrap();
+        std::env::set_var(crate::paths::TRIAGE_HOME_ENV, home.path());
+
+        let ticket = Ticket {
+            id: 902,
+            subject: "Station Acme-01 audio issue".into(),
+            description: "Call-ID: call-123@example.net. Kamailio warning at 2026-05-16T08:30:00Z."
+                .into(),
+            requester_org: Some("Acme PD".into()),
+            requester_email: None,
+            tags: vec![],
+            created_at: Utc.with_ymd_and_hms(2026, 5, 1, 0, 0, 0).unwrap(),
+            updated_at: None,
+            comments: vec![],
+        };
+        let mut session = crate::investigation::create_session(ticket.clone());
+        let call = Arc::new(Mutex::new(None));
+        let dd = RecordingDatadog::new(Arc::clone(&call));
+        let tickets_root = tempfile::tempdir().unwrap();
+        let memory_md = tickets_root.path().join("MEMORY.md");
+        let memory_db = tickets_root.path().join("data/memory.db");
+        let _env = crate::memory::MemoryEnvScope::new_with_tickets_root(
+            &memory_md,
+            &memory_db,
+            Some(tickets_root.path()),
+        );
+        let opts = InvestigateOptions {
+            no_llm: true,
+            force: true,
+            memory_hits_override: Some(vec![]),
+            window_minutes: 15,
+            tickets_root: Some(tickets_root.path().to_path_buf()),
+            ..InvestigateOptions::defaults()
+        };
+        let rubric = Rubric::load().expect("embedded rubric must parse");
+        let reporter = SilentReporter;
+
+        let outcome = investigate_one_structured(
+            ticket,
+            &mut session,
+            None,
+            Some(&dd as &dyn DatadogSource),
+            &rubric,
+            &reporter,
+            &opts,
+        )
+        .await;
+
+        match prev_home {
+            Some(v) => std::env::set_var(crate::paths::TRIAGE_HOME_ENV, v),
+            None => std::env::remove_var(crate::paths::TRIAGE_HOME_ENV),
+        }
+
+        assert!(outcome.is_ok(), "pipeline failed: {:?}", outcome.err());
+        let labels = dd.recorded_labels();
+        assert_eq!(
+            labels,
+            vec![
+                "site:us-nv-acme",
+                "station:Acme-01",
+                "call_id:call-123@example.net",
+                "component:kamailio",
+            ]
+        );
     }
 
     #[tokio::test]
@@ -3186,6 +3475,7 @@ validator_warnings: []\n---\n";
             site_entry: None,
             log_lines: vec![],
             log_truncated: false,
+            log_clusters: vec![],
             anchor: None,
             anchor_source: None,
             window_start: None,
