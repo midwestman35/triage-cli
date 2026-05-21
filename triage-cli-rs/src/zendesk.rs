@@ -7,7 +7,9 @@
 //!   so the `doctor` and Datadog error-paths surface the same messages.
 
 use std::env;
+use std::future::Future;
 use std::path::Path;
+use std::pin::Pin;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -60,6 +62,38 @@ pub enum ZendeskError {
     PaginationLoop(u32),
     #[error("Zendesk assigned-tickets search pagination exceeded limit")]
     SearchPaginationLoop,
+}
+
+/// Trait for Zendesk data access. The concrete `ZendeskClient` makes real
+/// HTTP calls; tests inject mock implementations.
+pub trait ZendeskSource: Send + Sync {
+    fn get_ticket<'a>(
+        &'a self,
+        ticket_id: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<Ticket, ZendeskError>> + Send + 'a>>;
+
+    fn fetch_customer_history<'a>(
+        &'a self,
+        email: &'a str,
+        limit: usize,
+    ) -> Pin<Box<dyn Future<Output = Vec<TicketSummary>> + Send + 'a>>;
+
+    fn list_view_ticket_ids<'a>(
+        &'a self,
+        view_id: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u64>, ZendeskError>> + Send + 'a>>;
+
+    fn list_my_ticket_ids<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u64>, ZendeskError>> + Send + 'a>>;
+
+    #[allow(clippy::type_complexity)]
+    fn download_attachment<'a>(
+        &'a self,
+        url: &'a str,
+        dest_path: &'a Path,
+        max_bytes: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<(u64, String), ZendeskError>> + Send + 'a>>;
 }
 
 pub struct ZendeskClient {
@@ -543,6 +577,45 @@ impl ZendeskClient {
         let text = resp.text().await.unwrap_or_default();
         let snippet: String = text.chars().take(200).collect();
         Err(ZendeskError::HttpStatus(status.as_u16(), snippet))
+    }
+}
+
+impl ZendeskSource for ZendeskClient {
+    fn get_ticket<'a>(
+        &'a self,
+        ticket_id: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<Ticket, ZendeskError>> + Send + 'a>> {
+        Box::pin(async move { self.get_ticket(ticket_id).await })
+    }
+
+    fn fetch_customer_history<'a>(
+        &'a self,
+        email: &'a str,
+        limit: usize,
+    ) -> Pin<Box<dyn Future<Output = Vec<TicketSummary>> + Send + 'a>> {
+        Box::pin(async move { self.fetch_customer_history(email, limit as u32).await })
+    }
+
+    fn list_view_ticket_ids<'a>(
+        &'a self,
+        view_id: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u64>, ZendeskError>> + Send + 'a>> {
+        Box::pin(async move { self.list_view_ticket_ids(view_id).await })
+    }
+
+    fn list_my_ticket_ids<'a>(
+        &'a self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u64>, ZendeskError>> + Send + 'a>> {
+        Box::pin(async move { self.list_my_ticket_ids().await })
+    }
+
+    fn download_attachment<'a>(
+        &'a self,
+        url: &'a str,
+        dest_path: &'a Path,
+        max_bytes: u64,
+    ) -> Pin<Box<dyn Future<Output = Result<(u64, String), ZendeskError>> + Send + 'a>> {
+        Box::pin(async move { self.download_attachment(url, dest_path, max_bytes).await })
     }
 }
 
