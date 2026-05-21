@@ -925,8 +925,7 @@ fn handle_pipeline_error(e: pipeline::PipelineError, open_full_diff: bool) -> Ex
     {
         print_soft_lock_summary(existing_owner, current_owner, summary);
         if open_full_diff {
-            if let Err(diff_err) = show_full_state_diff(state_path, new_state_content)
-            {
+            if let Err(diff_err) = show_full_state_diff(state_path, new_state_content) {
                 eprintln!(
                     "{}: could not produce full diff: {}",
                     "warning".yellow().bold(),

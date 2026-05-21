@@ -951,6 +951,7 @@ const SESSION_LOST_ACTION: &str = "session_lost";
 /// Acquires the per-ticket lock for both writes (analyst turn + provider
 /// turn). The caller is expected to have already validated `prompt` (e.g.
 /// rendered it from analyst input + attached evidence bodies).
+#[allow(clippy::too_many_arguments)]
 pub async fn followup_turn(
     ticket_dir: &std::path::Path,
     ticket_id: &str,
@@ -959,6 +960,7 @@ pub async fn followup_turn(
     model: &str,
     attachments: &[crate::models::Attachment],
     provider: &dyn crate::providers::LlmProvider,
+    reporter: Option<&dyn crate::chat::ChatPhaseReporter>,
 ) -> Result<crate::providers::FollowupResult, PipelineError> {
     use crate::chat;
     use std::time::Duration;
@@ -1041,7 +1043,17 @@ pub async fn followup_turn(
         )
     };
 
+    if let Some(reporter) = reporter {
+        reporter.phase(crate::chat::ChatStage::ContextAssembled);
+    }
+
     // Call provider
+    if let Some(reporter) = reporter {
+        if last_codex_session.is_some() {
+            reporter.phase(crate::chat::ChatStage::SessionResumeAttempt);
+        }
+        reporter.phase(crate::chat::ChatStage::ProviderAwait);
+    }
     let started = std::time::Instant::now();
     let result = provider
         .followup(
@@ -1054,6 +1066,10 @@ pub async fn followup_turn(
         .await
         .map_err(FollowupError::Provider)?;
     let elapsed_s = started.elapsed().as_secs_f64();
+
+    if let Some(reporter) = reporter {
+        reporter.phase(crate::chat::ChatStage::ResponseParsed);
+    }
 
     // Detect codex session-lost fallback: we attempted a resume (prior session
     // existed) but the provider did NOT resume — it started fresh without the
@@ -1122,6 +1138,10 @@ pub async fn followup_turn(
         ticket_id,
     )
     .map_err(FollowupError::from)?;
+
+    if let Some(reporter) = reporter {
+        reporter.phase(crate::chat::ChatStage::Saved);
+    }
 
     // Update manifest (best-effort — failure here is logged but not fatal)
     if let Ok(Some(mut m)) = chat::read_session_manifest_opt(ticket_dir) {
@@ -1572,6 +1592,7 @@ mod tests {
             "fake-model",
             &[],
             provider.as_ref(),
+            None,
         )
         .await
         .unwrap();
@@ -1721,6 +1742,7 @@ mod tests {
             "gpt-5.5",
             &[],
             provider.as_ref(),
+            None,
         )
         .await
         .unwrap();
@@ -1875,6 +1897,7 @@ mod tests {
             "gpt-5.5",
             &[],
             provider.as_ref(),
+            None,
         )
         .await
         .unwrap();
@@ -2049,6 +2072,7 @@ mod tests {
             "gpt-5.5",
             &[],
             provider.as_ref(),
+            None,
         )
         .await
         .unwrap();
@@ -2173,6 +2197,7 @@ mod tests {
             "fake-model",
             &[],
             &provider,
+            None,
         )
         .await
         .unwrap();
@@ -2297,6 +2322,7 @@ mod tests {
             "fake-model",
             &[],
             &provider,
+            None,
         )
         .await
         .unwrap();
@@ -2418,6 +2444,7 @@ mod tests {
             "fake-model",
             &[],
             &provider,
+            None,
         )
         .await
         .unwrap();
@@ -2599,6 +2626,7 @@ mod tests {
             "fake-model",
             &[],
             &provider,
+            None,
         )
         .await
         .unwrap();
@@ -2624,6 +2652,193 @@ mod tests {
         assert!(
             captured.contains("[system prompt truncated]"),
             "expected '[system prompt truncated]' in capped system prompt; got: {captured:?}"
+        );
+    }
+
+    #[derive(Default)]
+    struct RecordingChatReporter {
+        stages: std::sync::Mutex<Vec<crate::chat::ChatStage>>,
+    }
+
+    impl crate::chat::ChatPhaseReporter for RecordingChatReporter {
+        fn phase(&self, stage: crate::chat::ChatStage) {
+            self.stages.lock().unwrap().push(stage);
+        }
+    }
+
+    #[tokio::test]
+    async fn followup_turn_emits_phases_in_order_with_codex_resume() {
+        use crate::chat;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ticket_dir = dir.path().join("45001");
+        std::fs::create_dir_all(chat::session_dir(&ticket_dir)).unwrap();
+
+        let prior = crate::models::Turn {
+            schema: "triage-cli/conversation".into(),
+            schema_version: 1,
+            ticket_id: "45001".into(),
+            turn: 1,
+            turn_kind: crate::models::TurnKind::Codex,
+            ts: chrono::Utc::now(),
+            author: None,
+            body: "prior".into(),
+            evidence: vec![],
+            provider: Some("codex".into()),
+            model: Some("gpt-5.5".into()),
+            tokens_in: None,
+            tokens_out: None,
+            elapsed_s: None,
+            session_id: Some("01HPRIOR".into()),
+            resumed: Some(false),
+            action: None,
+            outcome: None,
+            drove_revision_from_turns: None,
+            diff: None,
+        };
+        chat::append_turn(&chat::conversation_jsonl_path(&ticket_dir), &prior).unwrap();
+
+        struct ResumeProvider;
+        impl crate::providers::LlmProvider for ResumeProvider {
+            fn name(&self) -> &'static str {
+                "fake-resume"
+            }
+
+            fn complete<'a>(
+                &'a self,
+                _prompt: &'a str,
+                _system_prompt: &'a str,
+                _model: &'a str,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<
+                                crate::providers::CompletionResult,
+                                crate::providers::ProviderError,
+                            >,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async { unreachable!("followup override is used") })
+            }
+
+            fn followup<'a>(
+                &'a self,
+                _session_id: Option<&'a str>,
+                _prompt: &'a str,
+                _system_prompt: &'a str,
+                _model: &'a str,
+                _attachments: &'a [crate::models::Attachment],
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<
+                                crate::providers::FollowupResult,
+                                crate::providers::ProviderError,
+                            >,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async {
+                    Ok(crate::providers::FollowupResult {
+                        text: "ok".into(),
+                        tokens_in: None,
+                        tokens_out: None,
+                        session_id: Some("01HNEW".into()),
+                        resumed: true,
+                    })
+                })
+            }
+        }
+
+        let reporter = RecordingChatReporter::default();
+        followup_turn(
+            &ticket_dir,
+            "45001",
+            "what next?",
+            "",
+            "gpt-5.5",
+            &[],
+            &ResumeProvider,
+            Some(&reporter),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            reporter.stages.lock().unwrap().as_slice(),
+            &[
+                crate::chat::ChatStage::ContextAssembled,
+                crate::chat::ChatStage::SessionResumeAttempt,
+                crate::chat::ChatStage::ProviderAwait,
+                crate::chat::ChatStage::ResponseParsed,
+                crate::chat::ChatStage::Saved,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn followup_turn_skips_resume_phase_when_no_prior_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let ticket_dir = dir.path().join("45002");
+        std::fs::create_dir_all(crate::chat::session_dir(&ticket_dir)).unwrap();
+
+        struct FirstProvider;
+        impl crate::providers::LlmProvider for FirstProvider {
+            fn name(&self) -> &'static str {
+                "fake-first"
+            }
+
+            fn complete<'a>(
+                &'a self,
+                _prompt: &'a str,
+                _system_prompt: &'a str,
+                _model: &'a str,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<
+                                crate::providers::CompletionResult,
+                                crate::providers::ProviderError,
+                            >,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async {
+                    Ok(crate::providers::CompletionResult {
+                        text: "ok".into(),
+                        tokens_in: None,
+                        tokens_out: None,
+                    })
+                })
+            }
+        }
+
+        let reporter = RecordingChatReporter::default();
+        followup_turn(
+            &ticket_dir,
+            "45002",
+            "first question",
+            "",
+            "gpt-5.5",
+            &[],
+            &FirstProvider,
+            Some(&reporter),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            reporter.stages.lock().unwrap().as_slice(),
+            &[
+                crate::chat::ChatStage::ContextAssembled,
+                crate::chat::ChatStage::ProviderAwait,
+                crate::chat::ChatStage::ResponseParsed,
+                crate::chat::ChatStage::Saved,
+            ]
         );
     }
 

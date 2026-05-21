@@ -1730,17 +1730,31 @@ fn _ticket_folder_anchor() -> std::path::PathBuf {
 
 async fn run_chat_session(ticket_id: &str) -> anyhow::Result<()> {
     use crate::providers::get_provider;
-    use crate::tui::chat::{parse_chat_command, ChatCommand};
+    use crate::tui::chat::{parse_chat_command, ChatCommand, ChatInputSurface};
     use crate::{chat, pipeline};
     use crossterm::event::{self, Event, KeyCode, KeyModifiers};
     use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
     use ratatui::backend::CrosstermBackend;
     use ratatui::Terminal;
+    use std::sync::Arc;
     use std::time::Duration;
     use tui_textarea::TextArea;
 
+    enum ChatInputMode {
+        Ask,
+        FilePath(String),
+        PasteLine(String),
+        DirPath(String),
+    }
+
     let ticket_dir = ticket_folder::tickets_root().join(ticket_id);
     std::fs::create_dir_all(&ticket_dir)?;
+    let (chat_tx, mut chat_rx) = tokio::sync::mpsc::unbounded_channel::<chat::ChatEvent>();
+    let mut chat_logger = chat::ChatLogger::open(&ticket_dir).ok();
+    let _ = chat_tx.send(chat::ChatEvent::SessionOpened {
+        ticket_id: ticket_id.to_string(),
+        ts: chrono::Utc::now(),
+    });
 
     // Create a fresh terminal using stderr so we don't conflict with the
     // stdout-based inbox terminal that was suspended by the caller.
@@ -1749,113 +1763,427 @@ async fn run_chat_session(ticket_id: &str) -> anyhow::Result<()> {
     let backend = CrosstermBackend::new(stderr);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut input = TextArea::default();
-    input.set_block(ratatui::widgets::Block::default());
+    let mut ask_input = TextArea::default();
+    ask_input.set_block(ratatui::widgets::Block::default());
+    let mut input_mode = ChatInputMode::Ask;
 
     let mut pending_evidence: Vec<crate::models::EvidenceProvenance> = Vec::new();
-    let mut in_flight: Option<crate::tui::chat::InFlightState> = None;
+    let mut in_flight: Option<chat::ChatProgress> = None;
+    let mut status_hint: Option<String> = None;
+    let mut active_job: Option<tokio::task::JoinHandle<Result<(), String>>> = None;
+    let mut turn_started: Option<std::time::Instant> = None;
+    let transcript_scroll = 0;
+    let mut transcript_follow_bottom = true;
 
-    let provider = get_provider().map_err(|e| anyhow::anyhow!("provider unavailable: {e}"))?;
+    let provider: Arc<dyn crate::providers::LlmProvider> = match get_provider() {
+        Ok(provider) => Arc::from(provider),
+        Err(e) => {
+            let _ = chat_tx.send(chat::ChatEvent::SessionClosed {
+                ts: chrono::Utc::now(),
+                reason: chat::SessionCloseReason::ProviderUnavailable,
+            });
+            while let Ok(evt) = chat_rx.try_recv() {
+                if let Some(logger) = chat_logger.as_mut() {
+                    logger.log(&evt);
+                }
+            }
+            return Err(anyhow::anyhow!("provider unavailable: {e}"));
+        }
+    };
+    let close_reason = loop {
+        while let Ok(evt) = chat_rx.try_recv() {
+            if let Some(logger) = chat_logger.as_mut() {
+                logger.log(&evt);
+            }
+            in_flight = chat::update_progress(in_flight.take(), &evt);
+            if matches!(
+                evt,
+                chat::ChatEvent::TurnPersisted { .. }
+                    | chat::ChatEvent::ProviderError { .. }
+                    | chat::ChatEvent::Cancelled { .. }
+            ) {
+                turn_started = None;
+            }
+        }
 
-    loop {
+        if let Some(handle) = active_job.as_ref() {
+            if handle.is_finished() {
+                let finished = active_job.take().expect("just checked");
+                match finished.await {
+                    Ok(Ok(())) => {
+                        status_hint = None;
+                        clear_textarea(&mut ask_input);
+                        transcript_follow_bottom = true;
+                    }
+                    Ok(Err(msg)) => {
+                        let _ = append_chat_system_turn(
+                            &ticket_dir,
+                            ticket_id,
+                            &format!("follow-up failed: {msg}"),
+                        );
+                        status_hint = Some(msg);
+                    }
+                    Err(e) => {
+                        let msg = format!("chat task panicked: {e}");
+                        let _ = append_chat_system_turn(&ticket_dir, ticket_id, &msg);
+                        status_hint = Some(msg);
+                    }
+                }
+                turn_started = None;
+            } else if let Some(started) = turn_started {
+                let elapsed = started.elapsed().as_secs_f64();
+                in_flight = in_flight.map(|p| chat::advance_progress_tick(p, elapsed));
+            }
+        }
+
         let outcome = chat::parse_conversation_jsonl(&chat::conversation_jsonl_path(&ticket_dir))?;
+        let input_surface = match &input_mode {
+            ChatInputMode::Ask => ChatInputSurface::Ask(&ask_input),
+            ChatInputMode::FilePath(value) => ChatInputSurface::FilePath { value },
+            ChatInputMode::PasteLine(value) => ChatInputSurface::PasteLine { value },
+            ChatInputMode::DirPath(value) => ChatInputSurface::DirPath { value },
+        };
         let pane = crate::tui::chat::ChatPane {
             turns: &outcome.turns,
-            input: &input,
+            input: input_surface,
             ticket_id,
-            in_flight: in_flight.clone(),
+            progress: in_flight.as_ref(),
+            status_hint: status_hint.as_deref(),
+            transcript_scroll,
+            transcript_follow_bottom,
         };
         terminal.draw(|f| {
             let area = f.area();
             f.render_widget(&pane, area);
         })?;
 
-        // Tick the throbber if in-flight.
-        if let Some(ref mut s) = in_flight {
-            s.frame_idx = s.frame_idx.wrapping_add(1);
-        }
-
         if event::poll(Duration::from_millis(80))? {
             if let Event::Key(key) = event::read()? {
-                match (key.code, key.modifiers) {
-                    (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => break,
-                    (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
-                        let body: String = input.lines().join("\n");
-                        if body.trim().is_empty() {
-                            continue;
+                if active_job.is_some() {
+                    match (key.code, key.modifiers) {
+                        (KeyCode::Esc, _) => {
+                            if let Some(handle) = active_job.take() {
+                                handle.abort();
+                            }
+                            let _ = chat_tx.send(chat::ChatEvent::Cancelled {
+                                ts: chrono::Utc::now(),
+                                by: chat::CancelSource::EscKey,
+                            });
+                            in_flight = None;
+                            turn_started = None;
+                            status_hint = Some("turn cancelled".into());
                         }
-                        let cmd = parse_chat_command(&body);
-                        match cmd {
-                            ChatCommand::Body(b) => {
-                                send_analyst_turn(
-                                    &ticket_dir,
-                                    ticket_id,
-                                    &b,
-                                    std::mem::take(&mut pending_evidence),
-                                    provider.as_ref(),
-                                    &mut input,
-                                )
-                                .await?;
+                        (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                            if let Some(handle) = active_job.take() {
+                                handle.abort();
                             }
-                            ChatCommand::File(path) => {
-                                let turn_no = next_turn_number(&ticket_dir)?;
-                                let prov = chat::attach_file(&ticket_dir, turn_no, &path)
-                                    .map_err(|e| anyhow::anyhow!("attach_file: {e}"))?;
-                                pending_evidence.push(prov);
-                                clear_textarea(&mut input);
-                            }
-                            ChatCommand::Paste { label, body } => {
-                                pending_evidence.push(chat::attach_paste(&label, &body));
-                                clear_textarea(&mut input);
-                            }
-                            ChatCommand::Revise => {
-                                // Construct a Datadog client per-revise so the
-                                // structured pipeline can re-fetch logs around
-                                // the original anchor. `None` is fine when the
-                                // env isn't configured — the pipeline degrades
-                                // gracefully and leans on the base-evidence
-                                // catalog plus any newly attached evidence.
-                                let dd = DatadogClient::from_env().ok();
-                                let dd_source: Option<&dyn DatadogSource> =
-                                    dd.as_ref().map(|d| d as &dyn DatadogSource);
-                                pipeline::revise(
-                                    &ticket_dir,
-                                    ticket_id,
-                                    dd_source,
-                                    &pipeline::InvestigateOptions::defaults(),
-                                )
-                                .await?;
-                                clear_textarea(&mut input);
-                            }
-                            ChatCommand::Retry => {
-                                let retry_outcome = chat::parse_conversation_jsonl(
-                                    &chat::conversation_jsonl_path(&ticket_dir),
-                                )?;
-                                if let Some(last_analyst) =
-                                    retry_outcome.turns.iter().rev().find(|t| {
-                                        matches!(t.turn_kind, crate::models::TurnKind::Analyst)
-                                    })
-                                {
-                                    let body_clone = last_analyst.body.clone();
-                                    send_analyst_turn(
-                                        &ticket_dir,
-                                        ticket_id,
-                                        &body_clone,
+                            let _ = chat_tx.send(chat::ChatEvent::Cancelled {
+                                ts: chrono::Utc::now(),
+                                by: chat::CancelSource::CtrlC,
+                            });
+                            break chat::SessionCloseReason::CtrlC;
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+
+                match &mut input_mode {
+                    ChatInputMode::Ask => match (key.code, key.modifiers) {
+                        (KeyCode::Esc, _) => {
+                            break chat::SessionCloseReason::EscFromAsk;
+                        }
+                        (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                            break chat::SessionCloseReason::CtrlC;
+                        }
+                        (KeyCode::Char('f'), KeyModifiers::CONTROL) => {
+                            let _ = chat_tx.send(chat::ChatEvent::KeyCommand {
+                                ts: chrono::Utc::now(),
+                                command: "/file".into(),
+                            });
+                            input_mode = ChatInputMode::FilePath(String::new());
+                        }
+                        (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
+                            let _ = chat_tx.send(chat::ChatEvent::KeyCommand {
+                                ts: chrono::Utc::now(),
+                                command: "/dir".into(),
+                            });
+                            input_mode = ChatInputMode::DirPath(String::new());
+                        }
+                        (KeyCode::Char('v'), KeyModifiers::CONTROL) => {
+                            let _ = chat_tx.send(chat::ChatEvent::KeyCommand {
+                                ts: chrono::Utc::now(),
+                                command: "/paste".into(),
+                            });
+                            input_mode = ChatInputMode::PasteLine(String::new());
+                        }
+                        (KeyCode::Char('t'), KeyModifiers::CONTROL) => {
+                            let retry_outcome = chat::parse_conversation_jsonl(
+                                &chat::conversation_jsonl_path(&ticket_dir),
+                            )?;
+                            if let Some(last_analyst) =
+                                retry_outcome.turns.iter().rev().find(|t| {
+                                    matches!(t.turn_kind, crate::models::TurnKind::Analyst)
+                                })
+                            {
+                                let _ = chat_tx.send(chat::ChatEvent::KeyCommand {
+                                    ts: chrono::Utc::now(),
+                                    command: "/retry".into(),
+                                });
+                                let td = ticket_dir.clone();
+                                let tid = ticket_id.to_string();
+                                let body = last_analyst.body.clone();
+                                let provider = provider.clone();
+                                let tx = chat_tx.clone();
+                                turn_started = Some(std::time::Instant::now());
+                                active_job = Some(tokio::spawn(async move {
+                                    send_analyst_turn_with_progress(
+                                        &td,
+                                        &tid,
+                                        &body,
                                         Vec::new(),
                                         provider.as_ref(),
-                                        &mut input,
+                                        tx,
+                                    )
+                                    .await
+                                    .map_err(|e| e.to_string())
+                                }));
+                            }
+                        }
+                        (KeyCode::Char('r'), KeyModifiers::CONTROL) => {
+                            let _ = chat_tx.send(chat::ChatEvent::KeyCommand {
+                                ts: chrono::Utc::now(),
+                                command: "/revise".into(),
+                            });
+                            let dd = DatadogClient::from_env().ok();
+                            let dd_source: Option<&dyn DatadogSource> =
+                                dd.as_ref().map(|d| d as &dyn DatadogSource);
+                            pipeline::revise(
+                                &ticket_dir,
+                                ticket_id,
+                                dd_source,
+                                &pipeline::InvestigateOptions::defaults(),
+                            )
+                            .await?;
+                            clear_textarea(&mut ask_input);
+                        }
+                        (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
+                            let body: String = ask_input.lines().join("\n");
+                            if body.trim().is_empty() {
+                                continue;
+                            }
+                            let cmd = parse_chat_command(&body);
+                            let _ = chat_tx.send(chat::ChatEvent::KeyCommand {
+                                ts: chrono::Utc::now(),
+                                command: command_label(&cmd).to_string(),
+                            });
+                            match cmd {
+                                ChatCommand::Body(b) => {
+                                    let td = ticket_dir.clone();
+                                    let tid = ticket_id.to_string();
+                                    let evidence = std::mem::take(&mut pending_evidence);
+                                    let provider = provider.clone();
+                                    let tx = chat_tx.clone();
+                                    turn_started = Some(std::time::Instant::now());
+                                    active_job = Some(tokio::spawn(async move {
+                                        send_analyst_turn_with_progress(
+                                            &td,
+                                            &tid,
+                                            &b,
+                                            evidence,
+                                            provider.as_ref(),
+                                            tx,
+                                        )
+                                        .await
+                                        .map_err(|e| e.to_string())
+                                    }));
+                                }
+                                ChatCommand::File(path) => {
+                                    let turn_no = next_turn_number(&ticket_dir)?;
+                                    let prov = chat::attach_file(&ticket_dir, turn_no, &path)
+                                        .map_err(|e| anyhow::anyhow!("attach_file: {e}"))?;
+                                    let _ = chat_tx.send(chat::ChatEvent::EvidenceAttached {
+                                        ts: chrono::Utc::now(),
+                                        provenance: prov.clone(),
+                                    });
+                                    pending_evidence.push(prov);
+                                    clear_textarea(&mut ask_input);
+                                }
+                                ChatCommand::Dir {
+                                    path,
+                                    recursive,
+                                    glob,
+                                } => {
+                                    attach_dir_to_pending(
+                                        &ticket_dir,
+                                        ticket_id,
+                                        &mut pending_evidence,
+                                        &chat_tx,
+                                        &path,
+                                        recursive,
+                                        glob.as_deref(),
+                                    )?;
+                                    clear_textarea(&mut ask_input);
+                                }
+                                ChatCommand::Paste { label, body } => {
+                                    let prov = chat::attach_paste(&label, &body);
+                                    let _ = chat_tx.send(chat::ChatEvent::EvidenceAttached {
+                                        ts: chrono::Utc::now(),
+                                        provenance: prov.clone(),
+                                    });
+                                    pending_evidence.push(prov);
+                                    clear_textarea(&mut ask_input);
+                                }
+                                ChatCommand::Revise => {
+                                    // Construct a Datadog client per-revise so the
+                                    // structured pipeline can re-fetch logs around
+                                    // the original anchor. `None` is fine when the
+                                    // env isn't configured — the pipeline degrades
+                                    // gracefully and leans on the base-evidence
+                                    // catalog plus any newly attached evidence.
+                                    let dd = DatadogClient::from_env().ok();
+                                    let dd_source: Option<&dyn DatadogSource> =
+                                        dd.as_ref().map(|d| d as &dyn DatadogSource);
+                                    pipeline::revise(
+                                        &ticket_dir,
+                                        ticket_id,
+                                        dd_source,
+                                        &pipeline::InvestigateOptions::defaults(),
                                     )
                                     .await?;
+                                    clear_textarea(&mut ask_input);
+                                }
+                                ChatCommand::Retry => {
+                                    let retry_outcome = chat::parse_conversation_jsonl(
+                                        &chat::conversation_jsonl_path(&ticket_dir),
+                                    )?;
+                                    if let Some(last_analyst) =
+                                        retry_outcome.turns.iter().rev().find(|t| {
+                                            matches!(t.turn_kind, crate::models::TurnKind::Analyst)
+                                        })
+                                    {
+                                        let td = ticket_dir.clone();
+                                        let tid = ticket_id.to_string();
+                                        let body = last_analyst.body.clone();
+                                        let provider = provider.clone();
+                                        let tx = chat_tx.clone();
+                                        turn_started = Some(std::time::Instant::now());
+                                        active_job = Some(tokio::spawn(async move {
+                                            send_analyst_turn_with_progress(
+                                                &td,
+                                                &tid,
+                                                &body,
+                                                Vec::new(),
+                                                provider.as_ref(),
+                                                tx,
+                                            )
+                                            .await
+                                            .map_err(|e| e.to_string())
+                                        }));
+                                    }
+                                }
+                                ChatCommand::Quit => {
+                                    break chat::SessionCloseReason::UserQuit;
                                 }
                             }
-                            ChatCommand::Quit => break,
                         }
-                    }
-                    _ => {
-                        input.input(key);
-                    }
+                        _ => {
+                            ask_input.input(key);
+                        }
+                    },
+                    ChatInputMode::FilePath(buf) => match key.code {
+                        KeyCode::Esc => input_mode = ChatInputMode::Ask,
+                        KeyCode::Enter => {
+                            let path = std::path::PathBuf::from(buf.trim());
+                            let turn_no = next_turn_number(&ticket_dir)?;
+                            match chat::attach_file(&ticket_dir, turn_no, &path) {
+                                Ok(prov) => {
+                                    let _ = chat_tx.send(chat::ChatEvent::EvidenceAttached {
+                                        ts: chrono::Utc::now(),
+                                        provenance: prov.clone(),
+                                    });
+                                    pending_evidence.push(prov);
+                                }
+                                Err(e) => {
+                                    let _ = chat_tx.send(chat::ChatEvent::EvidenceRejected {
+                                        ts: chrono::Utc::now(),
+                                        reason: format!("attach_file: {e}"),
+                                    });
+                                    let _ = append_chat_system_turn(
+                                        &ticket_dir,
+                                        ticket_id,
+                                        &format!("attach file failed: {e}"),
+                                    );
+                                }
+                            }
+                            input_mode = ChatInputMode::Ask;
+                        }
+                        KeyCode::Backspace => {
+                            buf.pop();
+                        }
+                        KeyCode::Char(c) => buf.push(c),
+                        _ => {}
+                    },
+                    ChatInputMode::PasteLine(buf) => match key.code {
+                        KeyCode::Esc => input_mode = ChatInputMode::Ask,
+                        KeyCode::Enter => {
+                            if let Some((label, body)) = buf.split_once('=') {
+                                let prov = chat::attach_paste(label.trim(), body);
+                                let _ = chat_tx.send(chat::ChatEvent::EvidenceAttached {
+                                    ts: chrono::Utc::now(),
+                                    provenance: prov.clone(),
+                                });
+                                pending_evidence.push(prov);
+                            }
+                            input_mode = ChatInputMode::Ask;
+                        }
+                        KeyCode::Backspace => {
+                            buf.pop();
+                        }
+                        KeyCode::Char(c) => buf.push(c),
+                        _ => {}
+                    },
+                    ChatInputMode::DirPath(buf) => match key.code {
+                        KeyCode::Esc => input_mode = ChatInputMode::Ask,
+                        KeyCode::Enter => {
+                            let raw = buf.trim().to_string();
+                            let cmd = parse_chat_command(&format!("/dir {raw}"));
+                            if let ChatCommand::Dir {
+                                path,
+                                recursive,
+                                glob,
+                            } = cmd
+                            {
+                                attach_dir_to_pending(
+                                    &ticket_dir,
+                                    ticket_id,
+                                    &mut pending_evidence,
+                                    &chat_tx,
+                                    &path,
+                                    recursive,
+                                    glob.as_deref(),
+                                )?;
+                            }
+                            input_mode = ChatInputMode::Ask;
+                        }
+                        KeyCode::Backspace => {
+                            buf.pop();
+                        }
+                        KeyCode::Char(c) => buf.push(c),
+                        _ => {}
+                    },
                 }
             }
+        }
+    };
+
+    let _ = chat_tx.send(chat::ChatEvent::SessionClosed {
+        ts: chrono::Utc::now(),
+        reason: close_reason,
+    });
+    while let Ok(evt) = chat_rx.try_recv() {
+        if let Some(logger) = chat_logger.as_mut() {
+            logger.log(&evt);
         }
     }
 
@@ -1875,6 +2203,102 @@ fn next_turn_number(ticket_dir: &Path) -> anyhow::Result<u32> {
         crate::chat::parse_conversation_jsonl(&crate::chat::conversation_jsonl_path(ticket_dir))
             .map_err(|e| anyhow::anyhow!("parse_conversation_jsonl: {e}"))?;
     Ok(outcome.turns.iter().map(|t| t.turn).max().unwrap_or(0) + 1)
+}
+
+fn command_label(cmd: &crate::tui::chat::ChatCommand) -> &'static str {
+    match cmd {
+        crate::tui::chat::ChatCommand::Body(_) => "send",
+        crate::tui::chat::ChatCommand::File(_) => "/file",
+        crate::tui::chat::ChatCommand::Dir { .. } => "/dir",
+        crate::tui::chat::ChatCommand::Paste { .. } => "/paste",
+        crate::tui::chat::ChatCommand::Revise => "/revise",
+        crate::tui::chat::ChatCommand::Retry => "/retry",
+        crate::tui::chat::ChatCommand::Quit => "/quit",
+    }
+}
+
+fn append_chat_system_turn(ticket_dir: &Path, ticket_id: &str, body: &str) -> anyhow::Result<()> {
+    let next = next_turn_number(ticket_dir)?;
+    let turn = crate::models::Turn {
+        schema: "triage-cli/conversation".into(),
+        schema_version: 1,
+        ticket_id: ticket_id.to_string(),
+        turn: next,
+        turn_kind: crate::models::TurnKind::System,
+        ts: chrono::Utc::now(),
+        author: None,
+        body: body.to_string(),
+        evidence: vec![],
+        provider: None,
+        model: None,
+        tokens_in: None,
+        tokens_out: None,
+        elapsed_s: None,
+        session_id: None,
+        resumed: None,
+        action: None,
+        outcome: None,
+        drove_revision_from_turns: None,
+        diff: None,
+    };
+    crate::chat::append_turn(&crate::chat::conversation_jsonl_path(ticket_dir), &turn)
+        .map_err(|e| anyhow::anyhow!("append system turn: {e}"))?;
+    let parsed =
+        crate::chat::parse_conversation_jsonl(&crate::chat::conversation_jsonl_path(ticket_dir))?;
+    crate::chat::write_conversation_md(
+        &crate::chat::conversation_md_path(ticket_dir),
+        &parsed.turns,
+        ticket_id,
+    )?;
+    Ok(())
+}
+
+fn attach_dir_to_pending(
+    ticket_dir: &Path,
+    ticket_id: &str,
+    pending_evidence: &mut Vec<crate::models::EvidenceProvenance>,
+    chat_tx: &tokio::sync::mpsc::UnboundedSender<crate::chat::ChatEvent>,
+    path: &Path,
+    recursive: bool,
+    glob: Option<&str>,
+) -> anyhow::Result<()> {
+    let turn_no = next_turn_number(ticket_dir)?;
+    let result = crate::chat::collect_dir_attachments(
+        ticket_dir,
+        turn_no,
+        path,
+        recursive,
+        glob,
+        25,
+        4 * 1024 * 1024,
+    )?;
+    let n_attached = result.attached.len();
+    let n_skipped = result.skipped.len();
+    for provenance in &result.attached {
+        let _ = chat_tx.send(crate::chat::ChatEvent::EvidenceAttached {
+            ts: chrono::Utc::now(),
+            provenance: provenance.clone(),
+        });
+        pending_evidence.push(provenance.clone());
+    }
+    for skipped in &result.skipped {
+        let _ = chat_tx.send(crate::chat::ChatEvent::EvidenceRejected {
+            ts: chrono::Utc::now(),
+            reason: format!("{skipped:?}"),
+        });
+    }
+    let mut body = format!(
+        "attached {n_attached} file(s) from {}; skipped {n_skipped}.",
+        path.display()
+    );
+    if !result.skipped.is_empty() {
+        body.push_str("\nskipped files:");
+        for skipped in &result.skipped {
+            body.push_str(&format!("\n- {skipped:?}"));
+        }
+    }
+    let _ = append_chat_system_turn(ticket_dir, ticket_id, &body);
+    Ok(())
 }
 
 /// Convert pending evidence into a (augmented_prompt, attachments) pair.
@@ -1899,7 +2323,8 @@ fn build_followup_message(
                 ..
             } => {
                 let extracted_text =
-                    investigation::read_text_if_supported(copied_path, *detected_type);
+                    investigation::read_text_if_supported(copied_path, *detected_type)
+                        .map(|text| crate::redact::redact(&text).0);
                 attachments.push(crate::models::Attachment {
                     copied_path: copied_path.clone(),
                     basename: basename.clone(),
@@ -1912,15 +2337,23 @@ fn build_followup_message(
     (prompt, attachments)
 }
 
-async fn send_analyst_turn(
+async fn send_analyst_turn_with_progress(
     ticket_dir: &Path,
     ticket_id: &str,
     body: &str,
     evidence: Vec<crate::models::EvidenceProvenance>,
     provider: &dyn crate::providers::LlmProvider,
-    input: &mut tui_textarea::TextArea<'_>,
+    tx: tokio::sync::mpsc::UnboundedSender<crate::chat::ChatEvent>,
 ) -> anyhow::Result<()> {
     use crate::chat;
+    let model = std::env::var("CODEX_MODEL")
+        .unwrap_or_else(|_| crate::providers::codex::DEFAULT_CODEX_MODEL.to_string());
+    let _ = tx.send(chat::ChatEvent::Phase {
+        ts: chrono::Utc::now(),
+        stage: chat::ChatStage::Ingesting,
+        elapsed_s: 0.0,
+    });
+
     // Build the augmented prompt and attachments BEFORE moving `evidence`
     // into the turn record below. Pastes are inlined; files become
     // Attachment entries that flow through the provider's native channel.
@@ -1970,6 +2403,10 @@ async fn send_analyst_turn(
             ticket_id,
         )
         .map_err(|e| anyhow::anyhow!("write_md: {e}"))?;
+        let _ = tx.send(chat::ChatEvent::AnalystAppended {
+            ts: chrono::Utc::now(),
+            turn: next,
+        });
     }
     // The caller-supplied `system_prompt` is intentionally empty here:
     // `pipeline::followup_turn` now owns ticket-context assembly (#22). It
@@ -1978,19 +2415,64 @@ async fn send_analyst_turn(
     // session-loss, a bounded replay of prior turns — #23) and prepends it
     // to whatever we pass here. Building it once inside `followup_turn`
     // keeps a single assembly point and avoids a double preamble.
-    let _result = pipeline::followup_turn(
+    let reporter = chat::MpscPhaseReporter::new(tx.clone());
+    let _ = tx.send(chat::ChatEvent::ProviderRequest {
+        ts: chrono::Utc::now(),
+        provider: provider.name().to_string(),
+        model: model.clone(),
+        prompt_bytes: augmented_prompt.len(),
+        attachments: attachments.len(),
+        session_id: None,
+    });
+    let started = std::time::Instant::now();
+    let result = pipeline::followup_turn(
         ticket_dir,
         ticket_id,
         &augmented_prompt,
         "",
-        &std::env::var("CODEX_MODEL")
-            .unwrap_or_else(|_| crate::providers::codex::DEFAULT_CODEX_MODEL.to_string()),
+        &model,
         &attachments,
         provider,
+        Some(&reporter),
     )
-    .await?;
-    clear_textarea(input);
-    Ok(())
+    .await;
+
+    match result {
+        Ok(result) => {
+            let _ = tx.send(chat::ChatEvent::ProviderResponse {
+                ts: chrono::Utc::now(),
+                elapsed_s: started.elapsed().as_secs_f64(),
+                tokens_in: result.tokens_in,
+                tokens_out: result.tokens_out,
+                resumed: result.resumed,
+                session_id: result.session_id,
+            });
+            let outcome =
+                chat::parse_conversation_jsonl(&chat::conversation_jsonl_path(ticket_dir))?;
+            let codex_turn = outcome
+                .turns
+                .iter()
+                .rev()
+                .find(|turn| matches!(turn.turn_kind, crate::models::TurnKind::Codex))
+                .map(|turn| turn.turn)
+                .unwrap_or(0);
+            let _ = tx.send(chat::ChatEvent::TurnPersisted {
+                ts: chrono::Utc::now(),
+                codex_turn,
+            });
+            Ok(())
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            let (redacted_msg, _) = crate::redact::redact(&msg);
+            let _ = tx.send(chat::ChatEvent::ProviderError {
+                ts: chrono::Utc::now(),
+                kind: "followup_turn".into(),
+                message: redacted_msg.clone(),
+            });
+            Err(anyhow::anyhow!("{redacted_msg}"))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2258,6 +2740,190 @@ status: open
         assert_eq!(
             atts[0].extracted_text.as_deref().unwrap_or(""),
             "FILE_CONTENT_SENTINEL\n"
+        );
+    }
+
+    #[test]
+    fn build_followup_message_redacts_attachment_text() {
+        use crate::models::{EvidenceProvenance, ExtractionStatus, FileType};
+        use std::io::Write as _;
+
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(b"call (555) 123-4567\n").unwrap();
+        let file_path = tmp.path().to_path_buf();
+        let evidence = vec![EvidenceProvenance::File {
+            source_path: file_path.clone(),
+            copied_path: file_path,
+            basename: "diag.log".into(),
+            sha256: "0".repeat(64),
+            bytes: 20,
+            detected_type: FileType::Log,
+            extraction: ExtractionStatus::Full,
+            truncated: false,
+            truncation_note: None,
+            sent_to_provider: true,
+        }];
+
+        let (_prompt, atts) = build_followup_message("question", &evidence);
+        let text = atts[0].extracted_text.as_deref().unwrap_or("");
+        assert!(!text.contains("123-4567"), "PII leaked: {text}");
+        assert!(text.contains("<PHONE>"), "redaction marker missing: {text}");
+    }
+
+    #[tokio::test]
+    async fn event_loop_logs_full_turn_sequence_via_mpsc() {
+        use crate::chat::{chat_events_log_path, ChatEvent, ChatLogger, ChatStage};
+
+        let dir = tempfile::tempdir().unwrap();
+        let ticket_dir = dir.path().join("44776");
+        std::fs::create_dir_all(crate::chat::session_dir(&ticket_dir)).unwrap();
+
+        struct StubProvider;
+        impl crate::providers::LlmProvider for StubProvider {
+            fn name(&self) -> &'static str {
+                "stub"
+            }
+
+            fn complete<'a>(
+                &'a self,
+                _prompt: &'a str,
+                _system_prompt: &'a str,
+                _model: &'a str,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<
+                                crate::providers::CompletionResult,
+                                crate::providers::ProviderError,
+                            >,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async {
+                    Ok(crate::providers::CompletionResult {
+                        text: "stub answer".into(),
+                        tokens_in: Some(10),
+                        tokens_out: Some(20),
+                    })
+                })
+            }
+        }
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ChatEvent>();
+        let mut logger = ChatLogger::open(&ticket_dir).unwrap();
+        send_analyst_turn_with_progress(
+            &ticket_dir,
+            "44776",
+            "what changed?",
+            Vec::new(),
+            &StubProvider,
+            tx,
+        )
+        .await
+        .unwrap();
+
+        let mut kinds = Vec::new();
+        while let Ok(evt) = rx.try_recv() {
+            kinds.push(match &evt {
+                ChatEvent::Phase {
+                    stage: ChatStage::Ingesting,
+                    ..
+                } => "phase:ingesting",
+                ChatEvent::Phase {
+                    stage: ChatStage::ContextAssembled,
+                    ..
+                } => "phase:context",
+                ChatEvent::Phase {
+                    stage: ChatStage::ProviderAwait,
+                    ..
+                } => "phase:await",
+                ChatEvent::Phase {
+                    stage: ChatStage::ResponseParsed,
+                    ..
+                } => "phase:parsed",
+                ChatEvent::Phase {
+                    stage: ChatStage::Saved,
+                    ..
+                } => "phase:saved",
+                ChatEvent::AnalystAppended { .. } => "analyst",
+                ChatEvent::ProviderRequest { .. } => "req",
+                ChatEvent::ProviderResponse { .. } => "resp",
+                ChatEvent::TurnPersisted { .. } => "persisted",
+                other => panic!("unexpected event: {other:?}"),
+            });
+            logger.log(&evt);
+        }
+        drop(logger);
+
+        assert_eq!(
+            kinds,
+            vec![
+                "phase:ingesting",
+                "analyst",
+                "req",
+                "phase:context",
+                "phase:await",
+                "phase:parsed",
+                "phase:saved",
+                "resp",
+                "persisted",
+            ]
+        );
+        let log_body = std::fs::read_to_string(chat_events_log_path(&ticket_dir)).unwrap();
+        assert_eq!(log_body.lines().count(), 9);
+    }
+
+    #[tokio::test]
+    async fn collect_dir_then_log_attached_and_rejected() {
+        use crate::chat::{chat_events_log_path, ChatEvent, ChatLogger, DirSkipped};
+
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("logs");
+        std::fs::create_dir_all(&src).unwrap();
+        for i in 0..30u32 {
+            std::fs::write(src.join(format!("a{i:03}.log")), "x").unwrap();
+        }
+        let ticket_dir = dir.path().join("44776");
+        std::fs::create_dir_all(crate::chat::session_dir(&ticket_dir)).unwrap();
+
+        let result =
+            crate::chat::collect_dir_attachments(&ticket_dir, 1, &src, false, None, 25, 4 << 20)
+                .unwrap();
+        assert_eq!(result.attached.len(), 25);
+        assert_eq!(result.skipped.len(), 5);
+
+        let mut logger = ChatLogger::open(&ticket_dir).unwrap();
+        for provenance in &result.attached {
+            logger.log(&ChatEvent::EvidenceAttached {
+                ts: chrono::Utc::now(),
+                provenance: provenance.clone(),
+            });
+        }
+        for skipped in &result.skipped {
+            let reason = match skipped {
+                DirSkipped::FileCapExceeded { path } => format!("file_cap: {}", path.display()),
+                other => format!("{other:?}"),
+            };
+            logger.log(&ChatEvent::EvidenceRejected {
+                ts: chrono::Utc::now(),
+                reason,
+            });
+        }
+        drop(logger);
+
+        let body = std::fs::read_to_string(chat_events_log_path(&ticket_dir)).unwrap();
+        assert_eq!(
+            body.lines()
+                .filter(|line| line.contains("evidence_attached"))
+                .count(),
+            25
+        );
+        assert_eq!(
+            body.lines()
+                .filter(|line| line.contains("evidence_rejected"))
+                .count(),
+            5
         );
     }
 }
