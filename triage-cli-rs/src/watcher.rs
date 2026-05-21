@@ -16,7 +16,7 @@ use crate::investigation;
 use crate::models::{SiteEntry, Ticket};
 use crate::pipeline::{self, InvestigateOptions, Reporter, SilentReporter};
 use crate::playbook::Rubric;
-use crate::zendesk::{ZendeskClient, ZendeskError};
+use crate::zendesk::{ZendeskClient, ZendeskError, ZendeskSource};
 
 const STATE_VERSION: u32 = 1;
 pub const DEFAULT_PRUNE_CAP: usize = 1000;
@@ -214,7 +214,7 @@ fn emit(msg: &str) {
 }
 
 pub async fn run_iteration(
-    zd: &ZendeskClient,
+    zd: &dyn ZendeskSource,
     _sites: &[SiteEntry],
     mut state: State,
     opts: &WatcherOptions,
@@ -294,6 +294,7 @@ pub async fn run_iteration(
         match pipeline::investigate_one_structured(
             ticket.clone(),
             &mut session,
+            Some(zd),
             dd_client,
             rubric,
             reporter.as_ref(),

@@ -11,6 +11,7 @@
 //! removed" signal.
 
 pub mod chat;
+pub mod effects;
 pub mod inbox;
 
 use std::io::{self, Stdout};

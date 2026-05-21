@@ -24,7 +24,7 @@ use crate::setup;
 use crate::ticket_folder;
 use crate::tui;
 use crate::watcher::{self, WatcherOptions};
-use crate::zendesk::ZendeskClient;
+use crate::zendesk::{ZendeskClient, ZendeskSource};
 
 const VALID_LEVELS: &[&str] = &["error", "warn", "info", "debug"];
 
@@ -405,6 +405,7 @@ async fn cmd_triage(c: TriageCmd) -> ExitCode {
         let outcome = match pipeline::investigate_one_structured(
             ticket.clone(),
             &mut session,
+            None,
             Some(&fixture_dd as &dyn DatadogSource),
             &rubric,
             &reporter,
@@ -495,6 +496,7 @@ async fn cmd_triage(c: TriageCmd) -> ExitCode {
     let outcome = match pipeline::investigate_one_structured(
         ticket.clone(),
         &mut session,
+        Some(&zd as &dyn ZendeskSource),
         dd.as_ref().map(|d| d as &dyn DatadogSource),
         &rubric,
         &reporter,
@@ -699,6 +701,7 @@ async fn cmd_investigate(c: InvestigateCmd) -> ExitCode {
     let outcome = match pipeline::investigate_one_structured(
         ticket.clone(),
         &mut session,
+        Some(&zd as &dyn ZendeskSource),
         effective_dd,
         &rubric,
         &reporter,
@@ -787,6 +790,7 @@ async fn cmd_demo(c: DemoCmd) -> ExitCode {
     let outcome = match pipeline::investigate_one_structured(
         ticket,
         &mut session,
+        None,
         Some(&fixture_dd as &dyn DatadogSource),
         &rubric,
         &reporter,
@@ -925,8 +929,7 @@ fn handle_pipeline_error(e: pipeline::PipelineError, open_full_diff: bool) -> Ex
     {
         print_soft_lock_summary(existing_owner, current_owner, summary);
         if open_full_diff {
-            if let Err(diff_err) = show_full_state_diff(state_path, new_state_content)
-            {
+            if let Err(diff_err) = show_full_state_diff(state_path, new_state_content) {
                 eprintln!(
                     "{}: could not produce full diff: {}",
                     "warning".yellow().bold(),
