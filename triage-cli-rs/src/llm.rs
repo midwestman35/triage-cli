@@ -8,6 +8,8 @@ use regex::Regex;
 use serde_json::Value;
 use thiserror::Error;
 
+mod bundle_prompt;
+
 use crate::models::{
     fmt_ts, indent_continuations, SiteEntry, StructuredTriageReport, Ticket, TriageBundle,
     ValidationOutcome,
@@ -297,7 +299,7 @@ fn validate_evidence_citations(
 /// Run the v1 reframe structured triage call.
 ///
 /// Pipeline:
-///   1. Build user message from the bundle (existing `as_user_message`).
+///   1. Build user message from the bundle.
 ///   2. Redact PII at the LLM boundary (if `redact_enabled`).
 ///   3. Send with the structured system prompt (rubric included).
 ///   4. Parse `StructuredTriageReport`; validate against rubric.
@@ -321,7 +323,7 @@ pub async fn triage_structured(
         .unwrap_or_else(|| model_for_provider(provider.name()));
     let system_prompt = build_structured_system_prompt(rubric);
 
-    let raw_user = bundle.as_user_message();
+    let raw_user = bundle_prompt::render_user_message(bundle);
     let (user_prompt, redaction_counts, residual_warning) = if redact_enabled {
         let (r, c) = redact(&raw_user);
         let w = crate::redact::residual_pii_warning(&r, &c);
