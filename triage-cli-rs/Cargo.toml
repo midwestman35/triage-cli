@@ -10,6 +10,14 @@ license = "Apache-2.0"
 name = "triage-cli"
 path = "src/main.rs"
 
+[[test]]
+name = "integration"
+path = "tests/integration/mod.rs"
+
+[[test]]
+name = "sandbox"
+path = "tests/sandbox/mod.rs"
+
 [dependencies]
 # CLI + config
 clap = { version = "4.5", features = ["derive", "env"] }

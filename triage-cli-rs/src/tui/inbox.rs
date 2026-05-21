@@ -33,7 +33,7 @@ use ratatui::{
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-use super::{enter_terminal, leave_terminal};
+use super::{effects::InboxEffects, enter_terminal, leave_terminal};
 use crate::datadog::{DatadogClient, DatadogSource};
 use crate::extract;
 use crate::investigation;
@@ -42,7 +42,7 @@ use crate::pipeline::{self, InvestigateOptions, Reporter, StructuredInvestigatio
 use crate::playbook::Rubric;
 use crate::ticket_folder::{self, tickets_root};
 use crate::watcher::{self, State, WatcherOptions};
-use crate::zendesk::ZendeskClient;
+use crate::zendesk::{ZendeskClient, ZendeskSource};
 
 const SELECTED_ICON: &str = "◉";
 const NOTIFY_TTL: Duration = Duration::from_secs(4);
@@ -217,6 +217,8 @@ struct InboxApp {
     polling: bool,
     last_poll: Option<DateTime<Utc>>,
     notification: Option<Notification>,
+    effects: InboxEffects,
+    last_frame: Instant,
     report_scroll: u16,
     modal: Option<SiteInputModal>,
     pending_triages: Vec<JoinHandle<()>>,
@@ -255,6 +257,8 @@ pub async fn run_inbox(opts: WatcherOptions) -> io::Result<()> {
         polling: false,
         last_poll: None,
         notification: None,
+        effects: InboxEffects::disabled(),
+        last_frame: Instant::now(),
         report_scroll: 0,
         modal: None,
         pending_triages: Vec::new(),
@@ -280,10 +284,20 @@ pub async fn run_inbox(opts: WatcherOptions) -> io::Result<()> {
             app.handle_event(ev);
         }
 
+        let now = Instant::now();
+        let elapsed = now.duration_since(app.last_frame);
+        app.last_frame = now;
+        app.effects.tick(elapsed);
+
         terminal.draw(|f| app.draw(f))?;
 
         // Wait for: keypress, ticker, or pipeline event — whichever fires first.
-        let key_event = poll_key_event(Duration::from_millis(120));
+        let key_timeout = if app.effects.wants_animation_frame() {
+            Duration::from_millis(16)
+        } else {
+            Duration::from_millis(120)
+        };
+        let key_event = poll_key_event(key_timeout);
         tokio::select! {
             biased;
             ev = event_rx.recv() => {
@@ -764,6 +778,7 @@ impl InboxApp {
         if self.modal.is_some() {
             self.draw_modal(frame, area);
         }
+        self.effects.render(frame);
     }
 
     fn draw_header(&self, frame: &mut ratatui::Frame, area: Rect) {
@@ -1305,15 +1320,25 @@ async fn run_pipeline(
     } else {
         DatadogClient::from_env().ok()
     };
+    let zd = ZendeskClient::from_env().ok();
     let rubric = Rubric::load().map_err(|e| e.to_string())?;
     let reporter = PhaseReporter {
         ticket_id: ticket.id,
         tx,
     };
     let dd_source: Option<&dyn DatadogSource> = dd.as_ref().map(|d| d as &dyn DatadogSource);
-    pipeline::investigate_one_structured(ticket, &mut session, dd_source, &rubric, &reporter, &opts)
-        .await
-        .map_err(|e| e.to_string())
+    let zd_source: Option<&dyn ZendeskSource> = zd.as_ref().map(|z| z as &dyn ZendeskSource);
+    pipeline::investigate_one_structured(
+        ticket,
+        &mut session,
+        zd_source,
+        dd_source,
+        &rubric,
+        &reporter,
+        &opts,
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
 
 struct PhaseReporter {
@@ -1973,6 +1998,7 @@ async fn run_chat_session(ticket_id: &str) -> anyhow::Result<()> {
                             pipeline::revise(
                                 &ticket_dir,
                                 ticket_id,
+                                None,
                                 dd_source,
                                 &pipeline::InvestigateOptions::defaults(),
                             )
@@ -2059,6 +2085,7 @@ async fn run_chat_session(ticket_id: &str) -> anyhow::Result<()> {
                                     pipeline::revise(
                                         &ticket_dir,
                                         ticket_id,
+                                        None,
                                         dd_source,
                                         &pipeline::InvestigateOptions::defaults(),
                                     )

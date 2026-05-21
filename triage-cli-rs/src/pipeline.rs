@@ -25,7 +25,7 @@ use crate::models::{
 };
 use crate::playbook::Rubric;
 use crate::ticket_folder::{self, TicketFolderError, TicketFolderPaths};
-use crate::zendesk::{ZendeskClient, ZendeskError};
+use crate::zendesk::{ZendeskError, ZendeskSource};
 
 #[derive(Debug, Error)]
 pub enum PipelineError {
@@ -221,6 +221,7 @@ pub struct StructuredInvestigation {
 pub async fn investigate_one_structured(
     ticket: Ticket,
     session: &mut InvestigationSession,
+    zd_client: Option<&dyn ZendeskSource>,
     dd_client: Option<&dyn DatadogSource>,
     rubric: &Rubric,
     reporter: &dyn Reporter,
@@ -241,26 +242,23 @@ pub async fn investigate_one_structured(
             "customer_history",
             &format!("{count} prior ticket(s) (fixture)"),
         );
-    } else {
-        match ZendeskClient::from_env() {
-            Ok(zd) => {
-                let email = ticket.requester_email.clone().unwrap_or_default();
-                let history = zd.fetch_customer_history(&email, 10).await;
-                if !history.is_empty() {
-                    session.evidence.customer_history = Some(CustomerHistoryEvidence {
-                        requester_email: email,
-                        tickets: history.clone(),
-                        source: "zendesk_customer_history".into(),
-                        limit: 10,
-                    });
-                }
-                reporter.phase_done(
-                    "customer_history",
-                    &format!("{} prior ticket(s) found", history.len()),
-                );
-            }
-            Err(e) => reporter.phase_failed("customer_history", &e.to_string()),
+    } else if let Some(zd) = zd_client {
+        let email = ticket.requester_email.clone().unwrap_or_default();
+        let history = zd.fetch_customer_history(&email, 10).await;
+        if !history.is_empty() {
+            session.evidence.customer_history = Some(CustomerHistoryEvidence {
+                requester_email: email,
+                tickets: history.clone(),
+                source: "zendesk_customer_history".into(),
+                limit: 10,
+            });
         }
+        reporter.phase_done(
+            "customer_history",
+            &format!("{} prior ticket(s) found", history.len()),
+        );
+    } else {
+        reporter.phase_done("customer_history", "skipped (no Zendesk client)");
     }
 
     // Phase: memory_lookup
@@ -1260,6 +1258,7 @@ fn build_revise_session(
 pub async fn revise(
     ticket_dir: &std::path::Path,
     ticket_id: &str,
+    zd_client: Option<&dyn ZendeskSource>,
     dd_client: Option<&dyn DatadogSource>,
     opts: &InvestigateOptions,
 ) -> Result<(), PipelineError> {
@@ -1363,6 +1362,7 @@ pub async fn revise(
     let _structured = investigate_one_structured(
         base_ticket.clone(),
         &mut session,
+        zd_client,
         dd_client,
         &rubric,
         &reporter,
@@ -1470,6 +1470,7 @@ mod tests {
         investigate_one_structured(
             ticket,
             &mut session,
+            None,
             Some(&fixture_dd as &dyn crate::datadog::DatadogSource),
             &rubric,
             &reporter,
@@ -3012,7 +3013,7 @@ mod tests {
             memory_hits_override: Some(vec![]),
             ..InvestigateOptions::defaults()
         };
-        let outcome = revise(&ticket_dir, "44776", None, &no_llm_opts).await;
+        let outcome = revise(&ticket_dir, "44776", None, None, &no_llm_opts).await;
         assert!(outcome.is_ok(), "revise failed: {:?}", outcome.err());
 
         // Conversation must be preserved + extended with a system revise turn
@@ -3105,7 +3106,7 @@ mod tests {
             memory_hits_override: Some(vec![]),
             ..InvestigateOptions::defaults()
         };
-        revise(&ticket_dir, "44776", None, &no_llm_opts)
+        revise(&ticket_dir, "44776", None, None, &no_llm_opts)
             .await
             .expect("revise must succeed");
 
@@ -3233,7 +3234,7 @@ validator_warnings: []\n---\n";
             memory_hits_override: Some(vec![]),
             ..InvestigateOptions::defaults()
         };
-        let outcome = revise(&ticket_dir, "44889", None, &opts).await;
+        let outcome = revise(&ticket_dir, "44889", None, None, &opts).await;
 
         assert!(
             matches!(
@@ -3343,7 +3344,7 @@ validator_warnings: []\n---\n";
             memory_hits_override: Some(vec![]),
             ..InvestigateOptions::defaults()
         };
-        revise(&ticket_dir, "44890", None, &opts)
+        revise(&ticket_dir, "44890", None, None, &opts)
             .await
             .expect("revise must succeed");
 
