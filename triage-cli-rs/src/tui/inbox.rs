@@ -1717,6 +1717,22 @@ fn read_file_for_display(path: &Path) -> String {
     }
 }
 
+fn open_required_chat_logger(ticket_dir: &Path) -> anyhow::Result<crate::chat::ChatLogger> {
+    crate::chat::ChatLogger::open(ticket_dir).map_err(|e| {
+        anyhow::anyhow!(
+            "could not open chat event logger at {}: {e}",
+            crate::chat::chat_events_log_path(ticket_dir).display()
+        )
+    })
+}
+
+fn global_chat_close_reason(key: KeyEvent) -> Option<crate::chat::SessionCloseReason> {
+    match (key.code, key.modifiers) {
+        (KeyCode::Char('c'), KeyModifiers::CONTROL) => Some(crate::chat::SessionCloseReason::CtrlC),
+        _ => None,
+    }
+}
+
 // Suppress unused-warning when the only `ticket_folder` symbol used here is
 // `tickets_root()`. The import is kept explicit so the dependency is obvious.
 #[allow(dead_code)]
@@ -1750,7 +1766,7 @@ async fn run_chat_session(ticket_id: &str) -> anyhow::Result<()> {
     let ticket_dir = ticket_folder::tickets_root().join(ticket_id);
     std::fs::create_dir_all(&ticket_dir)?;
     let (chat_tx, mut chat_rx) = tokio::sync::mpsc::unbounded_channel::<chat::ChatEvent>();
-    let mut chat_logger = chat::ChatLogger::open(&ticket_dir).ok();
+    let mut chat_logger = open_required_chat_logger(&ticket_dir)?;
     let _ = chat_tx.send(chat::ChatEvent::SessionOpened {
         ticket_id: ticket_id.to_string(),
         ts: chrono::Utc::now(),
@@ -1783,27 +1799,26 @@ async fn run_chat_session(ticket_id: &str) -> anyhow::Result<()> {
                 reason: chat::SessionCloseReason::ProviderUnavailable,
             });
             while let Ok(evt) = chat_rx.try_recv() {
-                if let Some(logger) = chat_logger.as_mut() {
-                    logger.log(&evt);
-                }
+                chat_logger.log(&evt);
             }
             return Err(anyhow::anyhow!("provider unavailable: {e}"));
         }
     };
     let close_reason = loop {
         while let Ok(evt) = chat_rx.try_recv() {
-            if let Some(logger) = chat_logger.as_mut() {
-                logger.log(&evt);
-            }
+            chat_logger.log(&evt);
             in_flight = chat::update_progress(in_flight.take(), &evt);
-            if matches!(
-                evt,
-                chat::ChatEvent::TurnPersisted { .. }
-                    | chat::ChatEvent::ProviderError { .. }
-                    | chat::ChatEvent::Cancelled { .. }
-            ) {
-                turn_started = None;
-            }
+            apply_terminal_chat_event(
+                &evt,
+                &mut active_job,
+                &mut in_flight,
+                &mut turn_started,
+                &mut status_hint,
+                &mut ask_input,
+                &mut transcript_follow_bottom,
+                &ticket_dir,
+                ticket_id,
+            );
         }
 
         if let Some(handle) = active_job.as_ref() {
@@ -1859,31 +1874,31 @@ async fn run_chat_session(ticket_id: &str) -> anyhow::Result<()> {
 
         if event::poll(Duration::from_millis(80))? {
             if let Event::Key(key) = event::read()? {
+                if let Some(reason) = global_chat_close_reason(key) {
+                    if active_job.is_some() {
+                        if let Some(handle) = active_job.take() {
+                            handle.abort();
+                        }
+                        let _ = chat_tx.send(chat::ChatEvent::Cancelled {
+                            ts: chrono::Utc::now(),
+                            by: chat::CancelSource::CtrlC,
+                        });
+                    }
+                    break reason;
+                }
+
                 if active_job.is_some() {
-                    match (key.code, key.modifiers) {
-                        (KeyCode::Esc, _) => {
-                            if let Some(handle) = active_job.take() {
-                                handle.abort();
-                            }
-                            let _ = chat_tx.send(chat::ChatEvent::Cancelled {
-                                ts: chrono::Utc::now(),
-                                by: chat::CancelSource::EscKey,
-                            });
-                            in_flight = None;
-                            turn_started = None;
-                            status_hint = Some("turn cancelled".into());
+                    if let (KeyCode::Esc, _) = (key.code, key.modifiers) {
+                        if let Some(handle) = active_job.take() {
+                            handle.abort();
                         }
-                        (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                            if let Some(handle) = active_job.take() {
-                                handle.abort();
-                            }
-                            let _ = chat_tx.send(chat::ChatEvent::Cancelled {
-                                ts: chrono::Utc::now(),
-                                by: chat::CancelSource::CtrlC,
-                            });
-                            break chat::SessionCloseReason::CtrlC;
-                        }
-                        _ => {}
+                        let _ = chat_tx.send(chat::ChatEvent::Cancelled {
+                            ts: chrono::Utc::now(),
+                            by: chat::CancelSource::EscKey,
+                        });
+                        in_flight = None;
+                        turn_started = None;
+                        status_hint = Some("turn cancelled".into());
                     }
                     continue;
                 }
@@ -1892,9 +1907,6 @@ async fn run_chat_session(ticket_id: &str) -> anyhow::Result<()> {
                     ChatInputMode::Ask => match (key.code, key.modifiers) {
                         (KeyCode::Esc, _) => {
                             break chat::SessionCloseReason::EscFromAsk;
-                        }
-                        (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                            break chat::SessionCloseReason::CtrlC;
                         }
                         (KeyCode::Char('f'), KeyModifiers::CONTROL) => {
                             let _ = chat_tx.send(chat::ChatEvent::KeyCommand {
@@ -2182,9 +2194,7 @@ async fn run_chat_session(ticket_id: &str) -> anyhow::Result<()> {
         reason: close_reason,
     });
     while let Ok(evt) = chat_rx.try_recv() {
-        if let Some(logger) = chat_logger.as_mut() {
-            logger.log(&evt);
-        }
+        chat_logger.log(&evt);
     }
 
     // Tear down the chat terminal before handing control back to the inbox.
@@ -2196,6 +2206,47 @@ async fn run_chat_session(ticket_id: &str) -> anyhow::Result<()> {
 fn clear_textarea(input: &mut tui_textarea::TextArea) {
     *input = tui_textarea::TextArea::default();
     input.set_block(ratatui::widgets::Block::default());
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_terminal_chat_event(
+    evt: &crate::chat::ChatEvent,
+    active_job: &mut Option<JoinHandle<Result<(), String>>>,
+    in_flight: &mut Option<crate::chat::ChatProgress>,
+    turn_started: &mut Option<std::time::Instant>,
+    status_hint: &mut Option<String>,
+    ask_input: &mut tui_textarea::TextArea,
+    transcript_follow_bottom: &mut bool,
+    ticket_dir: &Path,
+    ticket_id: &str,
+) {
+    match evt {
+        crate::chat::ChatEvent::TurnPersisted { .. } => {
+            active_job.take();
+            *in_flight = None;
+            *turn_started = None;
+            *status_hint = None;
+            clear_textarea(ask_input);
+            *transcript_follow_bottom = true;
+        }
+        crate::chat::ChatEvent::ProviderError { message, .. } => {
+            active_job.take();
+            *in_flight = None;
+            *turn_started = None;
+            *status_hint = Some(message.clone());
+            let _ = append_chat_system_turn(
+                ticket_dir,
+                ticket_id,
+                &format!("follow-up failed: {message}"),
+            );
+        }
+        crate::chat::ChatEvent::Cancelled { .. } => {
+            active_job.take();
+            *in_flight = None;
+            *turn_started = None;
+        }
+        _ => {}
+    }
 }
 
 fn next_turn_number(ticket_dir: &Path) -> anyhow::Result<u32> {
@@ -2218,6 +2269,11 @@ fn command_label(cmd: &crate::tui::chat::ChatCommand) -> &'static str {
 }
 
 fn append_chat_system_turn(ticket_dir: &Path, ticket_id: &str, body: &str) -> anyhow::Result<()> {
+    let _guard = crate::chat::acquire_session_lock(
+        &crate::chat::session_dir(ticket_dir),
+        std::time::Duration::from_secs(5),
+    )
+    .map_err(|e| anyhow::anyhow!("lock: {e}"))?;
     let next = next_turn_number(ticket_dir)?;
     let turn = crate::models::Turn {
         schema: "triage-cli/conversation".into(),
@@ -2554,6 +2610,76 @@ validator_warnings:
     }
 
     #[test]
+    fn chat_logger_open_failure_is_returned() {
+        let dir = tempfile::tempdir().unwrap();
+        let ticket_dir = dir.path().join("44776");
+        std::fs::write(&ticket_dir, "not a directory").unwrap();
+
+        let err = match open_required_chat_logger(&ticket_dir) {
+            Ok(_) => panic!("expected chat logger open to fail"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("chat event logger"));
+    }
+
+    #[test]
+    fn ctrl_c_is_global_chat_close_key() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+
+        assert_eq!(
+            global_chat_close_reason(key),
+            Some(crate::chat::SessionCloseReason::CtrlC)
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_chat_event_clears_active_job() {
+        let dir = tempfile::tempdir().unwrap();
+        let ticket_dir = dir.path().join("44776");
+        std::fs::create_dir_all(crate::chat::session_dir(&ticket_dir)).unwrap();
+
+        let mut active_job = Some(tokio::spawn(async { Ok::<(), String>(()) }));
+        let mut in_flight = Some(crate::chat::ChatProgress {
+            stage: crate::chat::ChatStage::ProviderAwait,
+            canned_msg: "awaiting provider",
+            elapsed_s: 0.0,
+            frame_idx: 0,
+            resumed: None,
+            session_id: None,
+        });
+        let mut turn_started = Some(std::time::Instant::now());
+        let mut status_hint = Some("working".to_string());
+        let mut ask_input = tui_textarea::TextArea::default();
+        ask_input.insert_str("what changed?");
+        let mut transcript_follow_bottom = false;
+
+        apply_terminal_chat_event(
+            &crate::chat::ChatEvent::TurnPersisted {
+                ts: chrono::Utc::now(),
+                codex_turn: 2,
+            },
+            &mut active_job,
+            &mut in_flight,
+            &mut turn_started,
+            &mut status_hint,
+            &mut ask_input,
+            &mut transcript_follow_bottom,
+            &ticket_dir,
+            "44776",
+        );
+
+        assert!(active_job.is_none());
+        assert!(in_flight.is_none());
+        assert!(turn_started.is_none());
+        assert!(status_hint.is_none());
+        assert!(ask_input.lines().iter().all(|line| line.is_empty()));
+        assert!(transcript_follow_bottom);
+    }
+
+    #[test]
     fn parse_state_md_handles_missing_optional_fields() {
         let text = r#"---
 ticket_id: 12345
@@ -2768,6 +2894,43 @@ status: open
         let text = atts[0].extracted_text.as_deref().unwrap_or("");
         assert!(!text.contains("123-4567"), "PII leaked: {text}");
         assert!(text.contains("<PHONE>"), "redaction marker missing: {text}");
+    }
+
+    #[test]
+    fn append_chat_system_turn_waits_for_session_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let ticket_dir = dir.path().join("44776");
+        std::fs::create_dir_all(crate::chat::session_dir(&ticket_dir)).unwrap();
+        let guard = crate::chat::acquire_session_lock(
+            &crate::chat::session_dir(&ticket_dir),
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let thread_ticket_dir = ticket_dir.clone();
+        let handle = std::thread::spawn(move || {
+            let result = append_chat_system_turn(&thread_ticket_dir, "44776", "system note");
+            tx.send(result).unwrap();
+        });
+
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(150))
+                .is_err(),
+            "system turn appended while another session held the ticket lock"
+        );
+        drop(guard);
+
+        rx.recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        handle.join().unwrap();
+        let parsed = crate::chat::parse_conversation_jsonl(&crate::chat::conversation_jsonl_path(
+            &ticket_dir,
+        ))
+        .unwrap();
+        assert_eq!(parsed.turns.len(), 1);
+        assert_eq!(parsed.turns[0].turn, 1);
     }
 
     #[tokio::test]

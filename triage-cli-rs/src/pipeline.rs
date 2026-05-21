@@ -992,6 +992,7 @@ pub async fn followup_turn(
         .find(|t| matches!(t.turn_kind, crate::models::TurnKind::Codex))
         .and_then(|t| t.session_id.clone());
     let next_turn = outcome.turns.iter().map(|t| t.turn).max().unwrap_or(0) + 1;
+    let provider_is_codex = provider.name() == "codex";
 
     // Apply PII redaction at the LLM boundary (spec § 7.1g, § 9.3).
     // The redactor scrubs caller PII (phones, addresses, GPS coords);
@@ -1049,7 +1050,7 @@ pub async fn followup_turn(
 
     // Call provider
     if let Some(reporter) = reporter {
-        if last_codex_session.is_some() {
+        if provider_is_codex && last_codex_session.is_some() {
             reporter.phase(crate::chat::ChatStage::SessionResumeAttempt);
         }
         reporter.phase(crate::chat::ChatStage::ProviderAwait);
@@ -2701,7 +2702,7 @@ mod tests {
         struct ResumeProvider;
         impl crate::providers::LlmProvider for ResumeProvider {
             fn name(&self) -> &'static str {
-                "fake-resume"
+                "codex"
             }
 
             fn complete<'a>(
@@ -2826,6 +2827,95 @@ mod tests {
             "gpt-5.5",
             &[],
             &FirstProvider,
+            Some(&reporter),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            reporter.stages.lock().unwrap().as_slice(),
+            &[
+                crate::chat::ChatStage::ContextAssembled,
+                crate::chat::ChatStage::ProviderAwait,
+                crate::chat::ChatStage::ResponseParsed,
+                crate::chat::ChatStage::Saved,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn followup_turn_skips_resume_phase_for_non_codex_provider_with_prior_session() {
+        use crate::chat;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ticket_dir = dir.path().join("45003");
+        std::fs::create_dir_all(chat::session_dir(&ticket_dir)).unwrap();
+
+        let prior = crate::models::Turn {
+            schema: "triage-cli/conversation".into(),
+            schema_version: 1,
+            ticket_id: "45003".into(),
+            turn: 1,
+            turn_kind: crate::models::TurnKind::Codex,
+            ts: chrono::Utc::now(),
+            author: None,
+            body: "prior".into(),
+            evidence: vec![],
+            provider: Some("codex".into()),
+            model: Some("gpt-5.5".into()),
+            tokens_in: None,
+            tokens_out: None,
+            elapsed_s: None,
+            session_id: Some("01HPRIOR".into()),
+            resumed: Some(false),
+            action: None,
+            outcome: None,
+            drove_revision_from_turns: None,
+            diff: None,
+        };
+        chat::append_turn(&chat::conversation_jsonl_path(&ticket_dir), &prior).unwrap();
+
+        struct UnleashLikeProvider;
+        impl crate::providers::LlmProvider for UnleashLikeProvider {
+            fn name(&self) -> &'static str {
+                "unleash"
+            }
+
+            fn complete<'a>(
+                &'a self,
+                _prompt: &'a str,
+                _system_prompt: &'a str,
+                _model: &'a str,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<
+                                crate::providers::CompletionResult,
+                                crate::providers::ProviderError,
+                            >,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async {
+                    Ok(crate::providers::CompletionResult {
+                        text: "ok".into(),
+                        tokens_in: None,
+                        tokens_out: None,
+                    })
+                })
+            }
+        }
+
+        let reporter = RecordingChatReporter::default();
+        followup_turn(
+            &ticket_dir,
+            "45003",
+            "what next?",
+            "",
+            "gpt-5.5",
+            &[],
+            &UnleashLikeProvider,
             Some(&reporter),
         )
         .await

@@ -51,7 +51,17 @@ impl<'a> Widget for &ChatPane<'a> {
             .map(|_| banner_rows(area.height))
             .filter(|rows| *rows > 1)
             .unwrap_or(0);
-        let input_h = if area.height >= 14 { 5 } else { 3 };
+        let reclaimed_banner_h = if self.progress.is_none() {
+            let rows = banner_rows(area.height);
+            if rows > 1 {
+                rows
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+        let input_h = (if area.height >= 14 { 5 } else { 3 }) + reclaimed_banner_h;
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -667,6 +677,36 @@ mod tests {
         assert!(
             !joined.contains("codex follow-up"),
             "banner leaked into a no-progress draw:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn pane_without_progress_gives_banner_rows_to_input() {
+        let input = TextArea::default();
+        let pane = ChatPane {
+            turns: &[],
+            input: ChatInputSurface::Ask(&input),
+            ticket_id: "1",
+            progress: None,
+            status_hint: None,
+            transcript_scroll: 0,
+            transcript_follow_bottom: true,
+        };
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| f.render_widget(&pane, f.area())).unwrap();
+
+        let dump = buffer_to_strings(terminal.backend().buffer());
+        let ask_row = dump
+            .iter()
+            .position(|line| line.contains("ASK (Ctrl-S send, Esc cancel)"))
+            .expect("ASK input title missing");
+
+        assert_eq!(
+            ask_row,
+            13,
+            "no-progress input should reclaim the four banner rows at height 24:\n{}",
+            dump.join("\n")
         );
     }
 }
