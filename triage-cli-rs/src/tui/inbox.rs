@@ -3081,7 +3081,7 @@ status: open
             crate::chat::collect_dir_attachments(&ticket_dir, 1, &src, false, None, 25, 4 << 20)
                 .unwrap();
         assert_eq!(result.attached.len(), 25);
-        assert_eq!(result.skipped.len(), 5);
+        assert_eq!(result.skipped.len(), 1);
 
         let mut logger = ChatLogger::open(&ticket_dir).unwrap();
         for provenance in &result.attached {
@@ -3092,7 +3092,9 @@ status: open
         }
         for skipped in &result.skipped {
             let reason = match skipped {
-                DirSkipped::FileCapExceeded { path } => format!("file_cap: {}", path.display()),
+                DirSkipped::ScanCapReached { path, limit } => {
+                    format!("scan_cap: {} after {limit} files", path.display())
+                }
                 other => format!("{other:?}"),
             };
             logger.log(&ChatEvent::EvidenceRejected {
@@ -3113,7 +3115,7 @@ status: open
             body.lines()
                 .filter(|line| line.contains("evidence_rejected"))
                 .count(),
-            5
+            1
         );
     }
 }

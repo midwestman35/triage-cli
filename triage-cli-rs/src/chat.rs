@@ -1085,10 +1085,26 @@ pub struct DirCollectResult {
 
 #[derive(Debug, PartialEq)]
 pub enum DirSkipped {
-    FileCapExceeded { path: PathBuf },
     SizeCapExceeded { path: PathBuf, bytes: u64 },
     UnsupportedType { path: PathBuf },
     GlobMismatch { path: PathBuf },
+    ScanCapReached { path: PathBuf, limit: usize },
+}
+
+struct DirCollectCtx<'a> {
+    ticket_dir: &'a Path,
+    turn_no: u32,
+    recursive: bool,
+    glob: Option<&'a str>,
+    cap_files: usize,
+    cap_total_bytes: u64,
+    ext_allowlist: &'a [&'a str],
+}
+
+struct DirCollectState {
+    attached: Vec<EvidenceProvenance>,
+    skipped: Vec<DirSkipped>,
+    running_bytes: u64,
 }
 
 pub fn collect_dir_attachments(
@@ -1105,18 +1121,59 @@ pub fn collect_dir_attachments(
         "js", "jsx",
     ];
 
-    let mut candidates = Vec::new();
-    walk_dir(dir, recursive, &mut candidates)?;
-    candidates.sort();
+    let ctx = DirCollectCtx {
+        ticket_dir,
+        turn_no,
+        recursive,
+        glob,
+        cap_files,
+        cap_total_bytes,
+        ext_allowlist: EXT_ALLOWLIST,
+    };
+    let mut state = DirCollectState {
+        attached: Vec::new(),
+        skipped: Vec::new(),
+        running_bytes: 0,
+    };
+    collect_dir_entries(&ctx, dir, &mut state)?;
 
-    let mut attached = Vec::new();
-    let mut skipped = Vec::new();
-    let mut running_bytes = 0u64;
-    let mut size_cap_tripped = false;
+    Ok(DirCollectResult {
+        attached: state.attached,
+        skipped: state.skipped,
+    })
+}
 
-    for path in candidates {
+fn collect_dir_entries(
+    ctx: &DirCollectCtx<'_>,
+    dir: &Path,
+    state: &mut DirCollectState,
+) -> Result<bool, ChatError> {
+    let mut entries = fs::read_dir(dir)?.collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.path());
+
+    for entry in entries {
+        if state.attached.len() >= ctx.cap_files {
+            state.skipped.push(DirSkipped::ScanCapReached {
+                path: dir.to_path_buf(),
+                limit: ctx.cap_files,
+            });
+            return Ok(true);
+        }
+
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            if ctx.recursive && collect_dir_entries(ctx, &path, state)? {
+                return Ok(true);
+            }
+            continue;
+        }
+        if !file_type.is_file() {
+            continue;
+        }
+
         let basename = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-        let matches_filter = if let Some(glob) = glob {
+        let matches_filter = if let Some(glob) = ctx.glob {
             simple_glob_match(glob, basename)
         } else {
             let ext = path
@@ -1125,10 +1182,10 @@ pub fn collect_dir_attachments(
                 .unwrap_or("")
                 .to_ascii_lowercase();
             investigation::detect_file_type(&path) != FileType::Unknown
-                && EXT_ALLOWLIST.iter().any(|allowed| *allowed == ext)
+                && ctx.ext_allowlist.iter().any(|allowed| *allowed == ext)
         };
         if !matches_filter {
-            skipped.push(if glob.is_some() {
+            state.skipped.push(if ctx.glob.is_some() {
                 DirSkipped::GlobMismatch { path }
             } else {
                 DirSkipped::UnsupportedType { path }
@@ -1136,42 +1193,24 @@ pub fn collect_dir_attachments(
             continue;
         }
 
-        if attached.len() >= cap_files {
-            skipped.push(DirSkipped::FileCapExceeded { path });
-            continue;
-        }
-
         let bytes = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-        if size_cap_tripped || running_bytes.saturating_add(bytes) > cap_total_bytes {
-            size_cap_tripped = true;
-            skipped.push(DirSkipped::SizeCapExceeded { path, bytes });
-            continue;
+        if state.running_bytes.saturating_add(bytes) > ctx.cap_total_bytes {
+            state
+                .skipped
+                .push(DirSkipped::SizeCapExceeded { path, bytes });
+            return Ok(true);
         }
 
-        match attach_file(ticket_dir, turn_no, &path) {
+        match attach_file(ctx.ticket_dir, ctx.turn_no, &path) {
             Ok(provenance) => {
-                running_bytes = running_bytes.saturating_add(bytes);
-                attached.push(provenance);
+                state.running_bytes = state.running_bytes.saturating_add(bytes);
+                state.attached.push(provenance);
             }
-            Err(_) => skipped.push(DirSkipped::UnsupportedType { path }),
+            Err(_) => state.skipped.push(DirSkipped::UnsupportedType { path }),
         }
     }
 
-    Ok(DirCollectResult { attached, skipped })
-}
-
-fn walk_dir(dir: &Path, recursive: bool, out: &mut Vec<PathBuf>) -> Result<(), ChatError> {
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        let file_type = entry.file_type()?;
-        if file_type.is_file() {
-            out.push(path);
-        } else if recursive && file_type.is_dir() {
-            walk_dir(&path, true, out)?;
-        }
-    }
-    Ok(())
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -2265,13 +2304,11 @@ mod tests {
         let r = collect_dir_attachments(&ticket_dir, 1, &src_dir, false, None, 25, 4 * 1024 * 1024)
             .unwrap();
         assert_eq!(r.attached.len(), 25);
-        assert_eq!(r.skipped.len(), 5);
-        for s in &r.skipped {
-            assert!(
-                matches!(s, DirSkipped::FileCapExceeded { .. }),
-                "wrong skip kind: {s:?}"
-            );
-        }
+        assert_eq!(r.skipped.len(), 1);
+        assert!(matches!(
+            r.skipped[0],
+            DirSkipped::ScanCapReached { limit: 25, .. }
+        ));
     }
 
     #[test]
@@ -2292,7 +2329,7 @@ mod tests {
             "expected 3 files within 3 MiB cap, got {}",
             r.attached.len()
         );
-        assert_eq!(r.skipped.len(), 7);
+        assert_eq!(r.skipped.len(), 1);
         assert!(r
             .skipped
             .iter()
