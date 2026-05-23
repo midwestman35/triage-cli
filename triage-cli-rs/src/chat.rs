@@ -1148,10 +1148,9 @@ fn collect_dir_entries(
     dir: &Path,
     state: &mut DirCollectState,
 ) -> Result<bool, ChatError> {
-    let mut entries = fs::read_dir(dir)?.collect::<Result<Vec<_>, _>>()?;
-    entries.sort_by_key(|entry| entry.path());
-
+    let entries = fs::read_dir(dir)?;
     for entry in entries {
+        let entry = entry?;
         if state.attached.len() >= ctx.cap_files {
             state.skipped.push(DirSkipped::ScanCapReached {
                 path: dir.to_path_buf(),

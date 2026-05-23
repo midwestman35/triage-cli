@@ -991,6 +991,9 @@ pub async fn followup_turn(
         .and_then(|t| t.session_id.clone());
     let next_turn = outcome.turns.iter().map(|t| t.turn).max().unwrap_or(0) + 1;
     let provider_is_codex = provider.name() == "codex";
+    let resume_session_id = provider_is_codex
+        .then_some(last_codex_session.as_deref())
+        .flatten();
 
     // Apply PII redaction at the LLM boundary (spec § 7.1g, § 9.3).
     // The redactor scrubs caller PII (phones, addresses, GPS coords);
@@ -1024,7 +1027,7 @@ pub async fn followup_turn(
         if let Some(ctx) = chat::build_ticket_context_preamble(ticket_dir) {
             parts.push(ctx);
         }
-        if last_codex_session.is_some() {
+        if resume_session_id.is_some() {
             if let Some(replay) =
                 chat::build_conversation_replay(&outcome.turns, chat::CONVERSATION_REPLAY_TURNS)
             {
@@ -1048,7 +1051,7 @@ pub async fn followup_turn(
 
     // Call provider
     if let Some(reporter) = reporter {
-        if provider_is_codex && last_codex_session.is_some() {
+        if resume_session_id.is_some() {
             reporter.phase(crate::chat::ChatStage::SessionResumeAttempt);
         }
         reporter.phase(crate::chat::ChatStage::ProviderAwait);
@@ -1056,7 +1059,7 @@ pub async fn followup_turn(
     let started = std::time::Instant::now();
     let result = provider
         .followup(
-            last_codex_session.as_deref(),
+            resume_session_id,
             &redacted_prompt,
             &combined_system_prompt,
             model,
@@ -1074,7 +1077,7 @@ pub async fn followup_turn(
     // existed) but the provider did NOT resume — it started fresh without the
     // prior turn context. Insert a System turn BEFORE the codex turn so the
     // analyst knows the model has amnesia and can restate relevant facts.
-    let session_lost = last_codex_session.is_some() && !result.resumed;
+    let session_lost = resume_session_id.is_some() && !result.resumed;
     let codex_turn_number = if session_lost {
         let system_turn = crate::models::Turn {
             schema: "triage-cli/conversation".into(),
@@ -1679,7 +1682,7 @@ mod tests {
         struct LostSessionProvider;
         impl crate::providers::LlmProvider for LostSessionProvider {
             fn name(&self) -> &'static str {
-                "fake-lost"
+                "codex"
             }
             fn complete<'a>(
                 &'a self,
@@ -2930,6 +2933,23 @@ mod tests {
                 crate::chat::ChatStage::ResponseParsed,
                 crate::chat::ChatStage::Saved,
             ]
+        );
+
+        let parsed = crate::chat::parse_conversation_jsonl(&crate::chat::conversation_jsonl_path(
+            &ticket_dir,
+        ))
+        .unwrap();
+        assert_eq!(
+            parsed.turns.len(),
+            2,
+            "non-codex followup must not insert a system turn"
+        );
+        assert!(
+            !parsed
+                .turns
+                .iter()
+                .any(|t| matches!(t.turn_kind, crate::models::TurnKind::System)),
+            "non-codex providers cannot lose a codex subprocess session"
         );
     }
 
