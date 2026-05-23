@@ -189,6 +189,18 @@ Site-level only: `<DD_CALL_CENTER_TAG>:<site_name> status:(<levels>)`. Window is
 
 Logging during the TUI run is redirected to a per-view file printed at startup so the TUI itself stays clean.
 
+### Chat surface (progress banner + event log)
+
+Inside the inbox, pressing `a` opens `tui::inbox::run_chat_session` for the selected ticket. The chat session runs one mpsc channel for the session; spawned per-turn tasks post `chat::ChatEvent` records to it for lifecycle events, key commands, evidence attaches, phase transitions, provider request/response, errors, and cancels. The inbox event loop drains the channel every 80ms, appends each event to `<ticket_dir>/.session/chat-events.log` as JSON Lines through `chat::ChatLogger`, and folds events through `chat::update_progress` into the `chat::ChatProgress` banner state.
+
+The progress banner above the input box has four responsive tiers: full bordered (20+ rows), compact bordered (14+), tight unbordered (10+), and single-row fallback below 10 rows. Layout is computed each draw from `area.height`, so terminal resizes need no recovery branch. `chat::ChatStage` has six variants: Ingesting, ContextAssembled, SessionResumeAttempt, ProviderAwait, ResponseParsed, Saved. `chat::canned_message` maps each stage to banner text; only ProviderAwait rotates messages, and that rotation is UI-only.
+
+`pipeline::followup_turn` accepts an optional `&dyn chat::ChatPhaseReporter` and emits the five pipeline-owned stages. Non-chat callers pass `None` and keep the same behavior; the inbox chat path passes `chat::MpscPhaseReporter`.
+
+`Ctrl-D` and `/dir <path> [-r] [glob]` attach directory evidence in one shot. Directory attach is single-level by default, recursive with `-r`, optionally filtered by `*`/`?` basename glob, and capped at 25 files / 4 MiB aggregate. Accepted files become `EvidenceProvenance` through `chat::attach_file`; skipped files emit `EvidenceRejected`; a System turn summarizes the batch.
+
+The chat-events log is per-ticket and does not store prompt body, system prompt, provider output, or paste body content. It stores event metadata, file paths / sha256s, counts, and redacted provider error messages.
+
 ### Stdout vs stderr discipline
 
 - **`triage`** prints `FORK_PACKET.md` (the file content) to stdout — the pipeable handoff surface. The other four ticket files are folder-only.
@@ -237,6 +249,9 @@ Logging during the TUI run is redirected to a per-view file printed at startup s
 | Investigation session + evidence | `triage-cli-rs/src/investigation.rs` |
 | Memory layer (MEMORY.md + SQLite FTS5, FTS5 `schema_version=2`) | `triage-cli-rs/src/memory.rs`, `MEMORY.md`, `data/memory.db` |
 | Base-evidence manifest (schema v2 per [ADR-0003](docs/adr/0003-base-evidence-body-snapshots.md)) | `triage-cli-rs/src/pipeline.rs` (`collect_base_evidence_entries`), `triage-cli-rs/src/chat.rs` (`write_base_evidence_manifest`); on-disk at `<ticket_dir>/.session/base-evidence-manifest.json` |
+| Chat-events log (per-ticket JSONL) | `triage-cli-rs/src/chat.rs` (`ChatLogger`, `chat_events_log_path`); on-disk at `<ticket_dir>/.session/chat-events.log` |
+| Chat progress + phase channel | `triage-cli-rs/src/chat.rs` (`ChatEvent`, `ChatStage`, `ChatProgress`, `ChatPhaseReporter`, `MpscPhaseReporter`, `update_progress`, `advance_progress_tick`, `canned_message`) |
+| Directory evidence attach | `triage-cli-rs/src/chat.rs` (`collect_dir_attachments`, `DirCollectResult`, `DirSkipped`) |
 | LLM provider trait + impls | `triage-cli-rs/src/providers/` (`mod.rs`, `unleash.rs`, `codex.rs`) |
 | LLM structured-output dispatch + validator + retry | `triage-cli-rs/src/llm.rs` (`triage_structured`) |
 | PII redaction | `triage-cli-rs/src/redact.rs` |

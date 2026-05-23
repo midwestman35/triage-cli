@@ -62,13 +62,13 @@ jobs:
         with:
           workspaces: triage-cli-rs -> triage-cli-rs/target
 
-      - name: cargo test --test integration
-        working-directory: triage-cli-rs
-        run: cargo test --test integration --no-fail-fast
-
       - name: Build release binary (for CLI smoke tests)
         working-directory: triage-cli-rs
         run: cargo build --release
+
+      - name: cargo test --test integration
+        working-directory: triage-cli-rs
+        run: cargo test --test integration --no-fail-fast
 
       - name: CLI smoke tests
         working-directory: triage-cli-rs

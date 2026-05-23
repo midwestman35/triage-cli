@@ -89,10 +89,10 @@ To dispatch a Codex Cloud agent that can run these tests:
    ```bash
    # Only runbook 02 (triage)
    cargo test --test integration runbook_02
-   
+
    # Only runbook 06 (watcher state logic)
    cargo test --test integration runbook_06
-   
+
    # Only CLI smoke tests
    cargo test --test integration runbook_cli
    ```
