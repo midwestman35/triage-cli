@@ -386,17 +386,25 @@ pub fn parse_chat_command(raw: &str) -> ChatCommand {
         return ChatCommand::File(std::path::PathBuf::from(rest.trim()));
     }
     if let Some(rest) = trimmed.strip_prefix("/dir ") {
-        let mut tokens = rest.split_whitespace();
-        let path = tokens.next().unwrap_or("").to_string();
+        let mut tokens = rest.split_whitespace().collect::<Vec<_>>();
         let mut recursive = false;
         let mut glob = None;
-        for token in tokens {
-            if token == "-r" {
-                recursive = true;
-            } else if glob.is_none() {
-                glob = Some(token.to_string());
+
+        if tokens.last() == Some(&"-r") {
+            recursive = true;
+            tokens.pop();
+        }
+        if let Some(last) = tokens.last() {
+            if last.contains('*') || last.contains('?') {
+                glob = tokens.pop().map(str::to_string);
             }
         }
+        if tokens.last() == Some(&"-r") {
+            recursive = true;
+            tokens.pop();
+        }
+
+        let path = tokens.join(" ");
         if !path.is_empty() {
             return ChatCommand::Dir {
                 path: std::path::PathBuf::from(path),
@@ -565,6 +573,30 @@ mod tests {
             parse_chat_command("/dir ./logs -r *.log"),
             ChatCommand::Dir {
                 path: std::path::PathBuf::from("./logs"),
+                recursive: true,
+                glob: Some("*.log".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_dir_command_preserves_internal_path_spaces() {
+        assert_eq!(
+            parse_chat_command("/dir /Users/alice/Call Logs"),
+            ChatCommand::Dir {
+                path: std::path::PathBuf::from("/Users/alice/Call Logs"),
+                recursive: false,
+                glob: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_dir_command_preserves_path_spaces_with_options() {
+        assert_eq!(
+            parse_chat_command("/dir /Users/alice/Call Logs -r *.log"),
+            ChatCommand::Dir {
+                path: std::path::PathBuf::from("/Users/alice/Call Logs"),
                 recursive: true,
                 glob: Some("*.log".into()),
             }
