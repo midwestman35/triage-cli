@@ -189,9 +189,28 @@ any future migration parser that might encounter non-UUID values.
   the JSONL stream on stdout. Method A is the most insulated from
   config drift.
 
+## v1 app-server transport (2026-05-25)
+
+ADR [0004](../../../docs/adr/0004-codex-app-server-transport.md) adds a second Codex path for inbox chat only.
+
+| LLM call | v1 transport | Capture method |
+| --- | --- | --- |
+| `LlmProvider::complete` (`triage_structured`, `extract_anchor`, …) | **Always** `codex exec` subprocess | `codex_json_output` (this document) |
+| `LlmProvider::followup` (inbox) | `codex app-server` when `CODEX_TRANSPORT` is not `exec` and probe passes; else exec | `app_server_thread_id` or `codex_json_output` |
+
+**App-server capture:** JSON-RPC `thread/start` or `thread/resume` returns `thread.id`. Persisted on the provider turn as `Turn.session_id` and on `SessionManifest` as `codex_thread_id` with `codex_capture_method: app_server_thread_id` and `codex_transport: app-server`.
+
+**Env:** `CODEX_TRANSPORT=app-server|exec` (default effective mode is app-server when unset; see `providers/mod.rs`). `CODEX_TRANSPORT=exec` forces subprocess for follow-up as well and skips app-server auth checks in `doctor`.
+
+**Do not mix IDs across transports** on one ticket — exec `thread_id` from JSONL is not assumed valid for app-server `thread/resume` when manifest `codex_transport` disagrees with the active env (replay / mismatch banners per interactive-investigation spec).
+
+**Tests:** exec contract remains `tests/codex_contract.rs`; app-server smoke is `tests/codex_app_server_contract.rs` (both gated on `CODEX_AVAILABLE=1`).
+
 ## Related code
 
-- Contract tests: `triage-cli-rs/tests/codex_contract.rs`
-- Existing codex provider (target of Task 10 changes):
-  `triage-cli-rs/src/providers/codex.rs`
+- Exec contract tests: `triage-cli-rs/tests/codex_contract.rs`
+- App-server contract tests: `triage-cli-rs/tests/codex_app_server_contract.rs`
+- Exec subprocess provider: `triage-cli-rs/src/providers/codex.rs`
+- App-server client: `triage-cli-rs/src/providers/codex_app_server.rs`
+- Transport dispatch: `triage-cli-rs/src/providers/mod.rs`
 - Spec sections discharged: § 5.6, § 12.1

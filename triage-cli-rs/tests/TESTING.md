@@ -8,7 +8,8 @@
 | Integration | `cargo test --test integration` | No | No | Yes |
 | CLI Smoke | `cargo test --test integration runbook_cli` | No | No | Yes (needs release build) |
 | Sandbox (live) | `SANDBOX_INTEGRATION=1 cargo test --test sandbox -- --nocapture` | Yes | Yes | No |
-| Codex Contract | `CODEX_AVAILABLE=1 cargo test --test codex_contract -- --nocapture` | Yes | Yes | No |
+| Codex Contract (exec) | `CODEX_AVAILABLE=1 cargo test --test codex_contract -- --nocapture` | Yes | Yes | No |
+| Codex App-Server Contract | `CODEX_AVAILABLE=1 cargo test --test codex_app_server_contract -- --nocapture` | Yes | Yes | No |
 
 ## Running All Offline Tests
 
@@ -22,6 +23,25 @@ cargo fmt --all -- --check
 ```
 
 No `.env`, no credentials, no network required.
+
+## CI and Codex transport
+
+Default CI jobs should **not** set `CODEX_AVAILABLE=1` and should prefer
+`CODEX_TRANSPORT=exec` (or `LLM_PROVIDER=unleash`) so builds never require a
+live Codex seat or app-server probe.
+
+Optional maintainer / nightly job when a Codex CLI is installed and authenticated:
+
+```bash
+export CODEX_AVAILABLE=1
+export CODEX_TRANSPORT=app-server   # or exec for subprocess-only contract tests
+CODEX_AVAILABLE=1 cargo test --test codex_contract -- --nocapture --test-threads=1
+CODEX_AVAILABLE=1 cargo test --test codex_app_server_contract -- --nocapture
+```
+
+Offline regression gates for Codex code changes remain:
+`cargo test --lib`, `cargo test --test pipeline_integration`,
+`cargo clippy --all-targets -- -D warnings`.
 
 ## Live Sandbox Tests
 
@@ -81,7 +101,8 @@ Four named fixtures in `triage-cli-rs/fixtures/`: `audio-drop`, `no-site-map`, `
 ```
 tests/
   README.md                     # This file (detailed testing guide)
-  codex_contract.rs             # Codex CLI contract tests
+  codex_contract.rs             # Codex exec JSONL contract (CODEX_AVAILABLE=1)
+  codex_app_server_contract.rs  # App-server initialize smoke (CODEX_AVAILABLE=1)
   integration/
     mod.rs                      # Module root
     zendesk_mock.rs             # ZendeskFixtureClient

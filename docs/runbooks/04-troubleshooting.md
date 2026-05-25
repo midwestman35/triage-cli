@@ -29,11 +29,35 @@ ApiException: 401 Unauthorized
 ```
 UNLEASH_API_KEY must be set when LLM_PROVIDER=unleash.
 codex CLI not found on PATH.
+codex app-server initialize failed: ...
+codex account not authenticated
 ```
 
 - `LLM_PROVIDER=unleash` requires `UNLEASH_API_KEY` and `UNLEASH_ASSISTANT_ID`. The Unleash assistant picks the model server-side; the CLI does not pass a model parameter.
-- `LLM_PROVIDER=codex` requires the `codex` CLI on `PATH` and an existing codex OAuth session (run `codex` once interactively to authenticate). The model defaults to `gpt-5.5`; override with `CODEX_MODEL`.
-- Only `unleash` and `codex` are accepted as of 2026-05-14. Any other value (`claude`, `openai`, …) is rejected by `doctor`. See `docs/adr/0002-prune-claude-openai-providers.md` for why those providers were removed.
+- `LLM_PROVIDER=codex` requires the `codex` CLI on `PATH`.
+  - **`CODEX_TRANSPORT=app-server`** (default): run `triage-cli setup` and complete device-code login; `doctor` checks `initialize`, `account/read`, and `CODEX_MODEL` in `model/list` without starting login. Upgrade Codex CLI if `app-server` subcommand is missing.
+  - **`CODEX_TRANSPORT=exec`**: uses subprocess OAuth (run `codex` interactively to refresh). App-server auth checks are skipped in `doctor`.
+  - At runtime, if app-server is unavailable, the CLI falls back to `exec` once (stderr hint). Set `CODEX_TRANSPORT=exec` explicitly to silence fallback and force subprocess-only.
+- Only `unleash` and `codex` are accepted as of 2026-05-14. Any other value (`claude`, `openai`, …) is rejected by `doctor`. See `docs/adr/0002-prune-claude-openai-providers.md` for why those providers were removed. Transport details: `docs/adr/0004-codex-app-server-transport.md`.
+
+### Codex transport / inbox resume
+
+- **Inbox follow-up fails after switching `CODEX_TRANSPORT`** — exec-captured `thread_id` values are not interchangeable with app-server threads. Check `.session/` manifest `codex_transport` and align env with the session that created the thread, or start a fresh chat turn.
+- **Structured triage still spawns `codex exec`** — v1 keeps `complete()` on the exec JSONL contract even when inbox uses app-server (`docs/decisions/2026-05-17-codex-session-capture.md`).
+
+### Codex contract tests (`CODEX_AVAILABLE`)
+
+Live contract tests are opt-in and do not run in default CI:
+
+```bash
+# Exec JSONL session capture (investigate / complete path)
+CODEX_AVAILABLE=1 cargo test --test codex_contract -- --nocapture --test-threads=1
+
+# App-server initialize smoke
+CODEX_AVAILABLE=1 cargo test --test codex_app_server_contract -- --nocapture
+```
+
+Requires `codex` on PATH and `CODEX_AVAILABLE=1`. See `triage-cli-rs/tests/TESTING.md`. In CI without a Codex seat, set `CODEX_TRANSPORT=exec` and omit `CODEX_AVAILABLE`.
 
 ## Site resolution
 

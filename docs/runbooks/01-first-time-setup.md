@@ -22,13 +22,18 @@ step yourself.
    cargo --version   # 1.95+
    ```
 
-   If `LLM_PROVIDER=codex`, also verify the codex CLI:
+   If `LLM_PROVIDER=codex`, verify the Codex CLI:
 
    ```bash
    codex --version
+   codex app-server --help   # required unless you will use CODEX_TRANSPORT=exec only
    ```
 
-   If `codex` is missing or unauthenticated, install the codex CLI and run `codex` once interactively to complete OAuth.
+   Prefer `triage-cli setup` for Codex: it writes `LLM_PROVIDER=codex` and
+   `CODEX_TRANSPORT=app-server` (or `exec` if the app-server probe fails), then
+   runs ChatGPT device-code login when needed. Tokens are not stored in `.env`.
+   For `CODEX_TRANSPORT=exec` only, you may instead run `codex` once
+   interactively to refresh subprocess OAuth.
 
 2. **Clone the repo (or `cd` into an existing checkout):**
 
@@ -60,9 +65,9 @@ step yourself.
    Fill in the following keys (see `README.md` for the full table):
 
    - `ZENDESK_SUBDOMAIN`, `ZENDESK_EMAIL`, `ZENDESK_API_TOKEN` — generate the API token in Zendesk Admin Center under Apps and integrations -> Zendesk API. Do **not** append `/token` to the email; the client does that.
-   - `LLM_PROVIDER` — `unleash` (default, HTTP to the internal Axon gateway) or `codex` (subprocess to the local `codex` CLI). These are the only accepted values as of 2026-05-14; see `docs/adr/0002-prune-claude-openai-providers.md`.
+   - `LLM_PROVIDER` — `unleash` (default, HTTP to the internal Axon gateway) or `codex` (local Codex CLI). These are the only accepted values as of 2026-05-14; see `docs/adr/0002-prune-claude-openai-providers.md`.
      - For `unleash`: set `UNLEASH_API_KEY` and `UNLEASH_ASSISTANT_ID`. The model is chosen server-side by the assistant.
-     - For `codex`: ensure the `codex` CLI is on `PATH`. Optionally set `CODEX_MODEL` (default `gpt-5.5`).
+     - For `codex`: ensure `codex` is on `PATH`. Set `CODEX_TRANSPORT=app-server` (default) or `exec` (subprocess-only / CI). Optionally set `CODEX_MODEL` (default `gpt-5.5`). Run `triage-cli setup` to probe transport and complete device-code auth — see `docs/adr/0004-codex-app-server-transport.md`.
    - `DD_API_KEY`, `DD_APP_KEY` — optional. Add these only if you plan to use Datadog enrichment in `triage`, `watch`, or `inbox`; Guided Investigation does not need them.
 
 5. **Build the site map** if you will use one-shot triage or watcher site resolution (turns `apex-cnc-inventory.md` into `data/cnc-map.json`):
@@ -77,7 +82,7 @@ step yourself.
    triage-cli doctor
    ```
 
-   Exits 0 when all critical checks pass (Zendesk creds, selected provider credential, output directory writable). Datadog is a warning only.
+   Exits 0 when all critical checks pass (Zendesk creds, selected provider credential, output directory writable). With `LLM_PROVIDER=codex` and `CODEX_TRANSPORT` not `exec`, doctor also checks app-server `initialize`, authenticated `account/read`, and `CODEX_MODEL` in `model/list`. Datadog is a warning only.
 
 7. **Smoke-test Guided Investigation against a ticket you are assigned.** Pick a ticket ID from your own Zendesk queue and run:
 
@@ -106,4 +111,5 @@ step yourself.
 - **`command not found: triage-cli`** — the binary is not on `PATH`. Either invoke it as `./triage-cli-rs/target/release/triage-cli ...` or create the symlink shown in step 3.
 - **`✗ <PROVIDER_KEY> not set`** from `doctor` — the selected `LLM_PROVIDER` does not have its required credential. Either set the env var or switch provider via `LLM_PROVIDER=...`.
 - **`✗ codex not on PATH`** from `doctor` — `LLM_PROVIDER=codex` requires the `codex` CLI. Install it and ensure `which codex` succeeds.
+- **`✗ codex app-server` / account not authenticated** — run `triage-cli setup` and complete device-code login, or set `CODEX_TRANSPORT=exec` and refresh OAuth via `codex` interactively. See runbook `05-switching-models.md` and `docs/runbooks/04-troubleshooting.md`.
 - **Zendesk auth failed (401/403)** — the email already has `/token` appended in `.env` (remove it), or the API token was pasted with whitespace, or the token does not have ticket read scope.

@@ -28,9 +28,22 @@ Controlled by `LLM_PROVIDER` env var (default: `unleash`).
 | Value | Mechanism | Required |
 |---|---|---|
 | `unleash` (default) | HTTP to internal Axon gateway | `UNLEASH_API_KEY`, `UNLEASH_ASSISTANT_ID` |
-| `codex` | Subprocess to `codex exec`; inherits Codex OAuth | `codex` CLI on PATH |
+| `codex` | Codex CLI: app-server JSON-RPC (default) or `codex exec` subprocess | `codex` on PATH; `CODEX_TRANSPORT`; auth via `setup` / `doctor` |
 
 The `claude` and `openai` providers were removed 2026-05-14 in favor of unleash + codex (see `docs/adr/0002-prune-claude-openai-providers.md`); if a future Anthropic API path is added, it must work with the enterprise OAuth seat the operator has — i.e. via the `claude` CLI subprocess, not the SDK. Codex reads `CODEX_MODEL` (default `gpt-5.5`); Unleash ignores any model parameter — the model is selected server-side by `UNLEASH_ASSISTANT_ID`.
+
+### Codex transport (`CODEX_TRANSPORT`)
+
+When `LLM_PROVIDER=codex`, `CODEX_TRANSPORT` selects how **inbox follow-ups** run (`providers/mod.rs`):
+
+| Value | Behavior |
+|---|---|
+| `app-server` (default when unset) | `CodexAppServerProvider` — persistent `codex app-server --listen stdio://`; capture `app_server_thread_id`. Setup uses device-code login; `doctor` probes `initialize` + `account/read` + `model/list` (read-only). |
+| `exec` | `CodexSubprocessProvider` only — `codex exec` / resume; capture `codex_json_output`. |
+
+`LlmProvider::complete` (`triage_structured`, anchors) **always** uses `codex exec` in v1 regardless of `CODEX_TRANSPORT`. If app-server is requested but unavailable, runtime falls back to exec once (stderr hint). See `docs/adr/0004-codex-app-server-transport.md`.
+
+**Regression gates (Codex changes):** `cargo test --lib`, `cargo test --test pipeline_integration`, `cargo clippy --all-targets -- -D warnings`. Optional live: `CODEX_AVAILABLE=1 cargo test --test codex_contract` and `codex_app_server_contract`. CI should use `CODEX_TRANSPORT=exec` without `CODEX_AVAILABLE` unless a dedicated job provides a Codex seat.
 
 ## Memory layer
 
@@ -80,7 +93,7 @@ Tests are inline (`#[cfg(test)]`) in the same `.rs` source files. Mocked clients
 
 `triage-cli-rs/` follows one-module-per-file. The binary entry point is `src/main.rs` → `triage_cli::run()` (in `src/lib.rs`) → `cli::run()`. Current modules under `src/`:
 
-`build_map`, `chat`, `cli`, `datadog`, `extract`, `fixture`, `interactive`, `investigation`, `llm`, `memory`, `models`, `paths`, `pipeline`, `playbook`, `providers/` (`mod`, `unleash`, `codex`), `redact`, `setup`, `ticket_folder`, `tui/` (`mod`, `chat`, `inbox`), `watcher`, `zendesk`.
+`build_map`, `chat`, `cli`, `datadog`, `extract`, `fixture`, `interactive`, `investigation`, `llm`, `memory`, `models`, `paths`, `pipeline`, `playbook`, `providers/` (`mod`, `unleash`, `codex`, `codex_app_server`), `redact`, `setup`, `ticket_folder`, `tui/` (`mod`, `chat`, `inbox`), `watcher`, `zendesk`.
 
 The legacy `render` module and `tui/investigate.rs` were removed in the v1 reframe — there is no longer a prose-note renderer or a mid-investigation TUI.
 
@@ -232,6 +245,8 @@ The chat-events log is per-ticket and does not store prompt body, system prompt,
 | `TRIAGE_FIXTURES_DIR` | Override the fixtures root used by `demo` / `--fixture` (default falls through to a binary-adjacent or repo `fixtures/` dir). |
 | `DIFF_VIEWER` | Command run on `--diff` soft-lock conflicts (e.g. `code --diff`). Falls back to `diff -u`. |
 | `LLM_PROVIDER` and provider creds | See the *LLM providers* table above. |
+| `CODEX_TRANSPORT` | When `LLM_PROVIDER=codex`: `app-server` \| `exec` (default effective: app-server). |
+| `CODEX_MODEL` | Codex model id (default `gpt-5.5`). |
 
 ## Where things live
 
@@ -252,7 +267,9 @@ The chat-events log is per-ticket and does not store prompt body, system prompt,
 | Chat-events log (per-ticket JSONL) | `triage-cli-rs/src/chat.rs` (`ChatLogger`, `chat_events_log_path`); on-disk at `<ticket_dir>/.session/chat-events.log` |
 | Chat progress + phase channel | `triage-cli-rs/src/chat.rs` (`ChatEvent`, `ChatStage`, `ChatProgress`, `ChatPhaseReporter`, `MpscPhaseReporter`, `update_progress`, `advance_progress_tick`, `canned_message`) |
 | Directory evidence attach | `triage-cli-rs/src/chat.rs` (`collect_dir_attachments`, `DirCollectResult`, `DirSkipped`) |
-| LLM provider trait + impls | `triage-cli-rs/src/providers/` (`mod.rs`, `unleash.rs`, `codex.rs`) |
+| LLM provider trait + impls | `triage-cli-rs/src/providers/` (`mod.rs`, `unleash.rs`, `codex.rs`, `codex_app_server.rs`) |
+| Codex transport ADR | `docs/adr/0004-codex-app-server-transport.md` |
+| Codex session capture (exec + app-server) | `triage-cli-rs/docs/decisions/2026-05-17-codex-session-capture.md`, `docs/decisions/2026-05-17-codex-session-capture.md` |
 | LLM structured-output dispatch + validator + retry | `triage-cli-rs/src/llm.rs` (`triage_structured`) |
 | PII redaction | `triage-cli-rs/src/redact.rs` |
 | Inbox TUI | `triage-cli-rs/src/tui/inbox.rs` |
