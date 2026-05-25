@@ -1517,6 +1517,8 @@ mod tests {
             created_at: Utc::now(),
             last_resumed_at: None,
             resume_count: 0,
+            codex_thread_id: None,
+            codex_transport: Some("exec".into()),
             codex_capture_method: Some("stderr_session_id_line".into()),
         };
         write_session_manifest(&ticket_dir, &m).unwrap();

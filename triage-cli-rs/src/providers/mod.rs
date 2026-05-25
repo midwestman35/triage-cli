@@ -117,6 +117,14 @@ fn codex_transport_mode() -> CodexTransportMode {
     }
 }
 
+/// Active Codex transport label for session provenance (`app-server` | `exec`).
+pub fn codex_transport_label() -> &'static str {
+    match codex_transport_mode() {
+        CodexTransportMode::Exec => "exec",
+        CodexTransportMode::AppServer => "app-server",
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CodexTransportMode {
     AppServer,
