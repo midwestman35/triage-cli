@@ -1,4 +1,4 @@
-//! Codex app-server contract smoke test (Phase 0).
+//! Codex app-server contract smoke tests (gated on `CODEX_AVAILABLE=1`).
 //!
 //! Verifies that a live `codex app-server --listen stdio://` process accepts
 //! `initialize` over newline-delimited JSON-RPC. Skipped in CI unless the gate
@@ -35,4 +35,23 @@ async fn initialize_smoke() {
         .await
         .expect("initialize should succeed against live codex app-server");
     assert!(client.is_initialized());
+}
+
+#[tokio::test]
+async fn thread_start_smoke() {
+    if !codex_available() {
+        eprintln!("skipped: set CODEX_AVAILABLE=1 and ensure `codex` is on PATH");
+        return;
+    }
+
+    let transport = StdioAppServerTransport::spawn()
+        .await
+        .expect("spawn codex app-server");
+    let mut client = CodexAppServerClient::new(transport);
+    client.initialize().await.expect("initialize");
+    let thread_id = client
+        .thread_start("You are a concise assistant.", "gpt-5.5")
+        .await
+        .expect("thread/start should return a thread id");
+    assert!(!thread_id.is_empty(), "thread id must be non-empty");
 }

@@ -1,20 +1,115 @@
 //! Codex app-server JSON-RPC client over newline-delimited stdio.
 //!
-//! Phase 0: transport abstraction, `initialize` gate, and unit tests with a fake
-//! transport. Not wired into `get_provider()` until Phase 1.
+//! Phase 1: production client, singleton process, overload retry, thread/turn
+//! RPCs for `LlmProvider::followup`. `complete()` stays on subprocess (Phase 3).
 
-use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use once_cell::sync::Lazy;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::sync::Mutex as AsyncMutex;
+use tokio::time::timeout;
 
-use super::ProviderError;
+use super::codex::CodexSubprocessProvider;
+use super::{
+    CompletionResult, FollowupResult, LlmProvider, ProviderError, ProviderProgress,
+};
 
 /// JSON-RPC overload / rate-limit code from the Codex app-server.
 pub const JSONRPC_OVERLOAD_CODE: i64 = -32001;
+
+/// Default max NDJSON lines read while waiting for one JSON-RPC response.
+pub const DEFAULT_MAX_READ_LINES: usize = 10_000;
+
+/// Default wall-clock budget while waiting for one JSON-RPC response.
+pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(120);
+
+const OVERLOAD_MAX_ATTEMPTS: u32 = 3;
+const OVERLOAD_TOTAL_CAP: Duration = Duration::from_secs(8);
+
+static APP_SERVER_FALLBACK_HINT: AtomicBool = AtomicBool::new(false);
+
+static SHARED_CLIENT: Lazy<AsyncMutex<Option<CodexAppServerClient<StdioAppServerTransport>>>> =
+    Lazy::new(|| AsyncMutex::new(None));
+
+/// Optional progress sink for inbox wiring (Phase 4). Internal-only.
+type ProgressReporter = Arc<dyn Fn(ProviderProgress) + Send + Sync>;
+
+static PROGRESS_REPORTER: Lazy<AsyncMutex<Option<ProgressReporter>>> =
+    Lazy::new(|| AsyncMutex::new(None));
+
+/// Register a process-wide progress callback (typically from the inbox pipeline).
+pub async fn set_progress_reporter(reporter: Option<ProgressReporter>) {
+    *PROGRESS_REPORTER.lock().await = reporter;
+}
+
+fn emit_progress(progress: ProviderProgress) {
+    if let Ok(guard) = PROGRESS_REPORTER.try_lock() {
+        if let Some(cb) = guard.as_ref() {
+            cb(progress);
+        }
+    }
+}
+
+/// Log once when `get_provider()` falls back from app-server to subprocess.
+pub(crate) fn log_app_server_fallback_once() {
+    if !APP_SERVER_FALLBACK_HINT.swap(true, Ordering::Relaxed) {
+        eprintln!(
+            "hint: codex app-server unavailable; using `codex exec` for Codex. \
+             Set CODEX_TRANSPORT=exec to silence this message."
+        );
+    }
+}
+
+/// Probe whether app-server is usable (`codex` on PATH + `initialize` succeeds).
+pub async fn probe_app_server() -> bool {
+    if which::which("codex").is_err() {
+        return false;
+    }
+    match StdioAppServerTransport::spawn().await {
+        Ok(transport) => {
+            let mut client = CodexAppServerClient::new(transport);
+            client.initialize().await.is_ok()
+        }
+        Err(_) => false,
+    }
+}
+
+/// Sync probe for `get_provider()` — uses the current Tokio runtime or a temporary one.
+pub fn probe_app_server_sync() -> bool {
+    if which::which("codex").is_err() {
+        return false;
+    }
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => handle.block_on(probe_app_server()),
+        Err(_) => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map(|rt| rt.block_on(probe_app_server()))
+            .unwrap_or(false),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ReadBounds {
+    max_lines: usize,
+    timeout: Duration,
+}
+
+impl Default for ReadBounds {
+    fn default() -> Self {
+        Self {
+            max_lines: DEFAULT_MAX_READ_LINES,
+            timeout: DEFAULT_READ_TIMEOUT,
+        }
+    }
+}
 
 /// Newline-delimited JSON-RPC over async readers/writers.
 pub trait AppServerTransport: Send {
@@ -31,7 +126,7 @@ pub trait AppServerTransport: Send {
 /// In-memory transport that replays scripted stdout lines for unit tests.
 #[derive(Debug)]
 pub struct FakeAppServerTransport {
-    responses: VecDeque<String>,
+    responses: std::collections::VecDeque<String>,
     pub written: Vec<String>,
 }
 
@@ -59,16 +154,15 @@ impl AppServerTransport for FakeAppServerTransport {
         &'a mut self,
     ) -> Pin<Box<dyn Future<Output = Result<String, ProviderError>> + Send + 'a>> {
         Box::pin(async move {
-            self.responses
-                .pop_front()
-                .ok_or_else(|| ProviderError::Transport("fake transport: no scripted response".into()))
+            self.responses.pop_front().ok_or_else(|| {
+                ProviderError::Transport("fake transport: no scripted response".into())
+            })
         })
     }
 }
 
 /// Spawns `codex app-server --listen stdio://` and speaks JSON-RPC on its stdio.
 pub struct StdioAppServerTransport {
-    #[allow(dead_code)]
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
@@ -83,25 +177,58 @@ impl StdioAppServerTransport {
             .args(["app-server", "--listen", "stdio://"])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
             .spawn()
-            .map_err(|e| ProviderError::SubprocessFailure("codex app-server", e.to_string()))?;
+            .map_err(|e| {
+                ProviderError::SubprocessFailure("codex app-server", e.to_string())
+            })?;
 
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| ProviderError::Transport("codex app-server: stdin not piped".into()))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| ProviderError::Transport("codex app-server: stdout not piped".into()))?;
+        let stdin = child.stdin.take().ok_or_else(|| {
+            ProviderError::Transport("codex app-server: stdin not piped".into())
+        })?;
+        let stdout = child.stdout.take().ok_or_else(|| {
+            ProviderError::Transport("codex app-server: stdout not piped".into())
+        })?;
 
         Ok(Self {
             child,
             stdin,
             stdout: BufReader::new(stdout),
         })
+    }
+
+    async fn stderr_snippet(&mut self) -> String {
+        let mut stderr_buf = Vec::new();
+        if let Some(mut stderr) = self.child.stderr.take() {
+            let _ = tokio::io::AsyncReadExt::read_to_end(&mut stderr, &mut stderr_buf).await;
+        }
+        let snippet = String::from_utf8_lossy(&stderr_buf);
+        let trimmed = snippet.trim();
+        if trimmed.is_empty() {
+            String::new()
+        } else {
+            const MAX: usize = 500;
+            if trimmed.len() > MAX {
+                format!("{}…", &trimmed[..MAX])
+            } else {
+                trimmed.to_string()
+            }
+        }
+    }
+
+    async fn child_failure_message(&mut self, context: &str) -> String {
+        let status = self.child.try_wait().ok().flatten();
+        let stderr = self.stderr_snippet().await;
+        match (status, stderr.is_empty()) {
+            (Some(s), true) => format!("{context}: child exited {:?} ", s.code()),
+            (Some(s), false) => format!(
+                "{context}: child exited {:?}; stderr: {stderr}",
+                s.code()
+            ),
+            (None, false) => format!("{context}; stderr: {stderr}"),
+            (None, true) => context.to_string(),
+        }
     }
 }
 
@@ -132,25 +259,28 @@ impl AppServerTransport for StdioAppServerTransport {
     ) -> Pin<Box<dyn Future<Output = Result<String, ProviderError>> + Send + 'a>> {
         Box::pin(async move {
             let mut line = String::new();
-            self.stdout
+            let n = self
+                .stdout
                 .read_line(&mut line)
                 .await
                 .map_err(|e| ProviderError::Transport(format!("codex app-server read: {e}")))?;
-            if line.is_empty() {
-                return Err(ProviderError::Transport(
-                    "codex app-server closed stdout".into(),
-                ));
+            if n == 0 {
+                let detail = self
+                    .child_failure_message("codex app-server closed stdout")
+                    .await;
+                return Err(ProviderError::Transport(detail));
             }
             Ok(line)
         })
     }
 }
 
-/// Minimal app-server client: `initialize` must succeed before other RPCs.
+/// App-server JSON-RPC client.
 pub struct CodexAppServerClient<T: AppServerTransport> {
     transport: T,
     next_id: i64,
     initialized: bool,
+    bounds: ReadBounds,
 }
 
 impl<T: AppServerTransport> CodexAppServerClient<T> {
@@ -159,14 +289,20 @@ impl<T: AppServerTransport> CodexAppServerClient<T> {
             transport,
             next_id: 1,
             initialized: false,
+            bounds: ReadBounds::default(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_bounds(mut self, bounds: ReadBounds) -> Self {
+        self.bounds = bounds;
+        self
     }
 
     pub fn is_initialized(&self) -> bool {
         self.initialized
     }
 
-    /// Negotiate capabilities with the app-server. Required before any other request.
     pub async fn initialize(&mut self) -> Result<(), ProviderError> {
         let params = json!({
             "clientInfo": {
@@ -179,9 +315,62 @@ impl<T: AppServerTransport> CodexAppServerClient<T> {
         Ok(())
     }
 
-    /// Phase-0 stub for the initialize gate — real methods arrive in Phase 1.
-    pub async fn stub_request(&mut self) -> Result<Value, ProviderError> {
+    pub async fn account_read(&mut self) -> Result<Value, ProviderError> {
         self.call("account/read", json!({})).await
+    }
+
+    pub async fn thread_start(
+        &mut self,
+        base_instructions: &str,
+        model: &str,
+    ) -> Result<String, ProviderError> {
+        let mut params = json!({
+            "approvalPolicy": "never",
+        });
+        if !base_instructions.is_empty() {
+            params["baseInstructions"] = json!(base_instructions);
+        }
+        if !model.is_empty() {
+            params["model"] = json!(model);
+        }
+        let result = self.call("thread/start", params).await?;
+        thread_id_from_result(&result).ok_or_else(|| {
+            ProviderError::Transport("codex app-server: thread/start missing thread.id".into())
+        })
+    }
+
+    pub async fn thread_resume(&mut self, thread_id: &str) -> Result<(), ProviderError> {
+        self.call(
+            "thread/resume",
+            json!({
+                "threadId": thread_id,
+                "approvalPolicy": "never",
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Start a turn and collect streamed assistant text until `turn/completed`.
+    pub async fn turn_start_and_collect(
+        &mut self,
+        thread_id: &str,
+        prompt: &str,
+        model: &str,
+    ) -> Result<String, ProviderError> {
+        emit_progress(ProviderProgress::Stage {
+            label: "turn/start".into(),
+        });
+        let mut params = json!({
+            "threadId": thread_id,
+            "input": [{"type": "text", "text": prompt}],
+            "approvalPolicy": "never",
+        });
+        if !model.is_empty() {
+            params["model"] = json!(model);
+        }
+        let _start_result = self.call("turn/start", params).await?;
+        self.drain_until_turn_completed(thread_id).await
     }
 
     async fn call(&mut self, method: &str, params: Value) -> Result<Value, ProviderError> {
@@ -190,50 +379,251 @@ impl<T: AppServerTransport> CodexAppServerClient<T> {
                 "codex app-server: call initialize before other requests".into(),
             ));
         }
-        let id = self.next_id;
-        self.next_id += 1;
-        let request = json!({ "id": id, "method": method, "params": params });
-        let line = serde_json::to_string(&request)
-            .map_err(|e| ProviderError::Transport(format!("encode request: {e}")))?;
-        self.transport.write_line(&line).await?;
-        self.read_response_for_id(id).await
+
+        let started = Instant::now();
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            let id = self.next_id;
+            self.next_id += 1;
+            let request = json!({ "id": id, "method": method, "params": params.clone() });
+            let line = serde_json::to_string(&request)
+                .map_err(|e| ProviderError::Transport(format!("encode request: {e}")))?;
+
+            match self.transport.write_line(&line).await {
+                Ok(()) => {}
+                Err(e) => return Err(e),
+            }
+
+            match self.read_response_for_id(id).await {
+                Ok(v) => return Ok(v),
+                Err(e) if is_overload_error(&e) && attempt < OVERLOAD_MAX_ATTEMPTS => {
+                    let elapsed = started.elapsed();
+                    if elapsed >= OVERLOAD_TOTAL_CAP {
+                        return Err(e);
+                    }
+                    let base_ms = 200u64.saturating_mul(1u64 << (attempt - 1));
+                    let jitter = (id as u64).wrapping_mul(37) % 100;
+                    let delay = Duration::from_millis(base_ms + jitter);
+                    let remaining = OVERLOAD_TOTAL_CAP.saturating_sub(elapsed);
+                    tokio::time::sleep(delay.min(remaining)).await;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     async fn read_response_for_id(&mut self, id: i64) -> Result<Value, ProviderError> {
+        let started = Instant::now();
+        let mut lines = 0usize;
         loop {
-            let line = self.transport.read_line().await?;
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
+            if lines >= self.bounds.max_lines {
+                return Err(ProviderError::Transport(format!(
+                    "codex app-server: no response for id {id} within {} lines",
+                    self.bounds.max_lines
+                )));
+            }
+            if started.elapsed() >= self.bounds.timeout {
+                return Err(ProviderError::Transport(format!(
+                    "codex app-server: timed out waiting for response id {id}"
+                )));
+            }
+
+            let remaining = self.bounds.timeout.saturating_sub(started.elapsed());
+            let line = match timeout(remaining, self.transport.read_line()).await {
+                Ok(Ok(l)) => l,
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    return Err(ProviderError::Transport(format!(
+                        "codex app-server: timed out waiting for response id {id}"
+                    )));
+                }
+            };
+            lines += 1;
+
+            let msg = match parse_line(&line) {
+                Ok(v) => v,
+                Err(e) => return Err(e),
+            };
+
+            if try_handle_server_request(&mut self.transport, &msg).await?.is_some() {
                 continue;
             }
-            let msg: Value = serde_json::from_str(trimmed).map_err(|e| {
-                ProviderError::Transport(format!("codex app-server: malformed JSON line: {e}"))
-            })?;
 
-            if msg.get("method").is_some() && msg.get("id").is_none() {
-                continue;
+            if let Some(method) = msg.get("method").and_then(Value::as_str) {
+                if msg.get("id").is_none() {
+                    if let Some(params) = msg.get("params") {
+                        handle_notification(method, params);
+                    }
+                    continue;
+                }
             }
 
             if let Some(err) = msg.get("error") {
-                return Err(jsonrpc_error_to_provider(err));
+                if response_id_matches(&msg, id) {
+                    return Err(jsonrpc_error_to_provider(err));
+                }
+                continue;
             }
 
-            if msg.get("id").and_then(Value::as_i64) == Some(id) {
-                return msg
-                    .get("result")
-                    .cloned()
-                    .ok_or_else(|| {
-                        ProviderError::Transport(format!(
-                            "codex app-server: response for id {id} missing result"
-                        ))
-                    });
+            if response_id_matches(&msg, id) {
+                return msg.get("result").cloned().ok_or_else(|| {
+                    ProviderError::Transport(format!(
+                        "codex app-server: response for id {id} missing result"
+                    ))
+                });
+            }
+        }
+    }
+
+    async fn drain_until_turn_completed(&mut self, thread_id: &str) -> Result<String, ProviderError> {
+        let started = Instant::now();
+        let mut lines = 0usize;
+        let mut text = String::new();
+
+        loop {
+            if lines >= self.bounds.max_lines {
+                return Err(ProviderError::Transport(format!(
+                    "codex app-server: turn for thread {thread_id} exceeded {} lines",
+                    self.bounds.max_lines
+                )));
+            }
+            if started.elapsed() >= self.bounds.timeout {
+                return Err(ProviderError::Transport(format!(
+                    "codex app-server: timed out waiting for turn/completed on thread {thread_id}"
+                )));
+            }
+
+            let remaining = self.bounds.timeout.saturating_sub(started.elapsed());
+            let line = match timeout(remaining, self.transport.read_line()).await {
+                Ok(Ok(l)) => l,
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    return Err(ProviderError::Transport(format!(
+                        "codex app-server: timed out waiting for turn/completed on thread {thread_id}"
+                    )));
+                }
+            };
+            lines += 1;
+
+            let msg = parse_line(&line)?;
+
+            if try_handle_server_request(&mut self.transport, &msg).await?.is_some() {
+                continue;
+            }
+
+            if let Some(method) = msg.get("method").and_then(Value::as_str) {
+                if msg.get("id").is_none() {
+                    if let Some(params) = msg.get("params") {
+                        if method == "item/agentMessage/delta" {
+                            if let Some(delta) = params.get("delta").and_then(Value::as_str) {
+                                text.push_str(delta);
+                                emit_progress(ProviderProgress::TextDelta {
+                                    text: delta.to_string(),
+                                });
+                            }
+                        } else {
+                            handle_notification(method, params);
+                        }
+                        if method == "turn/completed"
+                            && params
+                                .get("threadId")
+                                .and_then(Value::as_str)
+                                .is_some_and(|t| t == thread_id)
+                        {
+                            return Ok(text);
+                        }
+                    }
+                    continue;
+                }
             }
         }
     }
 }
 
+fn handle_notification(method: &str, params: &Value) {
+    match method {
+        "item/agentMessage/delta" => {
+            if let Some(delta) = params.get("delta").and_then(Value::as_str) {
+                emit_progress(ProviderProgress::TextDelta {
+                    text: delta.to_string(),
+                });
+            }
+        }
+        "error" | "thread/error" => {
+            let message = params
+                .get("message")
+                .or_else(|| params.get("error"))
+                .and_then(Value::as_str)
+                .unwrap_or("app-server error");
+            emit_progress(ProviderProgress::Error {
+                message: message.to_string(),
+            });
+        }
+        _ => {}
+    }
+}
+
+async fn try_handle_server_request<T: AppServerTransport>(
+    transport: &mut T,
+    msg: &Value,
+) -> Result<Option<()>, ProviderError> {
+    let Some(req_id) = msg.get("id") else {
+        return Ok(None);
+    };
+    let Some(method) = msg.get("method").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+
+    let response = match method {
+        "item/commandExecution/requestApproval" => {
+            json!({ "id": req_id, "result": { "decision": "acceptForSession" } })
+        }
+        "item/fileChange/requestApproval" => {
+            json!({ "id": req_id, "result": { "decision": "accept" } })
+        }
+        _ => json!({ "id": req_id, "result": {} }),
+    };
+    let line = serde_json::to_string(&response)
+        .map_err(|e| ProviderError::Transport(format!("encode server response: {e}")))?;
+    transport.write_line(&line).await?;
+    Ok(Some(()))
+}
+
+fn parse_line(line: &str) -> Result<Value, ProviderError> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Err(ProviderError::Transport(
+            "codex app-server: empty line".into(),
+        ));
+    }
+    serde_json::from_str(trimmed).map_err(|e| {
+        ProviderError::Transport(format!("codex app-server: malformed JSON line: {e}"))
+    })
+}
+
+fn response_id_matches(msg: &Value, id: i64) -> bool {
+    match msg.get("id") {
+        Some(Value::Number(n)) => n.as_i64() == Some(id),
+        Some(Value::Null) => true,
+        _ => false,
+    }
+}
+
+fn jsonrpc_error_code(error: &Value) -> Option<i64> {
+    error.get("code").and_then(Value::as_i64)
+}
+
+fn is_overload_error(err: &ProviderError) -> bool {
+    match err {
+        ProviderError::Transport(msg) => msg.contains(&JSONRPC_OVERLOAD_CODE.to_string()),
+        _ => false,
+    }
+}
+
 fn jsonrpc_error_to_provider(error: &Value) -> ProviderError {
-    let code = error.get("code").and_then(Value::as_i64).unwrap_or(0);
+    let code = jsonrpc_error_code(error).unwrap_or(0);
     let message = error
         .get("message")
         .and_then(Value::as_str)
@@ -241,6 +631,152 @@ fn jsonrpc_error_to_provider(error: &Value) -> ProviderError {
     ProviderError::Transport(format!(
         "codex app-server JSON-RPC error {code}: {message}"
     ))
+}
+
+fn thread_id_from_result(result: &Value) -> Option<String> {
+    result
+        .pointer("/thread/id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn is_thread_resume_failure(err: &ProviderError) -> bool {
+    match err {
+        ProviderError::Transport(msg) => {
+            msg.contains("thread/resume")
+                || msg.contains("not found")
+                || msg.contains("no rollout")
+        }
+        _ => false,
+    }
+}
+
+async fn spawn_shared_client(
+    guard: &mut Option<CodexAppServerClient<StdioAppServerTransport>>,
+) -> Result<(), ProviderError> {
+    let transport = StdioAppServerTransport::spawn().await?;
+    let mut client = CodexAppServerClient::new(transport);
+    client.initialize().await?;
+    *guard = Some(client);
+    Ok(())
+}
+
+async fn app_server_followup(
+    session_id: Option<&str>,
+    prompt: &str,
+    system_prompt: &str,
+    model: &str,
+) -> Result<FollowupResult, ProviderError> {
+    for attempt in 0..2u8 {
+        let mut guard = SHARED_CLIENT.lock().await;
+        if guard.is_none() {
+            spawn_shared_client(&mut guard).await?;
+        }
+
+        let Some(client) = guard.as_mut() else {
+            return Err(ProviderError::Transport(
+                "codex app-server: client unavailable".into(),
+            ));
+        };
+
+        let run = async {
+            let (thread_id, resumed) = if let Some(sid) = session_id {
+                match client.thread_resume(sid).await {
+                    Ok(()) => (sid.to_string(), true),
+                    Err(e) if is_thread_resume_failure(&e) => {
+                        let tid = client.thread_start(system_prompt, model).await?;
+                        (tid, false)
+                    }
+                    Err(e) => return Err(e),
+                }
+            } else {
+                let tid = client.thread_start(system_prompt, model).await?;
+                (tid, false)
+            };
+
+            let text = client
+                .turn_start_and_collect(&thread_id, prompt, model)
+                .await?;
+
+            Ok(FollowupResult {
+                text,
+                tokens_in: None,
+                tokens_out: None,
+                session_id: Some(thread_id),
+                resumed,
+            })
+        };
+
+        match run.await {
+            Ok(r) => return Ok(r),
+            Err(e) if attempt == 0 && is_transport_death(&e) => {
+                *guard = None;
+                drop(guard);
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    Err(ProviderError::Transport(
+        "codex app-server: failed after respawn".into(),
+    ))
+}
+
+fn is_transport_death(err: &ProviderError) -> bool {
+    matches!(
+        err,
+        ProviderError::Transport(msg)
+            if msg.contains("closed stdout") || msg.contains("child exited")
+    )
+}
+
+/// Codex via persistent app-server (followup) + subprocess (complete).
+pub struct CodexAppServerProvider {
+    exec: CodexSubprocessProvider,
+}
+
+impl CodexAppServerProvider {
+    pub fn new() -> Self {
+        Self {
+            exec: CodexSubprocessProvider,
+        }
+    }
+}
+
+impl Default for CodexAppServerProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LlmProvider for CodexAppServerProvider {
+    fn name(&self) -> &'static str {
+        "codex"
+    }
+
+    fn complete<'a>(
+        &'a self,
+        prompt: &'a str,
+        system_prompt: &'a str,
+        model: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<CompletionResult, ProviderError>> + Send + 'a>> {
+        self.exec.complete(prompt, system_prompt, model)
+    }
+
+    fn followup<'a>(
+        &'a self,
+        session_id: Option<&'a str>,
+        prompt: &'a str,
+        system_prompt: &'a str,
+        model: &'a str,
+        attachments: &'a [crate::models::Attachment],
+    ) -> Pin<Box<dyn Future<Output = Result<FollowupResult, ProviderError>> + Send + 'a>> {
+        Box::pin(async move {
+            let stamped = super::stamp_attachments_into_prompt(prompt, attachments);
+            app_server_followup(session_id, &stamped, system_prompt, model).await
+        })
+    }
 }
 
 #[cfg(test)]
@@ -260,6 +796,22 @@ mod tests {
         .to_string()
     }
 
+    fn thread_start_ok(id: i64) -> String {
+        serde_json::json!({
+            "id": id,
+            "result": {
+                "thread": { "id": "thread-abc-123" },
+                "approvalPolicy": "never",
+                "approvalsReviewer": "user",
+                "cwd": "/tmp",
+                "model": "gpt-5.5",
+                "modelProvider": "openai",
+                "sandbox": {}
+            }
+        })
+        .to_string()
+    }
+
     #[tokio::test]
     async fn fake_initialize_sets_initialized() {
         let transport = FakeAppServerTransport::new([initialize_ok_response(1)]);
@@ -270,10 +822,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fake_stub_before_initialize_fails() {
+    async fn fake_account_read_before_initialize_fails() {
         let transport = FakeAppServerTransport::new([initialize_ok_response(1)]);
         let mut client = CodexAppServerClient::new(transport);
-        let err = client.stub_request().await.unwrap_err();
+        let err = client.account_read().await.unwrap_err();
         assert!(matches!(err, ProviderError::Transport(ref m) if m.contains("initialize")));
     }
 
@@ -286,15 +838,67 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fake_overload_error_surfaces_transport() {
+    async fn fake_overload_retries_then_succeeds() {
+        let transport = FakeAppServerTransport::new([
+            serde_json::json!({
+                "id": 1,
+                "error": { "code": JSONRPC_OVERLOAD_CODE, "message": "rate limited" }
+            })
+            .to_string(),
+            serde_json::json!({
+                "id": 2,
+                "error": { "code": JSONRPC_OVERLOAD_CODE, "message": "rate limited" }
+            })
+            .to_string(),
+            initialize_ok_response(3),
+        ]);
+        let mut client = CodexAppServerClient::new(transport);
+        client.initialize().await.unwrap();
+        assert!(client.is_initialized());
+        assert_eq!(client.transport.written.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn fake_non_overload_error_not_retried() {
         let transport = FakeAppServerTransport::new([serde_json::json!({
             "id": 1,
-            "error": { "code": JSONRPC_OVERLOAD_CODE, "message": "rate limited" }
+            "error": { "code": -32600, "message": "bad request" }
         })
         .to_string()]);
         let mut client = CodexAppServerClient::new(transport);
         let err = client.initialize().await.unwrap_err();
-        assert!(matches!(err, ProviderError::Transport(ref m) if m.contains("-32001")));
+        assert!(matches!(err, ProviderError::Transport(ref m) if m.contains("-32600")));
+        assert_eq!(client.transport.written.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn fake_mismatched_error_id_is_skipped() {
+        let transport = FakeAppServerTransport::new([
+            serde_json::json!({
+                "id": 999,
+                "error": { "code": -32600, "message": "unrelated" }
+            })
+            .to_string(),
+            initialize_ok_response(1),
+        ]);
+        let mut client = CodexAppServerClient::new(transport);
+        client.initialize().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fake_bounded_read_timeout() {
+        let transport = FakeAppServerTransport::new(std::iter::repeat_n(
+            r#"{"method":"server/ready","params":{}}"#.to_string(),
+            20,
+        ));
+        let bounds = ReadBounds {
+            max_lines: 5,
+            timeout: Duration::from_millis(50),
+        };
+        let mut client = CodexAppServerClient::new(transport).with_bounds(bounds);
+        let err = client.initialize().await.unwrap_err();
+        assert!(matches!(err, ProviderError::Transport(ref m)
+            if m.contains("timed out") || m.contains("within 5 lines")));
     }
 
     #[tokio::test]
@@ -305,6 +909,44 @@ mod tests {
         ]);
         let mut client = CodexAppServerClient::new(transport);
         client.initialize().await.unwrap();
-        assert!(client.is_initialized());
+    }
+
+    #[tokio::test]
+    async fn fake_thread_start_returns_thread_id() {
+        let transport = FakeAppServerTransport::new([
+            initialize_ok_response(1),
+            thread_start_ok(2),
+        ]);
+        let mut client = CodexAppServerClient::new(transport);
+        client.initialize().await.unwrap();
+        let tid = client.thread_start("sys", "gpt-5.5").await.unwrap();
+        assert_eq!(tid, "thread-abc-123");
+    }
+
+    #[tokio::test]
+    async fn fake_delta_aggregation_until_turn_completed() {
+        let transport = FakeAppServerTransport::new([
+            initialize_ok_response(1),
+            serde_json::json!({ "id": 2, "result": { "turn": { "id": "turn-1" } } }).to_string(),
+            serde_json::json!({
+                "method": "item/agentMessage/delta",
+                "params": { "delta": "hel", "itemId": "i", "threadId": "t1", "turnId": "turn-1" }
+            }).to_string(),
+            serde_json::json!({
+                "method": "item/agentMessage/delta",
+                "params": { "delta": "lo", "itemId": "i", "threadId": "t1", "turnId": "turn-1" }
+            }).to_string(),
+            serde_json::json!({
+                "method": "turn/completed",
+                "params": { "threadId": "t1", "turn": { "id": "turn-1" } }
+            }).to_string(),
+        ]);
+        let mut client = CodexAppServerClient::new(transport);
+        client.initialize().await.unwrap();
+        let text = client
+            .turn_start_and_collect("t1", "hi", "gpt-5.5")
+            .await
+            .unwrap();
+        assert_eq!(text, "hello");
     }
 }

@@ -23,6 +23,14 @@ pub struct CompletionResult {
     pub tokens_out: Option<u32>,
 }
 
+/// Internal provider progress events (bridged to inbox `ChatEvent` in Phase 4).
+#[derive(Debug, Clone)]
+pub enum ProviderProgress {
+    Stage { label: String },
+    TextDelta { text: String },
+    Error { message: String },
+}
+
 /// Returned by `LlmProvider::followup`. Extends `CompletionResult` with
 /// session information for resumable providers (codex).
 #[derive(Debug, Clone, Default)]
@@ -99,12 +107,37 @@ pub enum ProviderError {
     SubprocessFailure(&'static str, String),
 }
 
+fn codex_transport_mode() -> CodexTransportMode {
+    let raw = env::var("CODEX_TRANSPORT").unwrap_or_default();
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "exec" => CodexTransportMode::Exec,
+        "app-server" | "app_server" => CodexTransportMode::AppServer,
+        "" => CodexTransportMode::AppServer,
+        _ => CodexTransportMode::AppServer,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexTransportMode {
+    AppServer,
+    Exec,
+}
+
 /// Return the configured LLM provider.
 pub fn get_provider() -> Result<Box<dyn LlmProvider>, ProviderError> {
     let raw = env::var("LLM_PROVIDER").unwrap_or_else(|_| "unleash".into());
     match raw.to_ascii_lowercase().as_str() {
         "unleash" => Ok(Box::new(unleash::UnleashProvider)),
-        "codex" => Ok(Box::new(codex::CodexSubprocessProvider)),
+        "codex" => {
+            if codex_transport_mode() == CodexTransportMode::Exec {
+                Ok(Box::new(codex::CodexSubprocessProvider))
+            } else if codex_app_server::probe_app_server_sync() {
+                Ok(Box::new(codex_app_server::CodexAppServerProvider::new()))
+            } else {
+                codex_app_server::log_app_server_fallback_once();
+                Ok(Box::new(codex::CodexSubprocessProvider))
+            }
+        }
         _ => Err(ProviderError::Unknown(raw)),
     }
 }
