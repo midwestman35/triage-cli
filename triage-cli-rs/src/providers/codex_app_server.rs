@@ -894,6 +894,10 @@ impl LlmProvider for CodexAppServerProvider {
         "codex"
     }
 
+    fn codex_transport(&self) -> Option<&'static str> {
+        Some("app-server")
+    }
+
     fn complete<'a>(
         &'a self,
         prompt: &'a str,

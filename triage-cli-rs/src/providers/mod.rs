@@ -1,8 +1,8 @@
 //! LLM provider abstraction. Variant selected via `LLM_PROVIDER` env var.
 //!
 //! - `unleash` (default): HTTP to Unleash gateway (`/chats`)
-//! - `codex`: subprocess to `codex exec` (new — no Python equivalent; see
-//!   `REGRESSIONS.md` R2)
+//! - `codex`: `CODEX_TRANSPORT=app-server` (persistent JSON-RPC) or `exec`
+//!   (`codex exec` subprocess for structured `complete()` and fallback)
 
 pub mod codex;
 pub mod codex_app_server;
@@ -11,6 +11,7 @@ pub mod unleash;
 use std::env;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::OnceLock;
 
 use thiserror::Error;
 
@@ -50,6 +51,12 @@ pub struct FollowupResult {
 /// concrete provider is selected at runtime from `LLM_PROVIDER`.
 pub trait LlmProvider: Send + Sync {
     fn name(&self) -> &'static str;
+
+    /// When `name()` is `codex`, the active transport (`app-server` | `exec`).
+    fn codex_transport(&self) -> Option<&'static str> {
+        None
+    }
+
     fn complete<'a>(
         &'a self,
         prompt: &'a str,
@@ -117,12 +124,29 @@ fn codex_transport_mode() -> CodexTransportMode {
     }
 }
 
-/// Active Codex transport label for session provenance (`app-server` | `exec`).
+static EFFECTIVE_CODEX_TRANSPORT: OnceLock<&'static str> = OnceLock::new();
+
+fn record_effective_codex_transport(label: &'static str) {
+    let _ = EFFECTIVE_CODEX_TRANSPORT.get_or_init(|| label);
+}
+
+/// Active Codex transport for the running provider instance, when known.
+pub fn active_codex_transport(provider: &dyn LlmProvider) -> Option<&'static str> {
+    provider
+        .codex_transport()
+        .or((provider.name() == "codex").then(|| codex_transport_label()))
+}
+
+/// Codex transport label for session provenance (`app-server` | `exec`).
+/// After `get_provider()`, reflects the provider actually selected (including
+/// exec fallback when app-server probe fails). Before that, reflects env intent.
 pub fn codex_transport_label() -> &'static str {
-    match codex_transport_mode() {
-        CodexTransportMode::Exec => "exec",
-        CodexTransportMode::AppServer => "app-server",
-    }
+    EFFECTIVE_CODEX_TRANSPORT.get().copied().unwrap_or_else(|| {
+        match codex_transport_mode() {
+            CodexTransportMode::Exec => "exec",
+            CodexTransportMode::AppServer => "app-server",
+        }
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,11 +162,14 @@ pub fn get_provider() -> Result<Box<dyn LlmProvider>, ProviderError> {
         "unleash" => Ok(Box::new(unleash::UnleashProvider)),
         "codex" => {
             if codex_transport_mode() == CodexTransportMode::Exec {
+                record_effective_codex_transport("exec");
                 Ok(Box::new(codex::CodexSubprocessProvider))
             } else if codex_app_server::probe_app_server_sync() {
+                record_effective_codex_transport("app-server");
                 Ok(Box::new(codex_app_server::CodexAppServerProvider::new()))
             } else {
                 codex_app_server::log_app_server_fallback_once();
+                record_effective_codex_transport("exec");
                 Ok(Box::new(codex::CodexSubprocessProvider))
             }
         }

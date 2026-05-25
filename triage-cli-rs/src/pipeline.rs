@@ -941,12 +941,15 @@ impl Reporter for MetricsReporter {
 /// Extracted to a const so implementation and tests stay in sync.
 const SESSION_LOST_ACTION: &str = "session_lost";
 
-/// Whether manifest transport matches the active Codex transport env.
+/// Whether manifest transport matches the active Codex transport.
 /// Missing `codex_transport` on legacy manifests is treated as aligned.
-fn codex_transport_aligns(manifest: &crate::models::SessionManifest) -> bool {
+fn codex_transport_aligns(
+    manifest: &crate::models::SessionManifest,
+    active_transport: &str,
+) -> bool {
     match manifest.codex_transport.as_deref() {
         None => true,
-        Some(recorded) => recorded == crate::providers::codex_transport_label(),
+        Some(recorded) => recorded == active_transport,
     }
 }
 
@@ -957,6 +960,7 @@ fn codex_resume_session_id(
     last_turn_session: Option<&str>,
     provider_name: &str,
     provider_is_codex: bool,
+    active_transport: &str,
 ) -> Option<String> {
     if !provider_is_codex {
         return None;
@@ -967,7 +971,7 @@ fn codex_resume_session_id(
     if m.provider != provider_name {
         return None;
     }
-    if !codex_transport_aligns(m) {
+    if !codex_transport_aligns(m, active_transport) {
         return None;
     }
     m.codex_thread_id
@@ -1059,13 +1063,17 @@ pub async fn followup_turn(
         .and_then(|t| t.session_id.clone());
     let next_turn = outcome.turns.iter().map(|t| t.turn).max().unwrap_or(0) + 1;
     let provider_is_codex = provider.name() == "codex";
+    let active_codex_transport = crate::providers::active_codex_transport(provider);
     let manifest = chat::read_session_manifest_opt(ticket_dir).ok().flatten();
-    let resume_session_id = codex_resume_session_id(
-        manifest.as_ref(),
-        last_codex_session.as_deref(),
-        provider.name(),
-        provider_is_codex,
-    );
+    let resume_session_id = active_codex_transport.and_then(|transport| {
+        codex_resume_session_id(
+            manifest.as_ref(),
+            last_codex_session.as_deref(),
+            provider.name(),
+            provider_is_codex,
+            transport,
+        )
+    });
     let had_prior_codex_context = provider_is_codex
         && codex_had_prior_context(manifest.as_ref(), last_codex_session.as_deref());
     let should_replay_context = resume_session_id.is_some()
@@ -1223,12 +1231,10 @@ pub async fn followup_turn(
 
     // Update manifest (best-effort — failure here is logged but not fatal)
     if let Ok(Some(mut m)) = chat::read_session_manifest_opt(ticket_dir) {
-        if provider_is_codex && codex_transport_aligns(&m) {
-            apply_codex_followup_manifest(
-                &mut m,
-                &result,
-                crate::providers::codex_transport_label(),
-            );
+        if provider_is_codex
+            && active_codex_transport.is_some_and(|t| codex_transport_aligns(&m, t))
+        {
+            apply_codex_followup_manifest(&mut m, &result, active_codex_transport.unwrap());
             let _ = chat::write_session_manifest(ticket_dir, &m);
         } else if result.resumed {
             // Non-codex or cross-transport: only bump resume counters.
@@ -1246,16 +1252,11 @@ pub async fn followup_turn(
             last_resumed_at: None,
             resume_count: 0,
             codex_thread_id: None,
-            codex_transport: provider_is_codex
-                .then(|| crate::providers::codex_transport_label().to_string()),
+            codex_transport: active_codex_transport.map(str::to_string),
             codex_capture_method: None,
         };
-        if provider_is_codex {
-            apply_codex_followup_manifest(
-                &mut m,
-                &result,
-                crate::providers::codex_transport_label(),
-            );
+        if let Some(transport) = active_codex_transport {
+            apply_codex_followup_manifest(&mut m, &result, transport);
         }
         let _ = chat::write_session_manifest(ticket_dir, &m);
     }
@@ -2780,7 +2781,13 @@ mod tests {
     fn codex_resume_session_id_prefers_manifest_thread_when_aligned() {
         let transport = crate::providers::codex_transport_label();
         let m = sample_manifest(transport, Some("manifest-thread"));
-        let sid = codex_resume_session_id(Some(&m), Some("turn-thread"), "codex", true);
+        let sid = codex_resume_session_id(
+            Some(&m),
+            Some("turn-thread"),
+            "codex",
+            true,
+            transport,
+        );
         assert_eq!(sid.as_deref(), Some("manifest-thread"));
     }
 
@@ -2793,7 +2800,14 @@ mod tests {
             "exec"
         };
         let m = sample_manifest(other, Some("stale-thread"));
-        assert!(codex_resume_session_id(Some(&m), Some("turn-thread"), "codex", true).is_none());
+        assert!(codex_resume_session_id(
+            Some(&m),
+            Some("turn-thread"),
+            "codex",
+            true,
+            active,
+        )
+        .is_none());
     }
 
     #[test]

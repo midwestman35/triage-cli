@@ -2542,8 +2542,8 @@ async fn send_analyst_turn_with_progress(
 
     let model = std::env::var("CODEX_MODEL")
         .unwrap_or_else(|_| crate::providers::codex::DEFAULT_CODEX_MODEL.to_string());
-    let bridge_app_server = provider.name() == "codex"
-        && crate::providers::codex_transport_label() == "app-server";
+    let bridge_app_server =
+        crate::providers::active_codex_transport(provider) == Some("app-server");
     let turn_instant = std::time::Instant::now();
     let _ = tx.send(chat::ChatEvent::Phase {
         ts: chrono::Utc::now(),
