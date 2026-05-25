@@ -75,6 +75,10 @@ async fn poll_iteration_with(
     let mut new_state = state;
 
     for tid in &view_ids {
+        if in_flight_triages.contains(tid) {
+            continue;
+        }
+
         let ticket = match zd.get_ticket(*tid).await {
             Ok(t) => t,
             Err(e) => {
@@ -93,9 +97,6 @@ async fn poll_iteration_with(
                 .triaged
                 .entry(key.clone())
                 .or_insert_with(|| updated.to_rfc3339());
-            continue;
-        }
-        if in_flight_triages.contains(tid) {
             continue;
         }
 
@@ -324,6 +325,7 @@ mod tests {
     struct StubZendesk {
         ticket: Ticket,
         view_ids: Vec<u64>,
+        fail_get_ticket: bool,
     }
 
     impl ZendeskSource for StubZendesk {
@@ -332,7 +334,11 @@ mod tests {
             ticket_id: u64,
         ) -> Pin<Box<dyn Future<Output = Result<Ticket, ZendeskError>> + Send + 'a>> {
             let ticket = self.ticket.clone();
+            let fail_get_ticket = self.fail_get_ticket;
             Box::pin(async move {
+                if fail_get_ticket {
+                    return Err(ZendeskError::TicketNotFound(ticket_id));
+                }
                 if ticket.id == ticket_id {
                     Ok(ticket)
                 } else {
@@ -424,6 +430,7 @@ mod tests {
         let zd = StubZendesk {
             ticket: ticket.clone(),
             view_ids: vec![ticket.id],
+            fail_get_ticket: false,
         };
         let state = State {
             version: 1,
@@ -472,5 +479,51 @@ mod tests {
                 ref error,
             } if error == "pipeline boom"
         ));
+    }
+
+    #[tokio::test]
+    async fn poll_iteration_skips_in_flight_before_fetching_ticket() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_file = tmp.path().join("watcher-state.json");
+        let updated_at = DateTime::parse_from_rfc3339("2026-05-25T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let ticket = sample_ticket(44, updated_at);
+        let zd = StubZendesk {
+            ticket: ticket.clone(),
+            view_ids: vec![ticket.id],
+            fail_get_ticket: true,
+        };
+        let state = State {
+            version: 1,
+            triaged: BTreeMap::new(),
+        };
+        let opts = sample_watcher_opts(&state_file);
+        let backfill_cutoff = updated_at - chrono::Duration::hours(1);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let runner: InboxPipelineRunner =
+            Arc::new(|_, _, _, _| Box::pin(async { panic!("in-flight ticket should not run") }));
+
+        let (new_state, view_ids) = poll_iteration_with(
+            &zd,
+            state,
+            opts,
+            backfill_cutoff,
+            &HashSet::from([ticket.id]),
+            tx,
+            runner,
+        )
+        .await
+        .expect("poll iteration should still succeed");
+
+        assert_eq!(view_ids, HashSet::from([ticket.id]));
+        assert!(
+            !new_state.triaged.contains_key("44"),
+            "in-flight tickets should not be marked handled by a later poll"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "in-flight skip should not emit a fetch-level TriageFailed"
+        );
     }
 }
