@@ -11,7 +11,7 @@ fn triage_cli_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("target")
         .join("release")
-        .join("triage-cli")
+        .join(format!("triage-cli{}", std::env::consts::EXE_SUFFIX))
 }
 
 fn env_with_home(home_dir: &Path) -> HashMap<String, String> {
@@ -142,6 +142,114 @@ fn runbook_02_cli_triage_fixture() {
     assert!(
         stdout.contains("Fork") || stdout.contains("fork"),
         "stdout must contain fork letter info:\n{stdout}"
+    );
+}
+
+#[test]
+fn runbook_02_cli_triage_fixture_isolated_home_preserves_datadog_metrics() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let fixture_path = triage_cli::fixture::resolve_named("audio-drop");
+    let metrics_path = home.path().join("triage-metrics.json");
+
+    let output = Command::new(triage_cli_bin())
+        .args([
+            "triage",
+            "55001",
+            "--fixture",
+            fixture_path.to_str().unwrap(),
+            "--no-llm",
+            "--force",
+            "--metrics-out",
+            metrics_path.to_str().unwrap(),
+        ])
+        .envs(env_with_home(home.path()))
+        .output()
+        .expect("triage-cli triage must spawn");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "triage fixture must exit 0 with an empty isolated TRIAGE_HOME\nstderr: {stderr}"
+    );
+    assert!(
+        metrics_path.exists(),
+        "triage fixture must write --metrics-out JSON under an isolated TRIAGE_HOME"
+    );
+
+    let metrics: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&metrics_path).expect("read metrics.json"))
+            .expect("parse metrics.json");
+    let datadog_lines = metrics
+        .get("evidence_counts")
+        .and_then(|counts| counts.get("datadog_lines"))
+        .and_then(serde_json::Value::as_i64);
+    assert_eq!(
+        datadog_lines,
+        Some(8),
+        "fixture triage under an empty isolated TRIAGE_HOME must preserve all canned Datadog lines; metrics={metrics}"
+    );
+}
+
+#[test]
+fn runbook_02_cli_investigate_fixture_without_zendesk_env() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let data_dir = home.path().join("data");
+    std::fs::create_dir_all(&data_dir).expect("create data dir");
+
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+    let inventory = repo_root.join("apex-cnc-inventory.md");
+    if !inventory.exists() {
+        eprintln!("skipping: apex-cnc-inventory.md not found");
+        return;
+    }
+    std::fs::copy(&inventory, home.path().join("apex-cnc-inventory.md")).expect("copy inventory");
+
+    let mut env = env_with_home(home.path());
+
+    let build_output = Command::new(triage_cli_bin())
+        .args(["build-map"])
+        .envs(&env)
+        .output()
+        .expect("triage-cli build-map must spawn");
+    assert!(build_output.status.success(), "build-map must succeed");
+
+    let fixture_path = triage_cli::fixture::resolve_named("audio-drop");
+    env.insert(
+        "TRIAGE_FIXTURES_DIR".into(),
+        fixture_path.parent().unwrap().to_str().unwrap().into(),
+    );
+
+    let output = Command::new(triage_cli_bin())
+        .args([
+            "investigate",
+            "--fixture",
+            fixture_path.to_str().unwrap(),
+            "--no-llm",
+            "--force",
+        ])
+        .envs(&env)
+        .env_remove("ZENDESK_SUBDOMAIN")
+        .env_remove("ZENDESK_EMAIL")
+        .env_remove("ZENDESK_API_TOKEN")
+        .output()
+        .expect("triage-cli investigate must spawn");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "investigate fixture mode must exit 0 without Zendesk env\nstderr: {stderr}"
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Fork") || stdout.contains("fork"),
+        "stdout must contain fork letter info:\n{stdout}"
+    );
+
+    let ticket_dir = home.path().join("Tickets").join("55001");
+    assert!(
+        ticket_dir.join("STATE.md").exists(),
+        "fixture investigate must write STATE.md under TRIAGE_TICKETS_ROOT"
     );
 }
 

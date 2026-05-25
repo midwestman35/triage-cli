@@ -178,6 +178,11 @@ pub struct InvestigateOptions {
     /// under `p` regardless of the env var. /revise uses this to write under
     /// the existing ticket_dir's parent without mutating process-global env.
     pub tickets_root: Option<std::path::PathBuf>,
+    /// Fixture/demo mode only: if canned Datadog evidence was injected but the
+    /// isolated `TRIAGE_HOME` has no site map, still fetch the fixture logs
+    /// without requiring site resolution. Production runs keep the stricter
+    /// site-map gate by leaving this at `false`.
+    pub allow_unscoped_fixture_logs: bool,
 }
 
 impl InvestigateOptions {
@@ -198,6 +203,7 @@ impl InvestigateOptions {
             memory_hits_override: None,
             followup_mode: false,
             tickets_root: None,
+            allow_unscoped_fixture_logs: false,
         }
     }
 }
@@ -302,6 +308,7 @@ pub async fn investigate_one_structured(
     if let Some(dd) = dd_client {
         let sites_path_buf = crate::paths::triage_home().join("data/cnc-map.json");
         let sites_path = sites_path_buf.as_path();
+        let mut fetched_logs = false;
         if sites_path.exists() {
             match extract::load_site_map(sites_path) {
                 Ok(sites) => {
@@ -314,23 +321,24 @@ pub async fn investigate_one_structured(
                     )
                     .await?;
                     if let Some(entry) = resolved {
-                        let extracted_dt = if opts.anchor_override.is_none() {
-                            llm::extract_anchor(&ticket, None).await.unwrap_or(None)
-                        } else {
-                            None
-                        };
-                        let (anchor_dt, _src) =
-                            extract::resolve_anchor(&ticket, opts.anchor_override, extracted_dt);
-                        let (start, end) = extract::build_window(anchor_dt, opts.window_minutes)?;
                         let (logs, truncated) =
-                            dd.get_logs(&entry.site_name, &levels, start, end).await?;
+                            fetch_datadog_logs(dd, &ticket, &levels, &entry.site_name, opts)
+                                .await?;
                         log_lines = logs;
                         log_truncated = truncated;
                         site_entry = Some(entry);
+                        fetched_logs = true;
                     }
                 }
                 Err(e) => reporter.phase_failed("enrichment", &e.to_string()),
             }
+        }
+        if !fetched_logs && opts.allow_unscoped_fixture_logs {
+            let fallback_site = opts.site_override.as_deref().unwrap_or("fixture");
+            let (logs, truncated) =
+                fetch_datadog_logs(dd, &ticket, &levels, fallback_site, opts).await?;
+            log_lines = logs;
+            log_truncated = truncated;
         }
         reporter.phase_done("enrichment", &format!("{} log line(s)", log_lines.len()));
     } else {
@@ -759,6 +767,25 @@ pub async fn resolve_site(
     };
     let (entry2, _) = extract::lookup_site(ticket, sites, None, Some(&name))?;
     Ok((entry2, SiteStrategy::SiteSubstring))
+}
+
+async fn fetch_datadog_logs(
+    dd: &dyn DatadogSource,
+    ticket: &Ticket,
+    levels: &[String],
+    site_name: &str,
+    opts: &InvestigateOptions,
+) -> Result<(Vec<LogLine>, bool), PipelineError> {
+    let extracted_dt = if opts.anchor_override.is_none() {
+        llm::extract_anchor(ticket, None).await.unwrap_or(None)
+    } else {
+        None
+    };
+    let (anchor_dt, _src) = extract::resolve_anchor(ticket, opts.anchor_override, extracted_dt);
+    let (start, end) = extract::build_window(anchor_dt, opts.window_minutes)?;
+    dd.get_logs(site_name, levels, start, end)
+        .await
+        .map_err(PipelineError::from)
 }
 
 /// Reporter that forwards each phase as an async message to a TUI consumer.
@@ -1424,7 +1451,41 @@ pub async fn revise(
 mod tests {
     use super::*;
     use crate::fixture::{FixtureDatadogClient, FixtureLoader};
+    use crate::paths::TRIAGE_HOME_ENV;
     use crate::playbook::Rubric;
+
+    struct FixtureEnvScope {
+        _memory: crate::memory::MemoryEnvScope,
+        prev_home: Option<String>,
+    }
+
+    impl FixtureEnvScope {
+        fn new(home: &std::path::Path, tickets_root: &std::path::Path) -> Self {
+            std::fs::create_dir_all(home.join("data")).expect("fixture test home data dir");
+            let memory_md = home.join("MEMORY.md");
+            let memory_db = home.join("data/memory.db");
+            let memory = crate::memory::MemoryEnvScope::new_with_tickets_root(
+                &memory_md,
+                &memory_db,
+                Some(tickets_root),
+            );
+            let prev_home = std::env::var(TRIAGE_HOME_ENV).ok();
+            std::env::set_var(TRIAGE_HOME_ENV, home);
+            Self {
+                _memory: memory,
+                prev_home,
+            }
+        }
+    }
+
+    impl Drop for FixtureEnvScope {
+        fn drop(&mut self) {
+            match &self.prev_home {
+                Some(value) => std::env::set_var(TRIAGE_HOME_ENV, value),
+                None => std::env::remove_var(TRIAGE_HOME_ENV),
+            }
+        }
+    }
 
     /// Run the pipeline against the audio-drop fixture (ticket #55001) using
     /// `no_llm: true` so no network calls are made. Returns the pipeline result.
@@ -1515,6 +1576,65 @@ mod tests {
         let bem = crate::chat::read_base_evidence_manifest(&ticket_dir)
             .expect("base-evidence-manifest.json must round-trip");
         let _ = bem.ticket_id; // round-trip asserted by successful read
+    }
+
+    #[tokio::test]
+    async fn fixture_datadog_logs_survive_isolated_triage_home() {
+        let home = tempfile::tempdir().unwrap();
+        let tickets_root = home.path().join("Tickets");
+        std::fs::create_dir_all(&tickets_root).unwrap();
+        let _env = FixtureEnvScope::new(home.path(), &tickets_root);
+
+        let fixtures_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let loader = FixtureLoader::new(fixtures_dir.join("audio-drop"))
+            .expect("audio-drop fixture must exist");
+        let ticket = loader.load_ticket().expect("fixture ticket.json");
+        let logs = loader
+            .load_datadog_logs()
+            .expect("fixture datadog-logs.json");
+        let memory_hits = loader.load_memory_hits().expect("fixture memory-hits.json");
+
+        let mut session = crate::investigation::create_session(ticket.clone());
+        let fixture_dd = FixtureDatadogClient::new(logs);
+        let opts = InvestigateOptions {
+            no_llm: true,
+            memory_hits_override: Some(memory_hits),
+            force: true,
+            followup_mode: false,
+            allow_unscoped_fixture_logs: true,
+            ..InvestigateOptions::defaults()
+        };
+        let rubric = Rubric::load().expect("embedded rubric must parse");
+        let reporter = MetricsReporter::new(Box::new(SilentReporter));
+
+        let outcome = investigate_one_structured(
+            ticket,
+            &mut session,
+            None,
+            Some(&fixture_dd as &dyn crate::datadog::DatadogSource),
+            &rubric,
+            &reporter,
+            &opts,
+        )
+        .await;
+        assert!(
+            outcome.is_ok(),
+            "fixture pipeline failed: {:?}",
+            outcome.err()
+        );
+
+        let datadog_lines = reporter
+            .named_metrics()
+            .into_iter()
+            .find_map(|(key, value)| match (key.as_str(), value) {
+                ("evidence.datadog_lines", MetricValue::Int(lines)) => Some(lines),
+                _ => None,
+            })
+            .expect("datadog metric should be recorded");
+        assert_eq!(
+            datadog_lines, 8,
+            "fixture logs should survive isolated TRIAGE_HOME runs"
+        );
     }
 
     #[tokio::test]
