@@ -2,7 +2,7 @@
 
 ## Summary
 
-v1 ([`2026-05-25-codex-app-server-transition.md`](./2026-05-25-codex-app-server-transition.md), [ADR 0004](../adr/0004-codex-app-server-transport.md)) moved **inbox `followup`** onto a persistent stdio app-server client. Four items were explicitly deferred. This plan sequences them so structured-output parity lands before routing `complete()` through app-server, and so **server-side cancel** is real before inbox copy claims “Esc to cancel.”
+v1 ([`2026-05-25-codex-app-server-transition.md`](./2026-05-25-codex-app-server-transition.md), [ADR 0004](../../adr/0004-codex-app-server-transport.md)) moved **inbox `followup`** onto a persistent stdio app-server client. Four items were explicitly deferred. This plan sequences them so structured-output parity lands before routing `complete()` through app-server, and so **server-side cancel** is real before inbox copy claims “Esc to cancel.”
 
 **Prerequisite:** v1 merged (PR #48 or equivalent): `CodexAppServerProvider`, `AppServerTransport`, `thread/start` + `turn/start` follow-up path, manifest `codex_thread_id` / `codex_transport`, async setup/doctor.
 
@@ -39,12 +39,11 @@ flowchart TD
   A --> B
   C --> B
   A -.->|shared turn_start plumbing| C
-  D -->|optional for remote daemons| B
 ```
 
-**Recommended order:** Track 1 → Track 3 (partial overlap with 1) → Track 2 → Track 4 (parallel once transport trait is stable).
+**Recommended order:** Track 1 → Track 3 (partial overlap with 1) → Track 2. Track 4 is a post-core optional task and must not gate Tracks 1–3.
 
-Track 4 is **not** required for Tracks 1–3; it enables remote/long-lived daemons and drops subprocess stdio coupling.
+Track 4 is **not** required for Tracks 1–3; it enables remote/long-lived daemons and drops subprocess stdio coupling. Upstream currently marks WebSocket app-server transport experimental / unsupported, so it must remain opt-in and off the critical path.
 
 ---
 
@@ -66,17 +65,21 @@ Prove app-server can produce validator-grade JSON at least as reliably as exec, 
    - Version tag in schema `description` or `$id` string for debugging (`triage-cli/structured-triage/v1`).
 
 2. **Turn API extension** — extend `CodexAppServerClient`:
-   - `turn_start_structured(thread_id, input, model, output_schema: Value) -> TurnHandle` where `TurnHandle` holds `{ thread_id, turn_id }`.
-   - Parse **`turn/started`** notification (or synchronous `turn/start` result if present) for `turn.id` — required for interrupt (Track 3).
+   - `turn_start_collect(thread_id, input, model, output_schema: Option<Value>) -> TurnOutput` where `TurnOutput` holds `{ thread_id, turn_id, text, tokens_in, tokens_out, status }`.
+   - `turn/start` returns the initial turn object in the synchronous response on Codex CLI 0.133.0; use that as the primary source for `turn.id`, and also tolerate / reconcile the later `turn/started` notification.
    - On `turn/completed`, collect final assistant text from:
      - **Preferred:** structured item payload if app-server emits JSON in `item/completed` for schema-constrained turns (verify against live CLI).
      - **Fallback:** aggregate `item/agentMessage/delta` then `serde_json::from_str` on full body (same as today’s exec path).
+   - Token counts are not part of the generated `TurnCompletedNotification` schema on Codex CLI 0.133.0; capture them opportunistically from `thread/tokenUsage/updated` events keyed by `(threadId, turnId)`.
 
 3. **Ephemeral threads for one-shot `complete()`** — `thread/start` with `ephemeral: true` (per upstream docs) for structured calls that do not need inbox resume:
    - Avoid polluting ticket `codex_thread_id` unless caller opts in.
    - Optional env `CODEX_STRUCTURED_EPHEMERAL=1` (default true for `complete()`).
 
-4. **Prompt shape** — keep `## System` / `## User` stamping in Rust (same as exec `complete()`); pass user block as `input: [{ type: "text", text }]`, system as `baseInstructions` on `thread/start` or `settings` on `turn/start` per whichever field Codex honors for one-shot turns (document chosen wire format in `docs/decisions/2026-05-17-codex-session-capture.md`).
+4. **Prompt shape** — keep the current semantic split but do **not** double-stamp:
+   - Exec path continues to combine into `## System` / `## User` because `codex exec` accepts one prompt argument.
+   - App-server path sends `system_prompt` as `baseInstructions` on `thread/start` and the user prompt as `input: [{ type: "text", text }]` on `turn/start`.
+   - Document the chosen app-server wire format in `triage-cli-rs/docs/decisions/2026-05-17-codex-session-capture.md`.
 
 5. **Parity harness** — new test binary or module `tests/codex_structured_parity.rs` (gated `CODEX_AVAILABLE=1`):
    - Fixed minimal bundle fixture + rubric slice.
@@ -106,13 +109,19 @@ When `CODEX_TRANSPORT=app-server` and structured parity gate passes, `CodexAppSe
 
 ### Design
 
-1. **Implement `complete()` on app-server** — replace delegation to `self.exec`:
-   - Call Track 1 `complete_via_app_server(prompt, system_prompt, model, schema)`.
-   - Map result to `CompletionResult` (tokens if `turn/completed` exposes usage — populate when present).
-   - On structured parse failure at provider layer: return `ProviderError::Transport` with truncated body (caller `triage_structured` still owns retry).
+1. **Implement the provider API without hiding retry ownership**:
+   - Keep `LlmProvider::complete(prompt, system_prompt, model)` as the public trait method.
+   - Add an internal Codex app-server helper, `complete_via_app_server(prompt, system_prompt, model, output_schema: Option<Value>)`, used only by `CodexAppServerProvider`.
+   - Select the schema at the Codex provider boundary from the system prompt / call shape:
+     - structured triage prompt → `structured_triage_output_schema()`
+     - `SITE_EXTRACTION_PROMPT` → `site_output_schema()`
+     - `ANCHOR_EXTRACTION_PROMPT` → `anchor_output_schema()`
+     - unknown prompt → `None`
+   - Return the raw assistant text in `CompletionResult` even when parsing fails. `llm::triage_structured`, `extract_site`, and `extract_anchor` keep parse and retry ownership exactly as today.
+   - Populate token counts only when a matching `thread/tokenUsage/updated` notification was observed; otherwise keep `None`.
 
 2. **Env / feature flag** — `CODEX_COMPLETE_TRANSPORT=app-server|exec|auto`:
-   - `auto` (default after parity): app-server when probe + parity self-check pass; else exec.
+   - `auto` defaults to **exec** until the parity harness has a checked-in passing evidence note; after that, auto may prefer app-server when probe passes.
    - v1 behavior preserved when `CODEX_COMPLETE_TRANSPORT=exec` or global `CODEX_TRANSPORT=exec`.
 
 3. **Session provenance for initial triage** — when structured `complete()` creates a resumable thread (non-ephemeral):
@@ -155,13 +164,18 @@ Esc / Ctrl-C during an in-flight app-server follow-up calls `turn/interrupt` wit
 
 ### Design
 
-1. **Turn lifecycle state** — `CodexAppServerClient` or session-local `ActiveTurn { thread_id, turn_id }`:
-   - Set on `turn/started` (notification) or from `turn/start` result.
+1. **Turn lifecycle state** — track `ActiveTurn { thread_id, turn_id }` in the app-server runtime:
+   - Set from the synchronous `turn/start` result first; reconcile with `turn/started` if both appear.
    - Clear on `turn/completed` (any terminal status).
 
-2. **RPC** — `turn_interrupt(thread_id, turn_id) -> Result<(), ProviderError>`:
+2. **RPC and concurrency model** — `turn_interrupt(thread_id, turn_id) -> Result<(), ProviderError>`:
    - JSON-RPC `turn/interrupt` per upstream.
    - After call, drain until `turn/completed` for that `turn_id` (bounded timeout, e.g. 30s).
+   - The current implementation holds the shared client mutex while draining a turn, so a UI-side cancel cannot write `turn/interrupt` over the same transport. Fix this before inbox wiring by moving the singleton to an actor-style runtime:
+     - One owned task holds `CodexAppServerClient` and receives commands over `mpsc` (`FollowupTurn`, `CompleteTurn`, `InterruptActiveTurn`, `Shutdown`).
+     - The actor is the only code that reads/writes the transport, so interrupt commands are serialized safely while the actor is waiting for notifications.
+     - `InterruptActiveTurn` returns after the matching `turn/completed status=interrupted` or a bounded timeout.
+   - A smaller stopgap is acceptable only for tests/spike code: pass a cancellation receiver into `drain_until_turn_completed` and send `turn/interrupt` from inside that same drain loop. Do not wire UI copy to server-side cancel until one of these safe transport-ownership models exists.
 
 3. **Cancellation token wiring** — inbox / pipeline:
    - Pass `tokio::sync::watch` or `CancellationToken` into `followup_turn` / `app_server_followup`.
@@ -199,7 +213,7 @@ Stdio coupling requires spawning `codex app-server` as a child and newline-frami
 
 ### Goal
 
-Pluggable `AppServerTransport` with `WsAppServerTransport` behind env `CODEX_APP_SERVER_LISTEN` (or dedicated `CODEX_APP_SERVER_URL`), defaulting to stdio for local CLI.
+Post-core, opt-in pluggable `AppServerTransport` with `WsAppServerTransport` behind env `CODEX_APP_SERVER_LISTEN` (or dedicated `CODEX_APP_SERVER_URL`), defaulting to stdio for local CLI. This is not required for structured `complete()` or interrupt.
 
 ### Design
 
@@ -207,7 +221,7 @@ Pluggable `AppServerTransport` with `WsAppServerTransport` behind env `CODEX_APP
    - `stdio://` → existing `StdioAppServerTransport`.
    - `ws://127.0.0.1:PORT` / `wss://...` → `WsAppServerTransport` using `tokio-tungstenite` (new dependency) or `reqwest` websocket if already in tree — **prefer minimal dep**.
 
-2. **Framing** — app-server speaks JSON-RPC messages over the socket (confirm: one WebSocket text frame per message vs NDJSON — **spike in Phase 0** against `codex app-server --listen ws://127.0.0.1:0`).
+2. **Framing** — upstream documents one JSON-RPC message per WebSocket text frame. Still run a small spike before implementation because the transport is experimental / unsupported.
 
 3. **Lifecycle** — no child process for WS mode when connecting to external server; `doctor` checks TCP connect + `initialize` instead of subcommand spawn.
 
@@ -248,8 +262,8 @@ Pluggable `AppServerTransport` with `WsAppServerTransport` behind env `CODEX_APP
 | 2 | 1 | Parity harness exec vs app-server (`CODEX_AVAILABLE=1`) | Phase 1 |
 | 3 | 3 | `turn_id` tracking + `turn/interrupt` + inbox wiring | v1 client |
 | 4 | 2 | `complete()` on app-server behind `CODEX_COMPLETE_TRANSPORT` | Phase 2 gate + Phase 3 recommended |
-| 5 | 4 | WebSocket transport + doctor/setup | Phase 1 client stable |
-| 6 | — | Docs, ADR 0005, runbooks, `.env.example` | Phases 1–5 |
+| 5 | — | Docs, ADR 0005, runbooks, `.env.example` | Phases 1–4 |
+| 6 | 4 | Optional WebSocket transport + doctor/setup | Core v2 complete; explicit opt-in |
 
 **Regression gates (every phase):**
 
@@ -303,9 +317,11 @@ CODEX_AVAILABLE=1 cargo test --test codex_structured_parity -- --nocapture
 | Risk | Mitigation |
 | --- | --- |
 | `outputSchema` stricter than prompt-only JSON → more retries | Keep exec fallback; monitor `triage_structured` retry rate |
-| `turn_id` only in notifications, race with fast completion | Buffer notifications per thread; sync test with fake ordering |
+| Provider-level parsing bypasses `llm.rs` retry | Provider must return raw text; parsing and retry remain in `llm.rs` |
+| `turn_id` notification races with fast completion | Use synchronous `turn/start` response as primary turn id; reconcile notifications |
+| Interrupt RPC contends with the turn drain mutex | Use actor ownership or in-drain cancellation before UI exposes real interrupt |
 | Interrupt succeeds but partial text already streamed | UI keeps draft until `Cancelled`; do not persist partial provider turn |
-| WebSocket framing differs from stdio NDJSON | Phase 0 spike before Phase 5; do not assume NDJSON on WS |
+| WebSocket is experimental / unsupported upstream | Keep Track 4 post-core, opt-in, and non-blocking for v2 success |
 | Mixed transport tickets (exec investigate + app-server chat) | No change to v1 mismatch rules; Option A avoids shared thread |
 
 ---
@@ -332,6 +348,6 @@ CODEX_AVAILABLE=1 cargo test --test codex_structured_parity -- --nocapture
 ## Related documents
 
 - v1 plan: [`2026-05-25-codex-app-server-transition.md`](./2026-05-25-codex-app-server-transition.md)
-- ADR 0004: [`../adr/0004-codex-app-server-transport.md`](../adr/0004-codex-app-server-transport.md)
-- Session capture: [`../../triage-cli-rs/docs/decisions/2026-05-17-codex-session-capture.md`](../../triage-cli-rs/docs/decisions/2026-05-17-codex-session-capture.md)
+- ADR 0004: [`../../adr/0004-codex-app-server-transport.md`](../../adr/0004-codex-app-server-transport.md)
+- Session capture: [`../../../triage-cli-rs/docs/decisions/2026-05-17-codex-session-capture.md`](../../../triage-cli-rs/docs/decisions/2026-05-17-codex-session-capture.md)
 - Inbox progress: [`2026-05-20-inbox-chat-revamp.md`](./2026-05-20-inbox-chat-revamp.md)

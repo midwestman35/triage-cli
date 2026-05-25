@@ -67,7 +67,7 @@ step yourself.
    - `ZENDESK_SUBDOMAIN`, `ZENDESK_EMAIL`, `ZENDESK_API_TOKEN` — generate the API token in Zendesk Admin Center under Apps and integrations -> Zendesk API. Do **not** append `/token` to the email; the client does that.
    - `LLM_PROVIDER` — `unleash` (default, HTTP to the internal Axon gateway) or `codex` (local Codex CLI). These are the only accepted values as of 2026-05-14; see `docs/adr/0002-prune-claude-openai-providers.md`.
      - For `unleash`: set `UNLEASH_API_KEY` and `UNLEASH_ASSISTANT_ID`. The model is chosen server-side by the assistant.
-     - For `codex`: ensure `codex` is on `PATH`. Set `CODEX_TRANSPORT=app-server` (default) or `exec` (subprocess-only / CI). Optionally set `CODEX_MODEL` (default `gpt-5.5`). Run `triage-cli setup` to probe transport and complete device-code auth — see `docs/adr/0004-codex-app-server-transport.md`.
+     - For `codex`: ensure `codex` is on `PATH`. Set `CODEX_TRANSPORT=app-server` for inbox app-server or `exec` for subprocess-only / CI. Set `CODEX_COMPLETE_TRANSPORT=auto` unless you are deliberately forcing `exec` or app-server structured parity tests; `auto` currently stays on exec until parity evidence is accepted. Optionally set `CODEX_MODEL` (default `gpt-5.5`). Run `triage-cli setup` to probe transport and complete device-code auth — see `docs/adr/0004-codex-app-server-transport.md`.
    - `DD_API_KEY`, `DD_APP_KEY` — optional. Add these only if you plan to use Datadog enrichment in `triage`, `watch`, or `inbox`; Guided Investigation does not need them.
 
 5. **Build the site map** if you will use one-shot triage or watcher site resolution (turns `apex-cnc-inventory.md` into `data/cnc-map.json`):

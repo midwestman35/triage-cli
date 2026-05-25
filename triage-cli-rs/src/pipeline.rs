@@ -1032,6 +1032,32 @@ pub async fn followup_turn(
     provider: &dyn crate::providers::LlmProvider,
     reporter: Option<&dyn crate::chat::ChatPhaseReporter>,
 ) -> Result<crate::providers::FollowupResult, PipelineError> {
+    followup_turn_with_cancel(
+        ticket_dir,
+        ticket_id,
+        prompt,
+        system_prompt,
+        model,
+        attachments,
+        provider,
+        reporter,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn followup_turn_with_cancel(
+    ticket_dir: &std::path::Path,
+    ticket_id: &str,
+    prompt: &str,
+    system_prompt: &str,
+    model: &str,
+    attachments: &[crate::models::Attachment],
+    provider: &dyn crate::providers::LlmProvider,
+    reporter: Option<&dyn crate::chat::ChatPhaseReporter>,
+    cancel_rx: Option<tokio::sync::watch::Receiver<Option<crate::providers::FollowupCancel>>>,
+) -> Result<crate::providers::FollowupResult, PipelineError> {
     use crate::chat;
     use std::time::Duration;
 
@@ -1076,8 +1102,8 @@ pub async fn followup_turn(
     });
     let had_prior_codex_context = provider_is_codex
         && codex_had_prior_context(manifest.as_ref(), last_codex_session.as_deref());
-    let should_replay_context = resume_session_id.is_some()
-        || (had_prior_codex_context && resume_session_id.is_none());
+    let should_replay_context =
+        resume_session_id.is_some() || (had_prior_codex_context && resume_session_id.is_none());
 
     // Apply PII redaction at the LLM boundary (spec § 7.1g, § 9.3).
     // The redactor scrubs caller PII (phones, addresses, GPS coords);
@@ -1142,12 +1168,13 @@ pub async fn followup_turn(
     }
     let started = std::time::Instant::now();
     let result = provider
-        .followup(
+        .followup_with_cancel(
             resume_session_id.as_deref(),
             &redacted_prompt,
             &combined_system_prompt,
             model,
             attachments,
+            cancel_rx,
         )
         .await
         .map_err(FollowupError::Provider)?;
@@ -2763,7 +2790,10 @@ mod tests {
         }
     }
 
-    fn sample_manifest(codex_transport: &str, codex_thread_id: Option<&str>) -> crate::models::SessionManifest {
+    fn sample_manifest(
+        codex_transport: &str,
+        codex_thread_id: Option<&str>,
+    ) -> crate::models::SessionManifest {
         crate::models::SessionManifest {
             version: 1,
             provider: "codex".into(),
@@ -2781,13 +2811,7 @@ mod tests {
     fn codex_resume_session_id_prefers_manifest_thread_when_aligned() {
         let transport = crate::providers::codex_transport_label();
         let m = sample_manifest(transport, Some("manifest-thread"));
-        let sid = codex_resume_session_id(
-            Some(&m),
-            Some("turn-thread"),
-            "codex",
-            true,
-            transport,
-        );
+        let sid = codex_resume_session_id(Some(&m), Some("turn-thread"), "codex", true, transport);
         assert_eq!(sid.as_deref(), Some("manifest-thread"));
     }
 
@@ -2800,14 +2824,10 @@ mod tests {
             "exec"
         };
         let m = sample_manifest(other, Some("stale-thread"));
-        assert!(codex_resume_session_id(
-            Some(&m),
-            Some("turn-thread"),
-            "codex",
-            true,
-            active,
-        )
-        .is_none());
+        assert!(
+            codex_resume_session_id(Some(&m), Some("turn-thread"), "codex", true, active,)
+                .is_none()
+        );
     }
 
     #[test]

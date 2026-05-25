@@ -954,6 +954,7 @@ fn append_draft_snippet(existing: Option<String>, delta: &str) -> Option<String>
 pub fn provider_stage_label_to_chat_stage(label: &str) -> Option<ChatStage> {
     match label {
         "turn/start" => Some(ChatStage::ProviderAwait),
+        "turn/interrupt" => Some(ChatStage::ProviderAwait),
         "thread/start" | "thread/resume" => Some(ChatStage::SessionResumeAttempt),
         _ => None,
     }
@@ -1021,7 +1022,10 @@ pub fn update_progress(prev: Option<ChatProgress>, evt: &ChatEvent) -> Option<Ch
             let draft_text = append_draft_snippet(base.draft_text, text);
             Some(ChatProgress {
                 stage: ChatStage::ProviderAwait,
-                canned_msg: canned_message(ChatStage::ProviderAwait, (base.elapsed_s / 4.0) as usize),
+                canned_msg: canned_message(
+                    ChatStage::ProviderAwait,
+                    (base.elapsed_s / 4.0) as usize,
+                ),
                 draft_text,
                 ..base
             })

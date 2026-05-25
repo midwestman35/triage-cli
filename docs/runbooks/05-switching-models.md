@@ -1,6 +1,6 @@
 # Switch the LLM provider or model
 
-> **When to use this:** you want to move `triage`/`investigate`/`watch` LLM calls between the internal Unleash gateway and Codex, pin a different codex model, or switch Codex transport (`app-server` vs `exec`).
+> **When to use this:** you want to move `triage`/`investigate`/`watch` LLM calls between the internal Unleash gateway and Codex, pin a different codex model, or switch Codex transport.
 
 `src/llm.rs` reads `LLM_PROVIDER` and dispatches through the provider trait in `src/providers/mod.rs`. As of 2026-05-14 only two provider values are accepted:
 
@@ -9,12 +9,22 @@
 | Unleash (default) | `unleash` | `UNLEASH_API_KEY`, `UNLEASH_ASSISTANT_ID`; optional `UNLEASH_BASE_URL`, `UNLEASH_ACCOUNT` | Selected server-side by the assistant ID — the CLI does not pass a model parameter. |
 | Codex CLI | `codex` | `codex` on `PATH`; `CODEX_TRANSPORT`; auth via `setup` (app-server) or `codex` OAuth (`exec`); optional `CODEX_MODEL` | `gpt-5.5` |
 
-### Codex transport (`CODEX_TRANSPORT`)
+### Codex transport
+
+`CODEX_TRANSPORT` controls inbox follow-up transport:
 
 | Value | When to use |
 | --- | --- |
-| `app-server` | Default. Inbox chat uses persistent `codex app-server`; `setup` / `doctor` use device-code auth. Structured `triage`/`investigate` still call `codex exec` in v1. |
+| `app-server` | Inbox chat uses persistent `codex app-server`; `setup` / `doctor` use device-code auth. |
 | `exec` | CI, older Codex CLI without `app-server`, or rollback. All Codex calls use subprocess; doctor skips app-server auth probes. |
+
+`CODEX_COMPLETE_TRANSPORT` controls structured `complete()` calls (`triage_structured`, anchor/site extraction):
+
+| Value | When to use |
+| --- | --- |
+| `auto` | Safe default. Currently stays on exec until app-server structured parity evidence is accepted. |
+| `exec` | CI, rollback, or exact v1 behavior. |
+| `app-server` | v2 validation only, after the app-server structured path and parity harness are in place. Uses `app_server_output_schema`; one-shot `complete()` calls use ephemeral app-server threads by default, so they do not update ticket manifests. |
 
 `setup` writes the appropriate value after probing. See `docs/adr/0004-codex-app-server-transport.md`.
 
@@ -39,6 +49,7 @@
    # Dev escape hatch — Codex CLI (app-server for inbox; setup handles auth).
    LLM_PROVIDER=codex
    CODEX_TRANSPORT=app-server
+   CODEX_COMPLETE_TRANSPORT=auto
    CODEX_MODEL=gpt-5.5   # optional; this is the default
    ```
 
@@ -46,6 +57,7 @@
    # Subprocess-only (CI or rollback).
    LLM_PROVIDER=codex
    CODEX_TRANSPORT=exec
+   CODEX_COMPLETE_TRANSPORT=exec
    CODEX_MODEL=gpt-5.5
    ```
 
@@ -86,7 +98,9 @@
 - **`codex app-server` subcommand not available** — upgrade Codex CLI or set `CODEX_TRANSPORT=exec`.
 - **`codex account not authenticated`** (doctor) — run `triage-cli setup` and complete device-code login; doctor does not start login by design.
 - **`codex exec` returns an OAuth error** — only relevant when `CODEX_TRANSPORT=exec`; run `codex` interactively to refresh OAuth, then retry.
-- **Inbox resume fails after transport change** — thread IDs from exec vs app-server are not interchangeable; see `docs/decisions/2026-05-17-codex-session-capture.md`.
+- **Inbox resume fails after transport change** — thread IDs from exec vs app-server are not interchangeable; see `triage-cli-rs/docs/decisions/2026-05-17-codex-session-capture.md`.
+- **Structured triage still uses exec** — expected with `CODEX_COMPLETE_TRANSPORT=auto` until parity evidence is accepted. Use `CODEX_COMPLETE_TRANSPORT=app-server` only for v2 validation.
+- **Esc cancels locally only** — app-server gets real `turn/interrupt` after v2 Track 3 lands. Exec cancel remains local-only unless a separate process-kill task exists.
 - **"Model not found" or 404** — typo in `CODEX_MODEL`, or the model is unavailable for the account. Cross-check with `doctor` (`model/list`) or `codex exec --model <m> "ping"` when on `exec`.
 - **Unknown `LLM_PROVIDER` value** — only `unleash` and `codex` are accepted; `doctor` will reject anything else.
 

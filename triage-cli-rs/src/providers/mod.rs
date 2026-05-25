@@ -6,6 +6,7 @@
 
 pub mod codex;
 pub mod codex_app_server;
+pub(crate) mod codex_schema;
 pub mod unleash;
 
 use std::env;
@@ -41,6 +42,12 @@ pub struct FollowupResult {
     pub tokens_out: Option<u32>,
     pub session_id: Option<String>,
     pub resumed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FollowupCancel {
+    EscKey,
+    CtrlC,
 }
 
 /// Single-turn LLM completion contract. Mirrors Python `LLMProvider.complete`.
@@ -88,6 +95,19 @@ pub trait LlmProvider: Send + Sync {
             })
         })
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn followup_with_cancel<'a>(
+        &'a self,
+        session_id: Option<&'a str>,
+        prompt: &'a str,
+        system_prompt: &'a str,
+        model: &'a str,
+        attachments: &'a [crate::models::Attachment],
+        _cancel_rx: Option<tokio::sync::watch::Receiver<Option<FollowupCancel>>>,
+    ) -> Pin<Box<dyn Future<Output = Result<FollowupResult, ProviderError>> + Send + 'a>> {
+        self.followup(session_id, prompt, system_prompt, model, attachments)
+    }
 }
 
 #[derive(Debug, Error)]
@@ -112,6 +132,8 @@ pub enum ProviderError {
     SubprocessMissing(&'static str),
     #[error("subprocess {0} failed: {1}")]
     SubprocessFailure(&'static str, String),
+    #[error("LLM provider turn interrupted")]
+    Interrupted,
 }
 
 fn codex_transport_mode() -> CodexTransportMode {
@@ -141,12 +163,13 @@ pub fn active_codex_transport(provider: &dyn LlmProvider) -> Option<&'static str
 /// After `get_provider()`, reflects the provider actually selected (including
 /// exec fallback when app-server probe fails). Before that, reflects env intent.
 pub fn codex_transport_label() -> &'static str {
-    EFFECTIVE_CODEX_TRANSPORT.get().copied().unwrap_or_else(|| {
-        match codex_transport_mode() {
+    EFFECTIVE_CODEX_TRANSPORT
+        .get()
+        .copied()
+        .unwrap_or_else(|| match codex_transport_mode() {
             CodexTransportMode::Exec => "exec",
             CodexTransportMode::AppServer => "app-server",
-        }
-    })
+        })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

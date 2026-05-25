@@ -35,15 +35,17 @@ codex account not authenticated
 
 - `LLM_PROVIDER=unleash` requires `UNLEASH_API_KEY` and `UNLEASH_ASSISTANT_ID`. The Unleash assistant picks the model server-side; the CLI does not pass a model parameter.
 - `LLM_PROVIDER=codex` requires the `codex` CLI on `PATH`.
-  - **`CODEX_TRANSPORT=app-server`** (default): run `triage-cli setup` and complete device-code login; `doctor` checks `initialize`, `account/read`, and `CODEX_MODEL` in `model/list` without starting login. Upgrade Codex CLI if `app-server` subcommand is missing.
+  - **`CODEX_TRANSPORT=app-server`**: run `triage-cli setup` and complete device-code login; `doctor` checks `initialize`, `account/read`, and `CODEX_MODEL` in `model/list` without starting login. Upgrade Codex CLI if `app-server` subcommand is missing.
   - **`CODEX_TRANSPORT=exec`**: uses subprocess OAuth (run `codex` interactively to refresh). App-server auth checks are skipped in `doctor`.
+  - **`CODEX_COMPLETE_TRANSPORT=auto`** is the safe default for structured `complete()` calls and currently remains exec until app-server parity evidence is accepted. Use `exec` for CI/rollback; use `app-server` only while validating the v2 structured path.
   - At runtime, if app-server is unavailable, the CLI falls back to `exec` once (stderr hint). Set `CODEX_TRANSPORT=exec` explicitly to silence fallback and force subprocess-only.
 - Only `unleash` and `codex` are accepted as of 2026-05-14. Any other value (`claude`, `openai`, …) is rejected by `doctor`. See `docs/adr/0002-prune-claude-openai-providers.md` for why those providers were removed. Transport details: `docs/adr/0004-codex-app-server-transport.md`.
 
 ### Codex transport / inbox resume
 
 - **Inbox follow-up fails after switching `CODEX_TRANSPORT`** — exec-captured `thread_id` values are not interchangeable with app-server threads. Check `.session/` manifest `codex_transport` and align env with the session that created the thread, or start a fresh chat turn.
-- **Structured triage still spawns `codex exec`** — v1 keeps `complete()` on the exec JSONL contract even when inbox uses app-server (`docs/decisions/2026-05-17-codex-session-capture.md`).
+- **Structured triage uses `codex exec` under `auto`** — expected while `CODEX_COMPLETE_TRANSPORT=auto` maps to exec. The v2 app-server path is gated on structured parity evidence and uses `app_server_output_schema` when enabled (`triage-cli-rs/docs/decisions/2026-05-17-codex-session-capture.md`).
+- **Esc did not stop Codex generation** — app-server can interrupt server-side only after v2 Track 3 wires `turn/interrupt`. Exec cancel is local-only unless a separate subprocess process-kill task lands.
 
 ### Codex contract tests (`CODEX_AVAILABLE`)
 
@@ -57,7 +59,7 @@ CODEX_AVAILABLE=1 cargo test --test codex_contract -- --nocapture --test-threads
 CODEX_AVAILABLE=1 cargo test --test codex_app_server_contract -- --nocapture
 ```
 
-Requires `codex` on PATH and `CODEX_AVAILABLE=1`. See `triage-cli-rs/tests/TESTING.md`. In CI without a Codex seat, set `CODEX_TRANSPORT=exec` and omit `CODEX_AVAILABLE`.
+Requires `codex` on PATH and `CODEX_AVAILABLE=1`. See `triage-cli-rs/tests/TESTING.md`. In CI without a Codex seat, set `CODEX_TRANSPORT=exec` or `CODEX_COMPLETE_TRANSPORT=exec` and omit `CODEX_AVAILABLE`.
 
 ## Site resolution
 

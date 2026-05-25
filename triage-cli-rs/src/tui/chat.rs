@@ -264,7 +264,11 @@ fn render_phase_banner(progress: &crate::chat::ChatProgress, area: Rect, buf: &m
                 Line::from(session),
             ];
             if let Some(draft) = progress.draft_text.as_deref() {
-                let snippet: String = draft.chars().rev().take(120).collect::<String>()
+                let snippet: String = draft
+                    .chars()
+                    .rev()
+                    .take(120)
+                    .collect::<String>()
                     .chars()
                     .rev()
                     .collect();

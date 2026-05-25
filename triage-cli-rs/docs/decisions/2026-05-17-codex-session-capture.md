@@ -189,20 +189,26 @@ any future migration parser that might encounter non-UUID values.
   the JSONL stream on stdout. Method A is the most insulated from
   config drift.
 
-## v1 app-server transport (2026-05-25)
+## Codex app-server transport (2026-05-25)
 
-ADR [0004](../../../docs/adr/0004-codex-app-server-transport.md) adds a second Codex path for inbox chat only.
+ADR [0004](../../../docs/adr/0004-codex-app-server-transport.md) adds a second Codex path. v1 uses it for inbox chat only; v2 adds a gated structured `complete()` path after parity evidence is accepted.
 
-| LLM call | v1 transport | Capture method |
+| LLM call | Current / v2 transport | Capture method |
 | --- | --- | --- |
-| `LlmProvider::complete` (`triage_structured`, `extract_anchor`, …) | **Always** `codex exec` subprocess | `codex_json_output` (this document) |
+| `LlmProvider::complete` (`triage_structured`, `extract_anchor`, `extract_site`, ...) | Current safe default: `codex exec`. v2 may use app-server when `CODEX_COMPLETE_TRANSPORT=app-server`, or when `auto` is later allowed by accepted parity evidence. | `codex_json_output` for exec; `app_server_output_schema` for app-server structured turns |
 | `LlmProvider::followup` (inbox) | `codex app-server` when `CODEX_TRANSPORT` is not `exec` and probe passes; else exec | `app_server_thread_id` or `codex_json_output` |
 
 **App-server capture:** JSON-RPC `thread/start` or `thread/resume` returns `thread.id`. Persisted on the provider turn as `Turn.session_id` and on `SessionManifest` as `codex_thread_id` with `codex_capture_method: app_server_thread_id` and `codex_transport: app-server`.
 
-**Env:** `CODEX_TRANSPORT=app-server|exec` (default effective mode is app-server when unset; see `providers/mod.rs`). `CODEX_TRANSPORT=exec` forces subprocess for follow-up as well and skips app-server auth checks in `doctor`.
+**Structured app-server capture:** v2 `complete()` uses `turn/start` with an `outputSchema` selected at the Codex provider boundary. Capture method label: `app_server_output_schema`. The provider returns raw assistant text to `llm.rs`; parse and retry ownership stays with the existing structured callers.
+
+**Ephemeral `complete()` threads:** one-shot structured app-server calls should use ephemeral threads by default. They do not create or mutate ticket `SessionManifest` / `codex_thread_id`; inbox follow-up starts or resumes its own conversation thread.
+
+**Env:** `CODEX_TRANSPORT=app-server|exec` controls follow-up and app-server availability. `CODEX_COMPLETE_TRANSPORT=exec|app-server|auto` controls `complete()`; `auto` currently remains exec until checked-in parity evidence is accepted. `CODEX_TRANSPORT=exec` forces subprocess for follow-up, skips app-server auth checks in `doctor`, and preserves v1 `complete()` behavior.
 
 **Do not mix IDs across transports** on one ticket — exec `thread_id` from JSONL is not assumed valid for app-server `thread/resume` when manifest `codex_transport` disagrees with the active env (replay / mismatch banners per interactive-investigation spec).
+
+**Cancel semantics:** app-server turns can interrupt server-side once v2 Track 3 wires `turn/interrupt` with active `threadId` + `turnId`. Exec cancel remains local-only unless a separate subprocess process-kill task lands.
 
 **Tests:** exec contract remains `tests/codex_contract.rs`; app-server smoke is `tests/codex_app_server_contract.rs` (both gated on `CODEX_AVAILABLE=1`).
 
