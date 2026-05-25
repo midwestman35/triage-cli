@@ -1,12 +1,46 @@
 //! Async integration tests moved from pipeline.rs #[cfg(test)] block.
 
 use triage_cli::fixture::{FixtureDatadogClient, FixtureLoader};
+use triage_cli::paths::TRIAGE_HOME_ENV;
 use triage_cli::pipeline::{
-    followup_turn, investigate_one_structured, revise, InvestigateOptions, PipelineError,
-    SilentReporter, StructuredInvestigation, SESSION_LOST_ACTION,
+    followup_turn, investigate_one_structured, revise, InvestigateOptions, MetricValue,
+    MetricsReporter, PipelineError, SilentReporter, StructuredInvestigation, SESSION_LOST_ACTION,
 };
 use triage_cli::playbook::Rubric;
 use triage_cli::ticket_folder::TicketFolderError;
+
+struct FixtureEnvScope {
+    _memory: triage_cli::memory::MemoryEnvScope,
+    prev_home: Option<String>,
+}
+
+impl FixtureEnvScope {
+    fn new(home: &std::path::Path, tickets_root: &std::path::Path) -> Self {
+        std::fs::create_dir_all(home.join("data")).expect("fixture test home data dir");
+        let memory_md = home.join("MEMORY.md");
+        let memory_db = home.join("data/memory.db");
+        let memory = triage_cli::memory::MemoryEnvScope::new_with_tickets_root(
+            &memory_md,
+            &memory_db,
+            Some(tickets_root),
+        );
+        let prev_home = std::env::var(TRIAGE_HOME_ENV).ok();
+        std::env::set_var(TRIAGE_HOME_ENV, home);
+        Self {
+            _memory: memory,
+            prev_home,
+        }
+    }
+}
+
+impl Drop for FixtureEnvScope {
+    fn drop(&mut self) {
+        match &self.prev_home {
+            Some(value) => std::env::set_var(TRIAGE_HOME_ENV, value),
+            None => std::env::remove_var(TRIAGE_HOME_ENV),
+        }
+    }
+}
 
 /// Run the pipeline against the audio-drop fixture (ticket #55001) using
 /// `no_llm: true` so no network calls are made. Returns the pipeline result.
@@ -97,6 +131,65 @@ async fn investigate_writes_base_snapshots() {
     let bem = triage_cli::chat::read_base_evidence_manifest(&ticket_dir)
         .expect("base-evidence-manifest.json must round-trip");
     let _ = bem.ticket_id; // round-trip asserted by successful read
+}
+
+#[tokio::test]
+async fn fixture_datadog_logs_survive_isolated_triage_home() {
+    let home = tempfile::tempdir().unwrap();
+    let tickets_root = home.path().join("Tickets");
+    std::fs::create_dir_all(&tickets_root).unwrap();
+    let _env = FixtureEnvScope::new(home.path(), &tickets_root);
+
+    let fixtures_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+    let loader =
+        FixtureLoader::new(fixtures_dir.join("audio-drop")).expect("audio-drop fixture must exist");
+    let ticket = loader.load_ticket().expect("fixture ticket.json");
+    let logs = loader
+        .load_datadog_logs()
+        .expect("fixture datadog-logs.json");
+    let memory_hits = loader.load_memory_hits().expect("fixture memory-hits.json");
+
+    let mut session = triage_cli::investigation::create_session(ticket.clone());
+    let fixture_dd = FixtureDatadogClient::new(logs);
+    let opts = InvestigateOptions {
+        no_llm: true,
+        memory_hits_override: Some(memory_hits),
+        force: true,
+        followup_mode: false,
+        allow_unscoped_fixture_logs: true,
+        ..InvestigateOptions::defaults()
+    };
+    let rubric = Rubric::load().expect("embedded rubric must parse");
+    let reporter = MetricsReporter::new(Box::new(SilentReporter));
+
+    let outcome = investigate_one_structured(
+        ticket,
+        &mut session,
+        None,
+        Some(&fixture_dd as &dyn triage_cli::datadog::DatadogSource),
+        &rubric,
+        &reporter,
+        &opts,
+    )
+    .await;
+    assert!(
+        outcome.is_ok(),
+        "fixture pipeline failed: {:?}",
+        outcome.err()
+    );
+
+    let datadog_lines = reporter
+        .named_metrics()
+        .into_iter()
+        .find_map(|(key, value)| match (key.as_str(), value) {
+            ("evidence.datadog_lines", MetricValue::Int(lines)) => Some(lines),
+            _ => None,
+        })
+        .expect("datadog metric should be recorded");
+    assert_eq!(
+        datadog_lines, 8,
+        "fixture logs should survive isolated TRIAGE_HOME runs"
+    );
 }
 
 #[tokio::test]

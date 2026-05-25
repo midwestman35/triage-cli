@@ -47,7 +47,14 @@ Subprocess tests that invoke the built `triage-cli` binary directly. Require `ca
 | `runbook_06_cli_watch_help` | `triage-cli watch --help` | exits 0, mentions `--view` |
 | `runbook_07_cli_inbox_help` | `triage-cli inbox --help` | exits 0, mentions `--view` |
 | `runbook_02_cli_triage_fixture` | `triage-cli triage 55001 --fixture ... --no-llm --force` | exits 0, stdout contains fork info |
+| `runbook_02_cli_triage_fixture_isolated_home_preserves_datadog_metrics` | `triage-cli triage 55001 --fixture ... --no-llm --force --metrics-out ...` | runs under an empty isolated `TRIAGE_HOME`, skips `build-map`, metrics JSON reports `evidence_counts.datadog_lines == 8` |
 | `runbook_03_cli_build_map` | `triage-cli build-map` | exits 0, mentions `cnc-map.json` |
+
+Fixture CLI smoke tests intentionally isolate `TRIAGE_HOME` to a fresh tempdir.
+The `runbook_02_cli_triage_fixture_isolated_home_preserves_datadog_metrics`
+case does not copy `apex-cnc-inventory.md`, does not run `build-map`, and uses
+`--metrics-out` JSON inspection to catch regressions where fixture Datadog
+evidence is dropped to `datadog_lines: 0`.
 
 ## Test Architecture
 

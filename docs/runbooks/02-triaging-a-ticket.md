@@ -44,7 +44,20 @@ Use `investigate` first when you are gathering evidence interactively. Use
    triage-cli triage https://<sub>.zendesk.com/agent/tickets/12345
    ```
 
-5. **Read the output and ticket folder.**
+5. **Replay a fixture offline when you are testing the pipeline itself:**
+
+   ```bash
+   triage-cli investigate --fixture triage-cli-rs/fixtures/audio-drop --no-llm --force
+   triage-cli triage 55001 --fixture triage-cli-rs/fixtures/audio-drop --no-llm --force
+   ```
+
+   `investigate --fixture` uses the fixture's `ticket.json` instead of
+   fetching live Zendesk data, so it skips attachment-download prompts. Fixture
+   and demo mode also load canned Datadog and memory inputs, so they do not
+   require Zendesk creds, Datadog creds, or a prebuilt
+   `$TRIAGE_HOME/data/cnc-map.json`.
+
+6. **Read the output and ticket folder.**
 
    - stdout prints `FORK_PACKET.md`, the pipeable handoff surface.
    - `Tickets/<id>/INTAKE.md` captures engine-known ticket facts.
@@ -53,7 +66,7 @@ Use `investigate` first when you are gathering evidence interactively. Use
    - `Tickets/<id>/STATE.md` records fork, confidence, owner, status, and
      rubric metadata for inbox and soft-locks.
 
-6. **Flags worth knowing.** Layer these on as the situation calls for it:
+7. **Flags worth knowing.** Layer these on as the situation calls for it:
 
    ```bash
    triage-cli triage 12345 --verbose

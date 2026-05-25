@@ -66,8 +66,9 @@ enum Cmd {
 
 #[derive(Debug, Args)]
 struct InvestigateCmd {
-    /// Zendesk ticket ID or full URL.
-    ticket: String,
+    /// Zendesk ticket ID or full URL. Optional when `--fixture` is set.
+    #[arg(required_unless_present = "fixture")]
+    ticket: Option<String>,
     /// Pre-supplied local evidence file. Repeat for multiple.
     #[arg(long = "file")]
     files: Vec<PathBuf>,
@@ -101,6 +102,8 @@ struct InvestigateCmd {
     #[arg(long, default_value_t = false)]
     diff: bool,
     /// Load ticket/logs from a fixture directory instead of Zendesk/Datadog.
+    /// In fixture mode the ticket comes from `ticket.json`, so the positional
+    /// ticket argument is optional and no attachment-download prompts are shown.
     #[arg(long)]
     fixture: Option<PathBuf>,
     /// Write a JSON run-metrics record to this path on success.
@@ -399,6 +402,7 @@ async fn cmd_triage(c: TriageCmd) -> ExitCode {
             memory_hits_override: Some(memory_hits),
             followup_mode: false,
             tickets_root: None,
+            allow_unscoped_fixture_logs: true,
         };
         let rubric = load_rubric_or_die();
         let reporter = MetricsReporter::new(Box::new(StderrReporter { verbose: c.verbose }));
@@ -489,6 +493,7 @@ async fn cmd_triage(c: TriageCmd) -> ExitCode {
         memory_hits_override: None,
         followup_mode: false,
         tickets_root: None,
+        allow_unscoped_fixture_logs: false,
     };
 
     let rubric = load_rubric_or_die();
@@ -524,14 +529,6 @@ async fn cmd_triage(c: TriageCmd) -> ExitCode {
 }
 
 async fn cmd_investigate(c: InvestigateCmd) -> ExitCode {
-    use std::io::IsTerminal;
-    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
-        die("investigate requires an interactive terminal. Use 'triage' for headless runs.");
-    }
-    let ticket_id = match extract::parse_ticket_id(&c.ticket) {
-        Ok(id) => id,
-        Err(e) => die(&e.to_string()),
-    };
     let parsed_pastes: Vec<(String, String)> = c.pastes.iter().map(|p| parse_paste(p)).collect();
     let at_dt = c.at.as_deref().map(parse_at);
     let levels = parse_levels(&c.levels);
@@ -543,36 +540,34 @@ async fn cmd_investigate(c: InvestigateCmd) -> ExitCode {
             ));
         }
     }
+    if c.tui {
+        die("`--tui` was removed in the v1 reframe; the inbox TUI \
+             (`triage-cli inbox`) is now the only TUI surface. Run \
+             without `--tui` to produce the ticket folder.");
+    }
+
+    if let Some(ref fixture_path) = c.fixture {
+        return cmd_investigate_fixture(&c, fixture_path, parsed_pastes, at_dt, levels).await;
+    }
+
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        die("investigate requires an interactive terminal. Use 'triage' for headless runs.");
+    }
+    let ticket_arg = c
+        .ticket
+        .as_deref()
+        .expect("clap must require a ticket when --fixture is absent");
+    let ticket_id = match extract::parse_ticket_id(ticket_arg) {
+        Ok(id) => id,
+        Err(e) => die(&e.to_string()),
+    };
 
     // Pre-flight: if a completed investigation already exists on disk, warn and
     // prompt before burning a network+LLM round-trip. Skipped when --force is
     // set, since the caller has explicitly opted in to overwriting.
-    if !c.force {
-        let state_path = ticket_folder::tickets_root()
-            .join(ticket_id.to_string())
-            .join("STATE.md");
-        if let Some(existing) = ticket_folder::read_existing_state(&state_path) {
-            let fork = existing.fork.as_deref().unwrap_or("?");
-            let confidence = existing.confidence.as_deref().unwrap_or("?");
-            let owner = existing.owner.as_deref().unwrap_or("unknown");
-            let folder = ticket_folder::tickets_root().join(ticket_id.to_string());
-            eprintln!(
-                "{} ZD-{ticket_id} already has an investigation.\n   Fork: {}  Confidence: {}  Owner: {}\n   Folder: {}",
-                "⚠".yellow().bold(),
-                fork.bold(),
-                confidence,
-                owner.bold(),
-                folder.display(),
-            );
-            if !Confirm::new()
-                .with_prompt("Re-investigate anyway?")
-                .default(false)
-                .interact()
-                .unwrap_or(false)
-            {
-                return ExitCode::SUCCESS;
-            }
-        }
+    if !confirm_reinvestigate(ticket_id, c.force) {
+        return ExitCode::SUCCESS;
     }
 
     let zd = match ZendeskClient::from_env() {
@@ -643,30 +638,6 @@ async fn cmd_investigate(c: InvestigateCmd) -> ExitCode {
         DatadogClient::from_env().ok()
     };
 
-    // Fixture mode: also load fixture logs if --fixture is set.
-    let fixture_dd = if let Some(ref fixture_path) = c.fixture {
-        match FixtureLoader::new(fixture_path) {
-            Ok(loader) => match loader.load_datadog_logs() {
-                Ok(logs) => Some(FixtureDatadogClient::new(logs)),
-                Err(e) => die(&format!("fixture logs: {e}")),
-            },
-            Err(e) => die(&format!("fixture: {e}")),
-        }
-    } else {
-        None
-    };
-    let fixture_memory = if let Some(ref fixture_path) = c.fixture {
-        match FixtureLoader::new(fixture_path) {
-            Ok(loader) => match loader.load_memory_hits() {
-                Ok(hits) => Some(hits),
-                Err(e) => die(&format!("fixture memory-hits: {e}")),
-            },
-            Err(e) => die(&format!("fixture: {e}")),
-        }
-    } else {
-        None
-    };
-
     let opts = InvestigateOptions {
         interactive: true,
         workspace: Some(workspace.root.clone()),
@@ -680,29 +651,21 @@ async fn cmd_investigate(c: InvestigateCmd) -> ExitCode {
         no_llm: c.no_llm,
         force: c.force,
         customer_history_override: None,
-        memory_hits_override: fixture_memory,
+        memory_hits_override: None,
         followup_mode: false,
         tickets_root: None,
+        allow_unscoped_fixture_logs: false,
     };
 
-    if c.tui {
-        die("`--tui` was removed in the v1 reframe; the inbox TUI \
-             (`triage-cli inbox`) is now the only TUI surface. Run \
-             without `--tui` to produce the ticket folder.");
-    }
     let rubric = load_rubric_or_die();
     let reporter = MetricsReporter::new(Box::new(SpinnerReporter::new(Box::new(StderrReporter {
         verbose: c.verbose,
     }))));
-    let effective_dd: Option<&dyn DatadogSource> = fixture_dd
-        .as_ref()
-        .map(|d| d as &dyn DatadogSource)
-        .or_else(|| dd.as_ref().map(|d| d as &dyn DatadogSource));
     let outcome = match pipeline::investigate_one_structured(
         ticket.clone(),
         &mut session,
         Some(&zd as &dyn ZendeskSource),
-        effective_dd,
+        dd.as_ref().map(|d| d as &dyn DatadogSource),
         &rubric,
         &reporter,
         &opts,
@@ -721,6 +684,137 @@ async fn cmd_investigate(c: InvestigateCmd) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+async fn cmd_investigate_fixture(
+    c: &InvestigateCmd,
+    fixture_path: &Path,
+    parsed_pastes: Vec<(String, String)>,
+    at_dt: Option<DateTime<Utc>>,
+    levels: Vec<String>,
+) -> ExitCode {
+    let loader = match FixtureLoader::new(fixture_path) {
+        Ok(l) => l,
+        Err(e) => die(&format!("fixture: {e}")),
+    };
+    let ticket = match loader.load_ticket() {
+        Ok(t) => t,
+        Err(e) => die(&format!("fixture ticket: {e}")),
+    };
+    if let Some(ticket_arg) = c.ticket.as_deref() {
+        let requested_id = match extract::parse_ticket_id(ticket_arg) {
+            Ok(id) => id,
+            Err(e) => die(&e.to_string()),
+        };
+        if requested_id != ticket.id {
+            die(&format!(
+                "fixture ticket mismatch: command requested #{requested_id}, but fixture ticket.json is #{}",
+                ticket.id
+            ));
+        }
+    }
+    if !confirm_reinvestigate(ticket.id, c.force) {
+        return ExitCode::SUCCESS;
+    }
+    let logs = match loader.load_datadog_logs() {
+        Ok(l) => l,
+        Err(e) => die(&format!("fixture logs: {e}")),
+    };
+    let memory_hits = match loader.load_memory_hits() {
+        Ok(h) => h,
+        Err(e) => die(&format!("fixture memory-hits: {e}")),
+    };
+    if c.verbose {
+        eprintln!(
+            "Fixture mode: ticket #{} — {} — {} log line(s) — {} memory hit(s)",
+            ticket.id,
+            ticket.subject,
+            logs.len(),
+            memory_hits.len()
+        );
+    }
+
+    let mut session = investigation::create_session(ticket.clone());
+    for path in &c.files {
+        if let Err(e) = investigation::add_local_file(&mut session, path) {
+            die(&format!("Could not read --file {}: {e}", path.display()));
+        }
+    }
+    for (label, text) in parsed_pastes {
+        investigation::add_pasted_evidence(&mut session, &label, &text);
+    }
+
+    let fixture_dd = FixtureDatadogClient::new(logs);
+    let opts = InvestigateOptions {
+        interactive: false,
+        workspace: None,
+        cnc_override: c.cnc.clone(),
+        site_override: c.site.clone(),
+        anchor_override: at_dt,
+        window_minutes: c.window_minutes,
+        levels,
+        verbose: c.verbose,
+        redact_enabled: true,
+        no_llm: c.no_llm,
+        force: c.force,
+        customer_history_override: None,
+        memory_hits_override: Some(memory_hits),
+        followup_mode: false,
+        tickets_root: None,
+        allow_unscoped_fixture_logs: true,
+    };
+    let rubric = load_rubric_or_die();
+    let reporter = MetricsReporter::new(Box::new(StderrReporter { verbose: c.verbose }));
+    let outcome = match pipeline::investigate_one_structured(
+        ticket.clone(),
+        &mut session,
+        None,
+        Some(&fixture_dd as &dyn DatadogSource),
+        &rubric,
+        &reporter,
+        &opts,
+    )
+    .await
+    {
+        Ok(o) => o,
+        Err(e) => return handle_pipeline_error(e, c.diff),
+    };
+    print_fork_packet_to_stdout(&outcome.paths.fork_packet);
+    surface_validator_warnings(&outcome.validator_warnings);
+    eprintln!("Ticket folder ready: {}", outcome.paths.folder.display());
+    if let Some(path) = c.metrics_out.as_ref() {
+        write_metrics_file(path, ticket.id, &reporter, &outcome);
+    }
+    ExitCode::SUCCESS
+}
+
+fn confirm_reinvestigate(ticket_id: u64, force: bool) -> bool {
+    if force {
+        return true;
+    }
+    let state_path = ticket_folder::tickets_root()
+        .join(ticket_id.to_string())
+        .join("STATE.md");
+    if let Some(existing) = ticket_folder::read_existing_state(&state_path) {
+        let fork = existing.fork.as_deref().unwrap_or("?");
+        let confidence = existing.confidence.as_deref().unwrap_or("?");
+        let owner = existing.owner.as_deref().unwrap_or("unknown");
+        let folder = ticket_folder::tickets_root().join(ticket_id.to_string());
+        eprintln!(
+            "{} ZD-{ticket_id} already has an investigation.\n   Fork: {}  Confidence: {}  Owner: {}\n   Folder: {}",
+            "⚠".yellow().bold(),
+            fork.bold(),
+            confidence,
+            owner.bold(),
+            folder.display(),
+        );
+        return Confirm::new()
+            .with_prompt("Re-investigate anyway?")
+            .default(false)
+            .interact()
+            .unwrap_or(false);
+    }
+    true
+}
+
 async fn cmd_demo(c: DemoCmd) -> ExitCode {
     let Some(name) = c.name else {
         eprintln!("Available demo fixtures:");
@@ -733,6 +827,7 @@ async fn cmd_demo(c: DemoCmd) -> ExitCode {
         eprintln!();
         eprintln!("Usage: triage-cli demo <name>");
         eprintln!("       triage-cli triage --fixture <path> [--no-llm]");
+        eprintln!("       triage-cli investigate --fixture <path> [--no-llm] [--force]");
         return ExitCode::SUCCESS;
     };
 
@@ -784,6 +879,7 @@ async fn cmd_demo(c: DemoCmd) -> ExitCode {
         memory_hits_override: Some(memory_hits),
         followup_mode: false,
         tickets_root: None,
+        allow_unscoped_fixture_logs: true,
     };
     let rubric = load_rubric_or_die();
     let reporter = StderrReporter { verbose: c.verbose };
@@ -1114,6 +1210,35 @@ mod tests {
         assert!(
             err.to_string().contains("--save"),
             "clap error should identify the rejected flag: {err}"
+        );
+    }
+
+    #[test]
+    fn investigate_fixture_allows_omitting_ticket() {
+        let cli = Cli::try_parse_from([
+            "triage-cli",
+            "investigate",
+            "--fixture",
+            "fixtures/audio-drop",
+            "--no-llm",
+        ])
+        .expect("fixture mode should not require a positional ticket");
+
+        let Cmd::Investigate(cmd) = cli.command else {
+            panic!("expected investigate subcommand");
+        };
+        assert!(cmd.ticket.is_none(), "fixture mode should allow no ticket");
+    }
+
+    #[test]
+    fn investigate_requires_ticket_when_fixture_is_absent() {
+        let err = Cli::try_parse_from(["triage-cli", "investigate"])
+            .expect_err("investigate without ticket or fixture should be rejected");
+
+        assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
+        assert!(
+            err.to_string().contains("<TICKET>") || err.to_string().contains("ticket"),
+            "clap error should explain the missing ticket argument: {err}"
         );
     }
 }

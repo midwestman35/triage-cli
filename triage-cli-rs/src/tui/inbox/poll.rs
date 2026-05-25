@@ -1,4 +1,7 @@
 use std::collections::HashSet;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use tokio::sync::{mpsc, oneshot};
@@ -19,9 +22,48 @@ pub(crate) async fn poll_iteration(
     state: State,
     opts: WatcherOptions,
     backfill_cutoff: DateTime<Utc>,
+    in_flight_triages: HashSet<u64>,
     tx: mpsc::UnboundedSender<InboxEvent>,
 ) -> Result<(State, HashSet<u64>), String> {
     let zd = ZendeskClient::from_env().map_err(|e| e.to_string())?;
+    poll_iteration_with(
+        &zd,
+        state,
+        opts,
+        backfill_cutoff,
+        &in_flight_triages,
+        tx,
+        live_pipeline_runner(),
+    )
+    .await
+}
+
+type InboxPipelineFuture =
+    Pin<Box<dyn Future<Output = Result<StructuredInvestigation, String>> + Send>>;
+type InboxPipelineRunner = Arc<
+    dyn Fn(
+            Ticket,
+            InvestigateOptions,
+            bool,
+            mpsc::UnboundedSender<InboxEvent>,
+        ) -> InboxPipelineFuture
+        + Send
+        + Sync,
+>;
+
+fn live_pipeline_runner() -> InboxPipelineRunner {
+    Arc::new(|ticket, opts, no_logs, tx| Box::pin(run_pipeline(ticket, opts, no_logs, tx)))
+}
+
+async fn poll_iteration_with(
+    zd: &dyn ZendeskSource,
+    state: State,
+    opts: WatcherOptions,
+    backfill_cutoff: DateTime<Utc>,
+    in_flight_triages: &HashSet<u64>,
+    tx: mpsc::UnboundedSender<InboxEvent>,
+    runner: InboxPipelineRunner,
+) -> Result<(State, HashSet<u64>), String> {
     let view_ids: Vec<u64> = match opts.view_id {
         Some(id) => zd
             .list_view_ticket_ids(id)
@@ -33,6 +75,10 @@ pub(crate) async fn poll_iteration(
     let mut new_state = state;
 
     for tid in &view_ids {
+        if in_flight_triages.contains(tid) {
+            continue;
+        }
+
         let ticket = match zd.get_ticket(*tid).await {
             Ok(t) => t,
             Err(e) => {
@@ -71,9 +117,12 @@ pub(crate) async fn poll_iteration(
             memory_hits_override: None,
             followup_mode: false,
             tickets_root: None,
+            allow_unscoped_fixture_logs: false,
         };
         let no_logs = opts.no_logs;
         let tid_copy = *tid;
+        let updated_at = updated;
+        let runner = runner.clone();
         let _ = tx.send(InboxEvent::TriagePhase {
             ticket_id: tid_copy,
             label: "Triaging".into(),
@@ -81,11 +130,12 @@ pub(crate) async fn poll_iteration(
         });
 
         tokio::spawn(async move {
-            match run_pipeline(ticket, opts_inner, no_logs, tx_inner.clone()).await {
+            match runner(ticket, opts_inner, no_logs, tx_inner.clone()).await {
                 Ok(outcome) => {
                     let _ = tx_inner.send(InboxEvent::TriageComplete {
                         ticket_id: tid_copy,
                         folder: outcome.paths.folder,
+                        updated_at,
                     });
                 }
                 Err(e) => {
@@ -96,7 +146,6 @@ pub(crate) async fn poll_iteration(
                 }
             }
         });
-        new_state.triaged.insert(key, updated.to_rfc3339());
     }
     let live_set: HashSet<String> = view_set.iter().map(|id| id.to_string()).collect();
     new_state =
@@ -149,10 +198,12 @@ pub(crate) async fn triage_one_ticket(
         site_override: effective_override,
         ..opts_to_investigate(opts.clone())
     };
+    let updated_at = ticket.updated_at.unwrap_or(ticket.created_at);
     let outcome = run_pipeline(ticket, opts_inner, opts.no_logs, tx.clone()).await?;
     let _ = tx.send(InboxEvent::TriageComplete {
         ticket_id,
         folder: outcome.paths.folder,
+        updated_at,
     });
     Ok(())
 }
@@ -174,6 +225,7 @@ fn opts_to_investigate(opts: WatcherOptions) -> InvestigateOptions {
         memory_hits_override: None,
         followup_mode: false,
         tickets_root: None,
+        allow_unscoped_fixture_logs: false,
     }
 }
 
@@ -257,5 +309,221 @@ fn pretty_phase_label(phase: &str) -> &'static str {
         "llm_call" => "Asking LLM",
         "save" => "Writing ticket folder",
         _ => "Triaging",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::path::Path;
+
+    use crate::models::{Comment, TicketSummary};
+    use crate::zendesk::ZendeskError;
+
+    #[derive(Clone)]
+    struct StubZendesk {
+        ticket: Ticket,
+        view_ids: Vec<u64>,
+        fail_get_ticket: bool,
+    }
+
+    impl ZendeskSource for StubZendesk {
+        fn get_ticket<'a>(
+            &'a self,
+            ticket_id: u64,
+        ) -> Pin<Box<dyn Future<Output = Result<Ticket, ZendeskError>> + Send + 'a>> {
+            let ticket = self.ticket.clone();
+            let fail_get_ticket = self.fail_get_ticket;
+            Box::pin(async move {
+                if fail_get_ticket {
+                    return Err(ZendeskError::TicketNotFound(ticket_id));
+                }
+                if ticket.id == ticket_id {
+                    Ok(ticket)
+                } else {
+                    Err(ZendeskError::TicketNotFound(ticket_id))
+                }
+            })
+        }
+
+        fn fetch_customer_history<'a>(
+            &'a self,
+            _email: &'a str,
+            _limit: usize,
+        ) -> Pin<Box<dyn Future<Output = Vec<TicketSummary>> + Send + 'a>> {
+            Box::pin(async { Vec::new() })
+        }
+
+        fn list_view_ticket_ids<'a>(
+            &'a self,
+            _view_id: u64,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<u64>, ZendeskError>> + Send + 'a>> {
+            let view_ids = self.view_ids.clone();
+            Box::pin(async move { Ok(view_ids) })
+        }
+
+        fn list_my_ticket_ids<'a>(
+            &'a self,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<u64>, ZendeskError>> + Send + 'a>> {
+            let view_ids = self.view_ids.clone();
+            Box::pin(async move { Ok(view_ids) })
+        }
+
+        fn download_attachment<'a>(
+            &'a self,
+            _url: &'a str,
+            _dest_path: &'a Path,
+            _max_bytes: u64,
+        ) -> Pin<Box<dyn Future<Output = Result<(u64, String), ZendeskError>> + Send + 'a>>
+        {
+            Box::pin(async {
+                Err(ZendeskError::AttachmentNotFound(
+                    "download_attachment not used in inbox poll test".into(),
+                ))
+            })
+        }
+    }
+
+    fn sample_ticket(ticket_id: u64, updated_at: DateTime<Utc>) -> Ticket {
+        Ticket {
+            id: ticket_id,
+            subject: format!("Ticket {ticket_id}"),
+            description: "description".into(),
+            requester_org: Some("Example Org".into()),
+            requester_email: Some("ops@example.com".into()),
+            tags: vec![],
+            created_at: updated_at - chrono::Duration::minutes(5),
+            updated_at: Some(updated_at),
+            comments: vec![Comment {
+                author: "analyst".into(),
+                body: "comment".into(),
+                created_at: updated_at - chrono::Duration::minutes(4),
+                is_public: true,
+                attachments: vec![],
+            }],
+        }
+    }
+
+    fn sample_watcher_opts(state_file: &Path) -> WatcherOptions {
+        WatcherOptions {
+            view_id: Some(44),
+            interval: 30,
+            state_file: state_file.to_path_buf(),
+            backfill_hours: 24.0,
+            window_minutes: 15,
+            levels: vec!["error".into()],
+            no_logs: true,
+            print_notes: false,
+            verbose: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn poll_iteration_failed_pipeline_keeps_ticket_retryable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_file = tmp.path().join("watcher-state.json");
+        let updated_at = DateTime::parse_from_rfc3339("2026-05-25T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let ticket = sample_ticket(44, updated_at);
+        let zd = StubZendesk {
+            ticket: ticket.clone(),
+            view_ids: vec![ticket.id],
+            fail_get_ticket: false,
+        };
+        let state = State {
+            version: 1,
+            triaged: BTreeMap::new(),
+        };
+        let opts = sample_watcher_opts(&state_file);
+        let backfill_cutoff = updated_at - chrono::Duration::hours(1);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let runner: InboxPipelineRunner =
+            Arc::new(|_, _, _, _| Box::pin(async { Err("pipeline boom".to_string()) }));
+
+        let (new_state, view_ids) = poll_iteration_with(
+            &zd,
+            state,
+            opts,
+            backfill_cutoff,
+            &HashSet::new(),
+            tx,
+            runner,
+        )
+        .await
+        .expect("poll iteration should still succeed");
+
+        assert_eq!(view_ids, HashSet::from([ticket.id]));
+        assert!(
+            !new_state.triaged.contains_key("44"),
+            "failed spawned triage must not suppress retry eligibility"
+        );
+        assert!(watcher::should_triage(&ticket, &new_state, backfill_cutoff));
+
+        let phase = rx.recv().await.expect("expected triage phase event");
+        assert!(matches!(
+            phase,
+            InboxEvent::TriagePhase {
+                ticket_id: 44,
+                ref label,
+                step: 1,
+            } if label == "Triaging"
+        ));
+
+        let failed = rx.recv().await.expect("expected triage failure event");
+        assert!(matches!(
+            failed,
+            InboxEvent::TriageFailed {
+                ticket_id: 44,
+                ref error,
+            } if error == "pipeline boom"
+        ));
+    }
+
+    #[tokio::test]
+    async fn poll_iteration_skips_in_flight_before_fetching_ticket() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_file = tmp.path().join("watcher-state.json");
+        let updated_at = DateTime::parse_from_rfc3339("2026-05-25T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let ticket = sample_ticket(44, updated_at);
+        let zd = StubZendesk {
+            ticket: ticket.clone(),
+            view_ids: vec![ticket.id],
+            fail_get_ticket: true,
+        };
+        let state = State {
+            version: 1,
+            triaged: BTreeMap::new(),
+        };
+        let opts = sample_watcher_opts(&state_file);
+        let backfill_cutoff = updated_at - chrono::Duration::hours(1);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let runner: InboxPipelineRunner =
+            Arc::new(|_, _, _, _| Box::pin(async { panic!("in-flight ticket should not run") }));
+
+        let (new_state, view_ids) = poll_iteration_with(
+            &zd,
+            state,
+            opts,
+            backfill_cutoff,
+            &HashSet::from([ticket.id]),
+            tx,
+            runner,
+        )
+        .await
+        .expect("poll iteration should still succeed");
+
+        assert_eq!(view_ids, HashSet::from([ticket.id]));
+        assert!(
+            !new_state.triaged.contains_key("44"),
+            "in-flight tickets should not be marked handled by a later poll"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "in-flight skip should not emit a fetch-level TriageFailed"
+        );
     }
 }

@@ -35,6 +35,11 @@ pub struct InvestigateOptions {
     /// under `p` regardless of the env var. /revise uses this to write under
     /// the existing ticket_dir's parent without mutating process-global env.
     pub tickets_root: Option<std::path::PathBuf>,
+    /// Fixture/demo mode only: if canned Datadog evidence was injected but the
+    /// isolated `TRIAGE_HOME` has no site map, still fetch the fixture logs
+    /// without requiring site resolution. Production runs keep the stricter
+    /// site-map gate by leaving this at `false`.
+    pub allow_unscoped_fixture_logs: bool,
 }
 
 impl InvestigateOptions {
@@ -55,6 +60,7 @@ impl InvestigateOptions {
             memory_hits_override: None,
             followup_mode: false,
             tickets_root: None,
+            allow_unscoped_fixture_logs: false,
         }
     }
 }

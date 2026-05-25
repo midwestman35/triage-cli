@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A **Rust 1.95+** CLI that triages Zendesk tickets for the Carbyne APEX NG911/E911 platform. The crate lives in `triage-cli-rs/`. Eight subcommands:
 
-- `triage-cli investigate <id-or-url>` — interactive guided session. Fetches the ticket, lets the analyst drop in attachments and pasted evidence, then runs the structured pipeline. Writes a five-markdown ticket folder under `${TRIAGE_TICKETS_ROOT:-./Tickets}/<id>/`. Requires a TTY.
+- `triage-cli investigate <id-or-url>` — interactive guided session. Fetches the ticket, lets the analyst drop in attachments and pasted evidence, then runs the structured pipeline. Writes a five-markdown ticket folder under `${TRIAGE_TICKETS_ROOT:-./Tickets}/<id>/`. Requires a TTY for live Zendesk tickets; `--fixture <dir>` replays a canned ticket offline and skips attachment-download prompts.
 - `triage-cli triage <id-or-url>` — headless single-shot pipeline (no evidence prompts). Same ticket-folder output; also prints `FORK_PACKET.md` to stdout (pipeable handoff).
 - `triage-cli inbox [--view ...]` — ratatui TUI over the produced ticket folders. Synth-summary right pane plus tabbed per-file view. Requires TTY.
 - `triage-cli watch --view <id>` — long-running headless poll loop; reuses the structured pipeline per ticket.
@@ -17,7 +17,7 @@ A **Rust 1.95+** CLI that triages Zendesk tickets for the Carbyne APEX NG911/E91
 - `triage-cli setup` — interactive first-run; prompts for env vars and writes `.env`. Idempotent.
 - `triage-cli demo [<name>]` — run a built-in canned fixture end-to-end with no credentials (forces `--no-llm` for byte-stable output). Called without a name, it lists the available fixtures.
 
-`triage` and `investigate` also accept `--fixture <dir>` (load ticket/logs from a fixture directory instead of Zendesk/Datadog), `--no-llm` (skip the provider call and emit a deterministic stub report — used by fixtures and golden tests), and `--metrics-out <path>` (write a best-effort JSON run-metrics record on success; failures here never change the exit code).
+`triage` and `investigate` also accept `--fixture <dir>` (load ticket/logs from a fixture directory instead of Zendesk/Datadog), `--no-llm` (skip the provider call and emit a deterministic stub report — used by fixtures and golden tests), and `--metrics-out <path>` (write a best-effort JSON run-metrics record on success; failures here never change the exit code). In `investigate` fixture mode, the positional ticket argument is optional because the ticket comes from `ticket.json`.
 
 The reference for the v1 surface is the spec at **`docs/spec/v1-reframe.md`** — when behavior is ambiguous, that file wins. `README.md` is the user-facing reference. The frozen Python source lives in `archive/python-source-2026-05-12.zip` — do not edit it, do not port new features back to Python.
 
@@ -172,7 +172,7 @@ Site-level only: `<DD_CALL_CENTER_TAG>:<site_name> status:(<levels>)`. Window is
 
 `fixture.rs` runs the pipeline end-to-end with no real credentials. A fixture is a directory holding `ticket.json`, `datadog-logs.json`, and `memory-hits.json` (the `expected/` subdir is reserved for golden-output tests, roadmap item #3). `FixtureLoader` reads those files; `FixtureDatadogClient` implements `DatadogSource` over the canned logs. The shipped fixtures live in `triage-cli-rs/fixtures/` and `NAMED_FIXTURES` lists them: `audio-drop`, `no-site-map`, `missing-evidence`, `vendor-fork`. `fixtures_root()` resolves the fixtures dir via `TRIAGE_FIXTURES_DIR` → binary-adjacent `fixtures/` → `./fixtures/` → `./triage-cli-rs/fixtures/`.
 
-`triage-cli demo <name>` (`cli::cmd_demo`) forces `no_llm: true` so output is byte-stable for golden comparison; `triage`/`investigate --fixture <dir>` take an arbitrary fixture path. `--no-llm` short-circuits the provider call in `pipeline::investigate_one_structured` and emits a deterministic stub `StructuredTriageReport` instead. This is roadmap item #2.
+`triage-cli demo <name>` (`cli::cmd_demo`) forces `no_llm: true` so output is byte-stable for golden comparison; `triage`/`investigate --fixture <dir>` take an arbitrary fixture path. `investigate --fixture` is fully offline: it uses the fixture ticket, skips live Zendesk fetches, and does not prompt for attachment downloads. `--no-llm` short-circuits the provider call in `pipeline::investigate_one_structured` and emits a deterministic stub `StructuredTriageReport` instead. This is roadmap item #2.
 
 ### Watcher state
 
