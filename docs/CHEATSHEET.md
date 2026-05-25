@@ -71,6 +71,17 @@ triage-cli triage 12345 --diff
 `triage` is the headless form of the same structured pipeline. It writes the
 ticket folder and prints `FORK_PACKET.md`, so it is still pipeable for handoff.
 
+## Offline fixture smoke
+
+```bash
+triage-cli triage 55001 --fixture triage-cli-rs/fixtures/audio-drop --no-llm --force
+triage-cli demo audio-drop
+```
+
+These fixture paths load canned ticket, Datadog, and memory inputs. They do
+not require Zendesk creds, Datadog creds, or a prebuilt
+`$TRIAGE_HOME/data/cnc-map.json`.
+
 ## `inbox --view N` - interactive TUI
 
 ```bash

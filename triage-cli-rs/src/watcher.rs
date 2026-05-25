@@ -289,6 +289,7 @@ pub async fn run_iteration(
             memory_hits_override: None,
             followup_mode: false,
             tickets_root: None,
+            allow_unscoped_fixture_logs: false,
         };
         let reporter: Box<dyn Reporter> = Box::new(SilentReporter);
         match pipeline::investigate_one_structured(
