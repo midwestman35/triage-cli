@@ -256,15 +256,23 @@ fn render_phase_banner(progress: &crate::chat::ChatProgress, area: Rect, buf: &m
                 (Some(_), None) => "session: in flight".to_string(),
                 (None, _) => "session: pending".to_string(),
             };
-            Paragraph::new(vec![
+            let mut lines = vec![
                 Line::from(format!(
                     "{frame}  {}  stage: {}   elapsed {:.1}s",
                     progress.canned_msg, stage_label, progress.elapsed_s
                 )),
                 Line::from(session),
-                Line::from("Esc cancels · Ctrl-T retries last turn"),
-            ])
-            .render(inner, buf);
+            ];
+            if let Some(draft) = progress.draft_text.as_deref() {
+                let snippet: String = draft.chars().rev().take(120).collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect();
+                let one_line = snippet.replace('\n', " ");
+                lines.push(Line::from(format!("draft: {one_line}")));
+            }
+            lines.push(Line::from("Esc cancels · Ctrl-T retries last turn"));
+            Paragraph::new(lines).render(inner, buf);
         }
         3 => {
             let block = Block::default()
@@ -627,6 +635,7 @@ mod tests {
             frame_idx: 0,
             resumed: None,
             session_id: None,
+            draft_text: None,
         }
     }
 

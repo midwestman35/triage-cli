@@ -1994,7 +1994,7 @@ async fn run_chat_session(ticket_id: &str) -> anyhow::Result<()> {
                                 let tid = ticket_id.to_string();
                                 let provider = provider.clone();
                                 let tx = chat_tx.clone();
-                                turn_started = Some(std::time::Instant::now());
+                                begin_analyst_turn(&mut in_flight, &mut turn_started);
                                 active_job = Some(tokio::spawn(async move {
                                     send_analyst_turn_with_progress(
                                         &td,
@@ -2044,7 +2044,7 @@ async fn run_chat_session(ticket_id: &str) -> anyhow::Result<()> {
                                     let evidence = std::mem::take(&mut pending_evidence);
                                     let provider = provider.clone();
                                     let tx = chat_tx.clone();
-                                    turn_started = Some(std::time::Instant::now());
+                                    begin_analyst_turn(&mut in_flight, &mut turn_started);
                                     active_job = Some(tokio::spawn(async move {
                                         send_analyst_turn_with_progress(
                                             &td,
@@ -2124,7 +2124,7 @@ async fn run_chat_session(ticket_id: &str) -> anyhow::Result<()> {
                                         let tid = ticket_id.to_string();
                                         let provider = provider.clone();
                                         let tx = chat_tx.clone();
-                                        turn_started = Some(std::time::Instant::now());
+                                        begin_analyst_turn(&mut in_flight, &mut turn_started);
                                         active_job = Some(tokio::spawn(async move {
                                             send_analyst_turn_with_progress(
                                                 &td,
@@ -2236,6 +2236,15 @@ async fn run_chat_session(ticket_id: &str) -> anyhow::Result<()> {
 fn clear_textarea(input: &mut tui_textarea::TextArea) {
     *input = tui_textarea::TextArea::default();
     input.set_block(ratatui::widgets::Block::default());
+}
+
+fn begin_analyst_turn(
+    in_flight: &mut Option<crate::chat::ChatProgress>,
+    turn_started: &mut Option<std::time::Instant>,
+) {
+    let started = std::time::Instant::now();
+    *turn_started = Some(started);
+    *in_flight = Some(crate::chat::initial_turn_progress());
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2529,8 +2538,13 @@ async fn send_analyst_turn_with_progress(
     tx: tokio::sync::mpsc::UnboundedSender<crate::chat::ChatEvent>,
 ) -> anyhow::Result<()> {
     use crate::chat;
+    use std::sync::Arc;
+
     let model = std::env::var("CODEX_MODEL")
         .unwrap_or_else(|_| crate::providers::codex::DEFAULT_CODEX_MODEL.to_string());
+    let bridge_app_server = provider.name() == "codex"
+        && crate::providers::codex_transport_label() == "app-server";
+    let turn_instant = std::time::Instant::now();
     let _ = tx.send(chat::ChatEvent::Phase {
         ts: chrono::Utc::now(),
         stage: chat::ChatStage::Ingesting,
@@ -2607,7 +2621,14 @@ async fn send_analyst_turn_with_progress(
         attachments: attachments.len(),
         session_id: None,
     });
-    let started = std::time::Instant::now();
+    if bridge_app_server {
+        let tx_progress = tx.clone();
+        crate::providers::codex_app_server::set_progress_reporter(Some(Arc::new(
+            move |progress| chat::bridge_provider_progress(&tx_progress, turn_instant, progress),
+        )))
+        .await;
+    }
+    let started = turn_instant;
     let result = pipeline::followup_turn(
         ticket_dir,
         ticket_id,
@@ -2619,6 +2640,9 @@ async fn send_analyst_turn_with_progress(
         Some(&reporter),
     )
     .await;
+    if bridge_app_server {
+        crate::providers::codex_app_server::set_progress_reporter(None).await;
+    }
 
     match result {
         Ok(result) => {
@@ -2769,14 +2793,7 @@ validator_warnings:
         std::fs::create_dir_all(crate::chat::session_dir(&ticket_dir)).unwrap();
 
         let mut active_job = Some(tokio::spawn(async { Ok::<(), String>(()) }));
-        let mut in_flight = Some(crate::chat::ChatProgress {
-            stage: crate::chat::ChatStage::ProviderAwait,
-            canned_msg: "awaiting provider",
-            elapsed_s: 0.0,
-            frame_idx: 0,
-            resumed: None,
-            session_id: None,
-        });
+        let mut in_flight = Some(crate::chat::initial_turn_progress());
         let mut turn_started = Some(std::time::Instant::now());
         let mut status_hint = Some("working".to_string());
         let mut ask_input = tui_textarea::TextArea::default();

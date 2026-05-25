@@ -745,6 +745,11 @@ pub enum ChatEvent {
         ts: chrono::DateTime<chrono::Utc>,
         codex_turn: u32,
     },
+    /// Streaming assistant text from codex app-server (`ProviderProgress::TextDelta`).
+    DraftDelta {
+        ts: chrono::DateTime<chrono::Utc>,
+        text: String,
+    },
     Cancelled {
         ts: chrono::DateTime<chrono::Utc>,
         by: CancelSource,
@@ -892,6 +897,9 @@ impl PartialEq for ChatEvent {
                     codex_turn: b,
                 },
             ) => a_ts == b_ts && a == b,
+            (DraftDelta { ts: a_ts, text: a }, DraftDelta { ts: b_ts, text: b }) => {
+                a_ts == b_ts && a == b
+            }
             (Cancelled { ts: a_ts, by: a }, Cancelled { ts: b_ts, by: b }) => {
                 a_ts == b_ts && a == b
             }
@@ -910,33 +918,111 @@ pub struct ChatProgress {
     pub frame_idx: usize,
     pub resumed: Option<bool>,
     pub session_id: Option<String>,
+    /// Accumulated streaming text from app-server deltas (not persisted to turns).
+    pub draft_text: Option<String>,
+}
+
+/// Progress shown as soon as the analyst sends a follow-up (before mpsc events arrive).
+pub fn initial_turn_progress() -> ChatProgress {
+    ChatProgress {
+        stage: ChatStage::Ingesting,
+        canned_msg: canned_message(ChatStage::Ingesting, 0),
+        elapsed_s: 0.0,
+        frame_idx: 0,
+        resumed: None,
+        session_id: None,
+        draft_text: None,
+    }
+}
+
+const DRAFT_SNIPPET_MAX: usize = 1200;
+
+fn append_draft_snippet(existing: Option<String>, delta: &str) -> Option<String> {
+    if delta.is_empty() {
+        return existing;
+    }
+    let mut draft = existing.unwrap_or_default();
+    draft.push_str(delta);
+    if draft.len() > DRAFT_SNIPPET_MAX {
+        let keep_from = draft.len() - DRAFT_SNIPPET_MAX;
+        draft = draft[keep_from..].to_string();
+    }
+    Some(draft)
+}
+
+/// Map codex app-server stage labels to inbox `ChatStage` values.
+pub fn provider_stage_label_to_chat_stage(label: &str) -> Option<ChatStage> {
+    match label {
+        "turn/start" => Some(ChatStage::ProviderAwait),
+        "thread/start" | "thread/resume" => Some(ChatStage::SessionResumeAttempt),
+        _ => None,
+    }
+}
+
+/// Bridge internal `ProviderProgress` into inbox `ChatEvent`s (Phase / DraftDelta).
+pub fn bridge_provider_progress(
+    tx: &tokio::sync::mpsc::UnboundedSender<ChatEvent>,
+    turn_started: std::time::Instant,
+    progress: crate::providers::ProviderProgress,
+) {
+    let elapsed_s = turn_started.elapsed().as_secs_f64();
+    match progress {
+        crate::providers::ProviderProgress::Stage { label } => {
+            if let Some(stage) = provider_stage_label_to_chat_stage(&label) {
+                let _ = tx.send(ChatEvent::Phase {
+                    ts: chrono::Utc::now(),
+                    stage,
+                    elapsed_s,
+                });
+            }
+        }
+        crate::providers::ProviderProgress::TextDelta { text } => {
+            if !text.is_empty() {
+                let _ = tx.send(ChatEvent::DraftDelta {
+                    ts: chrono::Utc::now(),
+                    text,
+                });
+            }
+        }
+        crate::providers::ProviderProgress::Error { message } => {
+            let (redacted, _) = crate::redact::redact(&message);
+            let _ = tx.send(ChatEvent::DraftDelta {
+                ts: chrono::Utc::now(),
+                text: format!("\n[provider notice: {redacted}]\n"),
+            });
+        }
+    }
 }
 
 pub fn update_progress(prev: Option<ChatProgress>, evt: &ChatEvent) -> Option<ChatProgress> {
     match evt {
-        ChatEvent::AnalystAppended { .. } => Some(prev.unwrap_or(ChatProgress {
-            stage: ChatStage::Ingesting,
-            canned_msg: canned_message(ChatStage::Ingesting, 0),
-            elapsed_s: 0.0,
-            frame_idx: 0,
-            resumed: None,
-            session_id: None,
-        })),
+        ChatEvent::AnalystAppended { .. } => Some(prev.unwrap_or_else(initial_turn_progress)),
         ChatEvent::Phase {
             stage, elapsed_s, ..
         } => {
-            let base = prev.unwrap_or(ChatProgress {
+            let base = prev.unwrap_or_else(|| ChatProgress {
                 stage: *stage,
                 canned_msg: canned_message(*stage, 0),
                 elapsed_s: *elapsed_s,
                 frame_idx: 0,
                 resumed: None,
                 session_id: None,
+                draft_text: None,
             });
             Some(ChatProgress {
                 stage: *stage,
                 canned_msg: canned_message(*stage, (*elapsed_s / 4.0) as usize),
                 elapsed_s: *elapsed_s,
+                ..base
+            })
+        }
+        ChatEvent::DraftDelta { text, .. } => {
+            let base = prev.unwrap_or_else(initial_turn_progress);
+            let draft_text = append_draft_snippet(base.draft_text, text);
+            Some(ChatProgress {
+                stage: ChatStage::ProviderAwait,
+                canned_msg: canned_message(ChatStage::ProviderAwait, (base.elapsed_s / 4.0) as usize),
+                draft_text,
                 ..base
             })
         }
@@ -1915,6 +2001,10 @@ mod tests {
                 ts: now_ts(),
                 codex_turn: 8,
             },
+            ChatEvent::DraftDelta {
+                ts: now_ts(),
+                text: "partial".into(),
+            },
             ChatEvent::Cancelled {
                 ts: now_ts(),
                 by: CancelSource::CtrlC,
@@ -2083,6 +2173,54 @@ mod tests {
     }
 
     #[test]
+    fn provider_stage_label_maps_turn_start_to_provider_await() {
+        assert_eq!(
+            provider_stage_label_to_chat_stage("turn/start"),
+            Some(ChatStage::ProviderAwait)
+        );
+        assert_eq!(
+            provider_stage_label_to_chat_stage("thread/resume"),
+            Some(ChatStage::SessionResumeAttempt)
+        );
+        assert!(provider_stage_label_to_chat_stage("unknown/phase").is_none());
+    }
+
+    #[tokio::test]
+    async fn bridge_provider_progress_text_delta_emits_draft_event() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let started = std::time::Instant::now();
+        bridge_provider_progress(
+            &tx,
+            started,
+            crate::providers::ProviderProgress::TextDelta {
+                text: "hello".into(),
+            },
+        );
+        let evt = rx.try_recv().unwrap();
+        assert!(matches!(evt, ChatEvent::DraftDelta { text, .. } if text == "hello"));
+    }
+
+    #[test]
+    fn update_progress_draft_delta_accumulates_snippet() {
+        let p = update_progress(
+            None,
+            &ChatEvent::DraftDelta {
+                ts: now_ts(),
+                text: "hel".into(),
+            },
+        );
+        let p = update_progress(
+            p,
+            &ChatEvent::DraftDelta {
+                ts: now_ts(),
+                text: "lo".into(),
+            },
+        );
+        assert_eq!(p.as_ref().unwrap().draft_text.as_deref(), Some("hello"));
+        assert_eq!(p.as_ref().unwrap().stage, ChatStage::ProviderAwait);
+    }
+
+    #[test]
     fn advance_progress_tick_derives_frame_idx_from_elapsed() {
         let p = ChatProgress {
             stage: ChatStage::ProviderAwait,
@@ -2091,6 +2229,7 @@ mod tests {
             frame_idx: 0,
             resumed: None,
             session_id: None,
+            draft_text: None,
         };
         let a = advance_progress_tick(p.clone(), 1.2);
         let b = advance_progress_tick(p.clone(), 1.2);
@@ -2110,6 +2249,7 @@ mod tests {
             frame_idx: 0,
             resumed: None,
             session_id: None,
+            draft_text: None,
         };
         let messages: Vec<&str> = (0..16)
             .map(|i| {
