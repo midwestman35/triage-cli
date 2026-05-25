@@ -15,6 +15,10 @@ name = "integration"
 path = "tests/integration/mod.rs"
 
 [[test]]
+name = "pipeline_integration"
+path = "tests/pipeline_integration.rs"
+
+[[test]]
 name = "sandbox"
 path = "tests/sandbox/mod.rs"
 
