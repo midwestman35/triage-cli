@@ -405,42 +405,40 @@ fn ensure_memory_md() -> std::io::Result<()> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Test-isolation helpers (cfg(test) only, pub(crate) so pipeline tests can
-// share the same mutex).
+// Test-isolation helpers (pub so integration tests can share the same mutex).
 // ─────────────────────────────────────────────────────────────────────────
 
 /// Env var name for the tickets root dir — overridden in tests.
-#[cfg(test)]
-pub(crate) const TICKETS_ROOT_ENV: &str = "TRIAGE_TICKETS_ROOT";
+pub const TICKETS_ROOT_ENV: &str = "TRIAGE_TICKETS_ROOT";
 
 /// Process-wide mutex that serialises any test mutating
 /// `TRIAGE_MEMORY_MD` / `TRIAGE_MEMORY_DB` / `TRIAGE_TICKETS_ROOT`.
 /// All tests in every module that touch these vars must hold this lock.
-#[cfg(test)]
-pub(crate) static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// RAII guard: locks [`ENV_GUARD`] and overrides the three process-global
 /// env vars used by the memory subsystem (and by `investigate_one_structured`
 /// for the tickets root).  All previous values are restored on drop.
-#[cfg(test)]
-pub(crate) struct MemoryEnvScope {
+///
+/// Primarily used by integration tests to isolate env vars; safe to call
+/// from any test context.
+pub struct MemoryEnvScope {
     _guard: std::sync::MutexGuard<'static, ()>,
     prev_md: Option<String>,
     prev_db: Option<String>,
     prev_tickets_root: Option<String>,
 }
 
-#[cfg(test)]
 impl MemoryEnvScope {
     /// Override `TRIAGE_MEMORY_MD` and `TRIAGE_MEMORY_DB` only.
     /// Use this from pure memory tests that don't touch the tickets root.
-    pub(crate) fn new(md: &std::path::Path, db: &std::path::Path) -> Self {
+    pub fn new(md: &std::path::Path, db: &std::path::Path) -> Self {
         Self::new_with_tickets_root(md, db, None)
     }
 
     /// Override all three env vars.  Pass `tickets_root = Some(path)` when
     /// the caller also needs to isolate `TRIAGE_TICKETS_ROOT`.
-    pub(crate) fn new_with_tickets_root(
+    pub fn new_with_tickets_root(
         md: &std::path::Path,
         db: &std::path::Path,
         tickets_root: Option<&std::path::Path>,
@@ -463,7 +461,6 @@ impl MemoryEnvScope {
     }
 }
 
-#[cfg(test)]
 impl Drop for MemoryEnvScope {
     fn drop(&mut self) {
         match &self.prev_md {
