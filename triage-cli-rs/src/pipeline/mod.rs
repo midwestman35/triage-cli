@@ -14,7 +14,7 @@ mod reporter;
 mod revise;
 mod site;
 
-pub use followup::{followup_turn, SESSION_LOST_ACTION};
+pub use followup::{followup_turn, followup_turn_with_cancel, SESSION_LOST_ACTION};
 pub use investigate::investigate_one_structured;
 pub use options::{InvestigateOptions, StructuredInvestigation};
 pub use reporter::{

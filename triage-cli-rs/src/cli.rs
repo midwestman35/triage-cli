@@ -210,7 +210,7 @@ pub fn run() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
         Cmd::Doctor => async_run(setup::doctor),
-        Cmd::Setup => setup::setup(),
+        Cmd::Setup => async_run(setup::setup),
         Cmd::BuildMap => cmd_build_map(),
         Cmd::MigrateHome(c) => cmd_migrate_home(c),
         Cmd::Triage(c) => async_run(|| cmd_triage(c)),

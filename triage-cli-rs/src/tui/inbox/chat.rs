@@ -2,7 +2,6 @@ use std::io;
 use std::path::Path;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use tokio::task::JoinHandle;
 
 use crate::datadog::{DatadogClient, DatadogSource};
 use crate::investigation;
@@ -26,6 +25,11 @@ fn global_chat_close_reason(key: KeyEvent) -> Option<crate::chat::SessionCloseRe
 }
 
 struct RawModeGuard;
+
+struct ActiveChatJob {
+    handle: tokio::task::JoinHandle<Result<(), String>>,
+    cancel_tx: Option<tokio::sync::watch::Sender<Option<crate::providers::FollowupCancel>>>,
+}
 
 impl RawModeGuard {
     fn enter() -> io::Result<Self> {
@@ -106,7 +110,8 @@ pub(crate) async fn run_chat_session(ticket_id: &str) -> anyhow::Result<()> {
     let mut pending_evidence: Vec<crate::models::EvidenceProvenance> = Vec::new();
     let mut in_flight: Option<chat::ChatProgress> = None;
     let mut status_hint: Option<String> = None;
-    let mut active_job: Option<tokio::task::JoinHandle<Result<(), String>>> = None;
+    let mut active_job: Option<ActiveChatJob> = None;
+    let mut pending_close_after_cancel: Option<chat::SessionCloseReason> = None;
     let mut turn_started: Option<std::time::Instant> = None;
     let transcript_scroll = 0;
     let mut transcript_follow_bottom = true;
@@ -124,10 +129,10 @@ pub(crate) async fn run_chat_session(ticket_id: &str) -> anyhow::Result<()> {
             ticket_id,
         );
 
-        if let Some(handle) = active_job.as_ref() {
-            if handle.is_finished() {
+        if let Some(job) = active_job.as_ref() {
+            if job.handle.is_finished() {
                 let finished = active_job.take().expect("just checked");
-                match finished.await {
+                match finished.handle.await {
                     Ok(Ok(())) => {
                         status_hint = None;
                         clear_textarea(&mut ask_input);
@@ -167,6 +172,11 @@ pub(crate) async fn run_chat_session(ticket_id: &str) -> anyhow::Result<()> {
                 in_flight = in_flight.map(|p| chat::advance_progress_tick(p, elapsed));
             }
         }
+        if active_job.is_none() {
+            if let Some(reason) = pending_close_after_cancel.take() {
+                break reason;
+            }
+        }
 
         let outcome = chat::parse_conversation_jsonl(&chat::conversation_jsonl_path(&ticket_dir))?;
         let input_surface = match &input_mode {
@@ -193,8 +203,14 @@ pub(crate) async fn run_chat_session(ticket_id: &str) -> anyhow::Result<()> {
             if let Event::Key(key) = event::read()? {
                 if let Some(reason) = global_chat_close_reason(key) {
                     if active_job.is_some() {
-                        if let Some(handle) = active_job.take() {
-                            handle.abort();
+                        if request_active_job_cancel(active_job.as_ref(), chat::CancelSource::CtrlC)
+                        {
+                            pending_close_after_cancel = Some(reason);
+                            status_hint = Some("interrupt requested".into());
+                            continue;
+                        }
+                        if let Some(job) = active_job.take() {
+                            job.handle.abort();
                         }
                         let _ = chat_tx.send(chat::ChatEvent::Cancelled {
                             ts: chrono::Utc::now(),
@@ -206,16 +222,21 @@ pub(crate) async fn run_chat_session(ticket_id: &str) -> anyhow::Result<()> {
 
                 if active_job.is_some() {
                     if let (KeyCode::Esc, _) = (key.code, key.modifiers) {
-                        if let Some(handle) = active_job.take() {
-                            handle.abort();
+                        if request_active_job_cancel(
+                            active_job.as_ref(),
+                            chat::CancelSource::EscKey,
+                        ) {
+                            status_hint = Some("interrupt requested".into());
+                        } else if let Some(job) = active_job.take() {
+                            job.handle.abort();
+                            let _ = chat_tx.send(chat::ChatEvent::Cancelled {
+                                ts: chrono::Utc::now(),
+                                by: chat::CancelSource::EscKey,
+                            });
+                            in_flight = None;
+                            turn_started = None;
+                            status_hint = Some("turn cancelled".into());
                         }
-                        let _ = chat_tx.send(chat::ChatEvent::Cancelled {
-                            ts: chrono::Utc::now(),
-                            by: chat::CancelSource::EscKey,
-                        });
-                        in_flight = None;
-                        turn_started = None;
-                        status_hint = Some("turn cancelled".into());
                     }
                     continue;
                 }
@@ -261,19 +282,9 @@ pub(crate) async fn run_chat_session(ticket_id: &str) -> anyhow::Result<()> {
                                 let tid = ticket_id.to_string();
                                 let provider = provider.clone();
                                 let tx = chat_tx.clone();
-                                turn_started = Some(std::time::Instant::now());
-                                active_job = Some(tokio::spawn(async move {
-                                    send_analyst_turn_with_progress(
-                                        &td,
-                                        &tid,
-                                        &body,
-                                        evidence,
-                                        provider.as_ref(),
-                                        tx,
-                                    )
-                                    .await
-                                    .map_err(|e| e.to_string())
-                                }));
+                                begin_analyst_turn(&mut in_flight, &mut turn_started);
+                                active_job =
+                                    Some(spawn_analyst_job(td, tid, body, evidence, provider, tx));
                             }
                         }
                         (KeyCode::Char('r'), KeyModifiers::CONTROL) => {
@@ -311,19 +322,9 @@ pub(crate) async fn run_chat_session(ticket_id: &str) -> anyhow::Result<()> {
                                     let evidence = std::mem::take(&mut pending_evidence);
                                     let provider = provider.clone();
                                     let tx = chat_tx.clone();
-                                    turn_started = Some(std::time::Instant::now());
-                                    active_job = Some(tokio::spawn(async move {
-                                        send_analyst_turn_with_progress(
-                                            &td,
-                                            &tid,
-                                            &b,
-                                            evidence,
-                                            provider.as_ref(),
-                                            tx,
-                                        )
-                                        .await
-                                        .map_err(|e| e.to_string())
-                                    }));
+                                    begin_analyst_turn(&mut in_flight, &mut turn_started);
+                                    active_job =
+                                        Some(spawn_analyst_job(td, tid, b, evidence, provider, tx));
                                 }
                                 ChatCommand::File(path) => {
                                     attach_file_to_pending(
@@ -391,19 +392,10 @@ pub(crate) async fn run_chat_session(ticket_id: &str) -> anyhow::Result<()> {
                                         let tid = ticket_id.to_string();
                                         let provider = provider.clone();
                                         let tx = chat_tx.clone();
-                                        turn_started = Some(std::time::Instant::now());
-                                        active_job = Some(tokio::spawn(async move {
-                                            send_analyst_turn_with_progress(
-                                                &td,
-                                                &tid,
-                                                &body,
-                                                evidence,
-                                                provider.as_ref(),
-                                                tx,
-                                            )
-                                            .await
-                                            .map_err(|e| e.to_string())
-                                        }));
+                                        begin_analyst_turn(&mut in_flight, &mut turn_started);
+                                        active_job = Some(spawn_analyst_job(
+                                            td, tid, body, evidence, provider, tx,
+                                        ));
                                     }
                                 }
                                 ChatCommand::Quit => {
@@ -505,11 +497,90 @@ fn clear_textarea(input: &mut tui_textarea::TextArea) {
     input.set_block(ratatui::widgets::Block::default());
 }
 
+fn begin_analyst_turn(
+    in_flight: &mut Option<crate::chat::ChatProgress>,
+    turn_started: &mut Option<std::time::Instant>,
+) {
+    let started = std::time::Instant::now();
+    *turn_started = Some(started);
+    *in_flight = Some(crate::chat::initial_turn_progress());
+}
+
+fn spawn_analyst_job(
+    ticket_dir: std::path::PathBuf,
+    ticket_id: String,
+    body: String,
+    evidence: Vec<crate::models::EvidenceProvenance>,
+    provider: std::sync::Arc<dyn crate::providers::LlmProvider>,
+    tx: tokio::sync::mpsc::UnboundedSender<crate::chat::ChatEvent>,
+) -> ActiveChatJob {
+    let (cancel_tx, cancel_rx) =
+        if crate::providers::active_codex_transport(provider.as_ref()) == Some("app-server") {
+            let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(None);
+            (Some(cancel_tx), Some(cancel_rx))
+        } else {
+            (None, None)
+        };
+    let handle = tokio::spawn(async move {
+        send_analyst_turn_with_progress(
+            &ticket_dir,
+            &ticket_id,
+            &body,
+            evidence,
+            provider.as_ref(),
+            tx,
+            cancel_rx,
+        )
+        .await
+        .map_err(|e| e.to_string())
+    });
+    ActiveChatJob { handle, cancel_tx }
+}
+
+fn request_active_job_cancel(
+    active_job: Option<&ActiveChatJob>,
+    source: crate::chat::CancelSource,
+) -> bool {
+    let Some(cancel_tx) = active_job.and_then(|job| job.cancel_tx.as_ref()) else {
+        return false;
+    };
+    let cancel = followup_cancel_from_chat_source(source);
+    cancel_tx.send(Some(cancel)).is_ok()
+}
+
+fn followup_cancel_from_chat_source(
+    source: crate::chat::CancelSource,
+) -> crate::providers::FollowupCancel {
+    match source {
+        crate::chat::CancelSource::EscKey => crate::providers::FollowupCancel::EscKey,
+        crate::chat::CancelSource::CtrlC => crate::providers::FollowupCancel::CtrlC,
+        crate::chat::CancelSource::AppExit => crate::providers::FollowupCancel::CtrlC,
+    }
+}
+
+fn chat_cancel_source_from_followup(
+    cancel: crate::providers::FollowupCancel,
+) -> crate::chat::CancelSource {
+    match cancel {
+        crate::providers::FollowupCancel::EscKey => crate::chat::CancelSource::EscKey,
+        crate::providers::FollowupCancel::CtrlC => crate::chat::CancelSource::CtrlC,
+    }
+}
+
+fn is_interrupted_followup(err: &crate::pipeline::PipelineError) -> bool {
+    matches!(
+        err,
+        crate::pipeline::PipelineError::Followup(crate::pipeline::FollowupError::Provider(
+            crate::providers::ProviderError::Interrupted
+        ))
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn drain_chat_events(
     chat_rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::chat::ChatEvent>,
     chat_logger: &mut crate::chat::ChatLogger,
-    active_job: &mut Option<JoinHandle<Result<(), String>>>,
+    active_job: &mut Option<ActiveChatJob>,
     in_flight: &mut Option<crate::chat::ChatProgress>,
     turn_started: &mut Option<std::time::Instant>,
     status_hint: &mut Option<String>,
@@ -538,7 +609,7 @@ fn drain_chat_events(
 #[allow(clippy::too_many_arguments)]
 fn apply_terminal_chat_event(
     evt: &crate::chat::ChatEvent,
-    active_job: &mut Option<JoinHandle<Result<(), String>>>,
+    active_job: &mut Option<ActiveChatJob>,
     in_flight: &mut Option<crate::chat::ChatProgress>,
     turn_started: &mut Option<std::time::Instant>,
     status_hint: &mut Option<String>,
@@ -794,10 +865,17 @@ async fn send_analyst_turn_with_progress(
     evidence: Vec<crate::models::EvidenceProvenance>,
     provider: &dyn crate::providers::LlmProvider,
     tx: tokio::sync::mpsc::UnboundedSender<crate::chat::ChatEvent>,
+    cancel_rx: Option<tokio::sync::watch::Receiver<Option<crate::providers::FollowupCancel>>>,
 ) -> anyhow::Result<()> {
     use crate::chat;
+    use std::sync::Arc;
+
     let model = std::env::var("CODEX_MODEL")
         .unwrap_or_else(|_| crate::providers::codex::DEFAULT_CODEX_MODEL.to_string());
+    let bridge_app_server =
+        crate::providers::active_codex_transport(provider) == Some("app-server");
+    let cancel_source_rx = cancel_rx.as_ref().cloned();
+    let turn_instant = std::time::Instant::now();
     let _ = tx.send(chat::ChatEvent::Phase {
         ts: chrono::Utc::now(),
         stage: chat::ChatStage::Ingesting,
@@ -874,8 +952,15 @@ async fn send_analyst_turn_with_progress(
         attachments: attachments.len(),
         session_id: None,
     });
-    let started = std::time::Instant::now();
-    let result = pipeline::followup_turn(
+    if bridge_app_server {
+        let tx_progress = tx.clone();
+        crate::providers::codex_app_server::set_progress_reporter(Some(Arc::new(
+            move |progress| chat::bridge_provider_progress(&tx_progress, turn_instant, progress),
+        )))
+        .await;
+    }
+    let started = turn_instant;
+    let result = pipeline::followup_turn_with_cancel(
         ticket_dir,
         ticket_id,
         &augmented_prompt,
@@ -884,8 +969,12 @@ async fn send_analyst_turn_with_progress(
         &attachments,
         provider,
         Some(&reporter),
+        cancel_rx,
     )
     .await;
+    if bridge_app_server {
+        crate::providers::codex_app_server::set_progress_reporter(None).await;
+    }
 
     match result {
         Ok(result) => {
@@ -913,6 +1002,18 @@ async fn send_analyst_turn_with_progress(
             Ok(())
         }
         Err(e) => {
+            if is_interrupted_followup(&e) {
+                let by = cancel_source_rx
+                    .as_ref()
+                    .and_then(|rx| *rx.borrow())
+                    .map(chat_cancel_source_from_followup)
+                    .unwrap_or(chat::CancelSource::EscKey);
+                let _ = tx.send(chat::ChatEvent::Cancelled {
+                    ts: chrono::Utc::now(),
+                    by,
+                });
+                return Ok(());
+            }
             let msg = e.to_string();
             let (redacted_msg, _) = crate::redact::redact(&msg);
             let _ = tx.send(chat::ChatEvent::ProviderError {
@@ -961,15 +1062,11 @@ mod tests {
         let ticket_dir = dir.path().join("44776");
         std::fs::create_dir_all(crate::chat::session_dir(&ticket_dir)).unwrap();
 
-        let mut active_job = Some(tokio::spawn(async { Ok::<(), String>(()) }));
-        let mut in_flight = Some(crate::chat::ChatProgress {
-            stage: crate::chat::ChatStage::ProviderAwait,
-            canned_msg: "awaiting provider",
-            elapsed_s: 0.0,
-            frame_idx: 0,
-            resumed: None,
-            session_id: None,
+        let mut active_job = Some(ActiveChatJob {
+            handle: tokio::spawn(async { Ok::<(), String>(()) }),
+            cancel_tx: None,
         });
+        let mut in_flight = Some(crate::chat::initial_turn_progress());
         let mut turn_started = Some(std::time::Instant::now());
         let mut status_hint = Some("working".to_string());
         let mut ask_input = tui_textarea::TextArea::default();
@@ -1282,6 +1379,7 @@ mod tests {
             Vec::new(),
             &StubProvider,
             tx,
+            None,
         )
         .await
         .unwrap();
@@ -1335,6 +1433,113 @@ mod tests {
         );
         let log_body = std::fs::read_to_string(chat_events_log_path(&ticket_dir)).unwrap();
         assert_eq!(log_body.lines().count(), 9);
+    }
+
+    #[tokio::test]
+    async fn interrupted_followup_logs_cancel_without_provider_turn() {
+        use crate::chat::ChatEvent;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ticket_dir = dir.path().join("44776");
+        std::fs::create_dir_all(crate::chat::session_dir(&ticket_dir)).unwrap();
+
+        struct InterruptedProvider;
+        impl crate::providers::LlmProvider for InterruptedProvider {
+            fn name(&self) -> &'static str {
+                "codex"
+            }
+
+            fn complete<'a>(
+                &'a self,
+                _prompt: &'a str,
+                _system_prompt: &'a str,
+                _model: &'a str,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<
+                                crate::providers::CompletionResult,
+                                crate::providers::ProviderError,
+                            >,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async { Err(crate::providers::ProviderError::Interrupted) })
+            }
+
+            fn followup_with_cancel<'a>(
+                &'a self,
+                _session_id: Option<&'a str>,
+                _prompt: &'a str,
+                _system_prompt: &'a str,
+                _model: &'a str,
+                _attachments: &'a [crate::models::Attachment],
+                _cancel_rx: Option<
+                    tokio::sync::watch::Receiver<Option<crate::providers::FollowupCancel>>,
+                >,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<
+                                crate::providers::FollowupResult,
+                                crate::providers::ProviderError,
+                            >,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async { Err(crate::providers::ProviderError::Interrupted) })
+            }
+        }
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ChatEvent>();
+        let (_cancel_tx, cancel_rx) =
+            tokio::sync::watch::channel(Some(crate::providers::FollowupCancel::CtrlC));
+        send_analyst_turn_with_progress(
+            &ticket_dir,
+            "44776",
+            "cancel me",
+            Vec::new(),
+            &InterruptedProvider,
+            tx,
+            Some(cancel_rx),
+        )
+        .await
+        .unwrap();
+
+        let mut cancelled_by = None;
+        let mut saw_provider_error = false;
+        while let Ok(evt) = rx.try_recv() {
+            match evt {
+                ChatEvent::Cancelled { by, .. } => cancelled_by = Some(by),
+                ChatEvent::ProviderError { .. } => saw_provider_error = true,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            cancelled_by,
+            Some(crate::chat::CancelSource::CtrlC),
+            "interrupted followup must preserve the requested cancel source"
+        );
+        assert!(
+            !saw_provider_error,
+            "interrupted followup must not log ProviderError"
+        );
+        let parsed = crate::chat::parse_conversation_jsonl(&crate::chat::conversation_jsonl_path(
+            &ticket_dir,
+        ))
+        .unwrap();
+        assert_eq!(parsed.turns.len(), 1);
+        assert!(matches!(
+            parsed.turns[0].turn_kind,
+            crate::models::TurnKind::Analyst
+        ));
+        crate::chat::acquire_session_lock(
+            &crate::chat::session_dir(&ticket_dir),
+            std::time::Duration::from_millis(50),
+        )
+        .expect("interrupted followup must release session lock");
     }
 
     #[tokio::test]

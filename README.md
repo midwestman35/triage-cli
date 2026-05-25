@@ -171,18 +171,38 @@ still injected under an isolated `TRIAGE_HOME`.
 | `LLM_PROVIDER` | `unleash` (default) or `codex`. |
 | `UNLEASH_API_KEY` | Required when `LLM_PROVIDER=unleash`. |
 | `UNLEASH_ASSISTANT_ID` | Required when `LLM_PROVIDER=unleash`. The model is selected server-side by the assistant; the CLI does not pass a model parameter. |
-| `CODEX_MODEL` | Model identifier passed to `codex exec` when `LLM_PROVIDER=codex`. Default `gpt-5.5`. |
+| `CODEX_TRANSPORT` | When `LLM_PROVIDER=codex`: `app-server` (default) or `exec`. See *Codex transport* below. |
+| `CODEX_MODEL` | Model passed to Codex (`exec` and app-server). Default `gpt-5.5`. |
 
 ## LLM providers
 
 | Value | Mechanism | Auth | Notes |
 |---|---|---|---|
 | `unleash` *(default)* | HTTP to `/chats` | `UNLEASH_API_KEY` + `UNLEASH_ASSISTANT_ID` | Internal Axon gateway. Model is chosen server-side by the assistant ID. |
-| `codex` | Subprocess to `codex exec` | Inherits codex OAuth | `codex` must be on PATH. Default model `gpt-5.5`, override with `CODEX_MODEL`. |
+| `codex` | Codex CLI (app-server or `exec`) | ChatGPT via app-server device-code in `setup`, or inherited `codex` OAuth when `CODEX_TRANSPORT=exec` | `codex` must be on PATH. Default model `gpt-5.5`, override with `CODEX_MODEL`. |
 
 `unleash` is the production path; `codex` is the dev escape hatch when the
 gateway is unreachable. The `claude` and `openai` providers were removed
 2026-05-14 — see `docs/adr/0002-prune-claude-openai-providers.md`.
+
+### Codex transport (`LLM_PROVIDER=codex`)
+
+| `CODEX_TRANSPORT` | Behavior |
+| --- | --- |
+| `app-server` *(default)* | Persistent `codex app-server --listen stdio://` for **inbox chat** follow-ups; lower latency and streamed progress. Structured `triage` / `investigate` LLM steps still use `codex exec` in v1. |
+| `exec` | Subprocess-only (`codex exec` / `resume`) for all Codex calls. Use for CI, older CLI builds, or rollback. |
+
+If app-server is selected but unavailable at runtime, the CLI falls back to
+`exec` once per process (stderr hint). `triage-cli setup` probes capability and
+writes `CODEX_TRANSPORT=app-server` or `exec` into `.env`. See
+`docs/adr/0004-codex-app-server-transport.md` and
+`docs/superpowers/plans/2026-05-25-codex-app-server-transition.md`.
+
+**First-time Codex auth:** run `triage-cli setup`, choose Codex, complete the
+device-code flow when prompted (verification URL + user code). OAuth tokens are
+not written to `.env`. **`triage-cli doctor`** with `LLM_PROVIDER=codex` checks
+`codex` on PATH, app-server subcommand (unless `CODEX_TRANSPORT=exec`),
+`initialize`, authenticated `account/read`, and `CODEX_MODEL` in `model/list`.
 
 ## Building the site map
 
@@ -211,8 +231,8 @@ triage-cli doctor
 ```
 
 Prints green/red checks for Zendesk credentials, the selected LLM provider
-key (or subprocess binary on PATH), and scratch-dir writability. Exits 0
-when all critical checks pass.
+(Unleash keys, or Codex binary + app-server auth when applicable), and
+scratch-dir writability. Exits 0 when all critical checks pass.
 
 ### Guided investigation
 
@@ -404,7 +424,7 @@ triage-cli/
         ├── zendesk.rs              # Zendesk HTTP client
         ├── datadog.rs              # Datadog Logs v2 HTTP client
         ├── llm.rs                  # provider dispatch + structured output + retry
-        ├── providers/              # mod, unleash, codex
+        ├── providers/              # mod, unleash, codex, codex_app_server
         ├── tui/                    # inbox ratatui app
         ├── models.rs               # serde data models
         ├── memory.rs               # MEMORY.md + FTS5 (schema v2)

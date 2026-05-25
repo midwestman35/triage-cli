@@ -1,15 +1,18 @@
 //! LLM provider abstraction. Variant selected via `LLM_PROVIDER` env var.
 //!
 //! - `unleash` (default): HTTP to Unleash gateway (`/chats`)
-//! - `codex`: subprocess to `codex exec` (new — no Python equivalent; see
-//!   `REGRESSIONS.md` R2)
+//! - `codex`: `CODEX_TRANSPORT=app-server` (persistent JSON-RPC) or `exec`
+//!   (`codex exec` subprocess for structured `complete()` and fallback)
 
 pub mod codex;
+pub mod codex_app_server;
+pub(crate) mod codex_schema;
 pub mod unleash;
 
 use std::env;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::OnceLock;
 
 use thiserror::Error;
 
@@ -20,6 +23,14 @@ pub struct CompletionResult {
     pub text: String,
     pub tokens_in: Option<u32>,
     pub tokens_out: Option<u32>,
+}
+
+/// Internal provider progress events (bridged to inbox `ChatEvent` in Phase 4).
+#[derive(Debug, Clone)]
+pub enum ProviderProgress {
+    Stage { label: String },
+    TextDelta { text: String },
+    Error { message: String },
 }
 
 /// Returned by `LlmProvider::followup`. Extends `CompletionResult` with
@@ -33,6 +44,12 @@ pub struct FollowupResult {
     pub resumed: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FollowupCancel {
+    EscKey,
+    CtrlC,
+}
+
 /// Single-turn LLM completion contract. Mirrors Python `LLMProvider.complete`.
 ///
 /// Rust 1.95 supports `async fn` in traits natively. We use the explicit
@@ -41,6 +58,12 @@ pub struct FollowupResult {
 /// concrete provider is selected at runtime from `LLM_PROVIDER`.
 pub trait LlmProvider: Send + Sync {
     fn name(&self) -> &'static str;
+
+    /// When `name()` is `codex`, the active transport (`app-server` | `exec`).
+    fn codex_transport(&self) -> Option<&'static str> {
+        None
+    }
+
     fn complete<'a>(
         &'a self,
         prompt: &'a str,
@@ -72,6 +95,19 @@ pub trait LlmProvider: Send + Sync {
             })
         })
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn followup_with_cancel<'a>(
+        &'a self,
+        session_id: Option<&'a str>,
+        prompt: &'a str,
+        system_prompt: &'a str,
+        model: &'a str,
+        attachments: &'a [crate::models::Attachment],
+        _cancel_rx: Option<tokio::sync::watch::Receiver<Option<FollowupCancel>>>,
+    ) -> Pin<Box<dyn Future<Output = Result<FollowupResult, ProviderError>> + Send + 'a>> {
+        self.followup(session_id, prompt, system_prompt, model, attachments)
+    }
 }
 
 #[derive(Debug, Error)]
@@ -96,6 +132,50 @@ pub enum ProviderError {
     SubprocessMissing(&'static str),
     #[error("subprocess {0} failed: {1}")]
     SubprocessFailure(&'static str, String),
+    #[error("LLM provider turn interrupted")]
+    Interrupted,
+}
+
+fn codex_transport_mode() -> CodexTransportMode {
+    let raw = env::var("CODEX_TRANSPORT").unwrap_or_default();
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "exec" => CodexTransportMode::Exec,
+        "app-server" | "app_server" => CodexTransportMode::AppServer,
+        "" => CodexTransportMode::AppServer,
+        _ => CodexTransportMode::AppServer,
+    }
+}
+
+static EFFECTIVE_CODEX_TRANSPORT: OnceLock<&'static str> = OnceLock::new();
+
+fn record_effective_codex_transport(label: &'static str) {
+    let _ = EFFECTIVE_CODEX_TRANSPORT.get_or_init(|| label);
+}
+
+/// Active Codex transport for the running provider instance, when known.
+pub fn active_codex_transport(provider: &dyn LlmProvider) -> Option<&'static str> {
+    provider
+        .codex_transport()
+        .or((provider.name() == "codex").then(|| codex_transport_label()))
+}
+
+/// Codex transport label for session provenance (`app-server` | `exec`).
+/// After `get_provider()`, reflects the provider actually selected (including
+/// exec fallback when app-server probe fails). Before that, reflects env intent.
+pub fn codex_transport_label() -> &'static str {
+    EFFECTIVE_CODEX_TRANSPORT
+        .get()
+        .copied()
+        .unwrap_or_else(|| match codex_transport_mode() {
+            CodexTransportMode::Exec => "exec",
+            CodexTransportMode::AppServer => "app-server",
+        })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexTransportMode {
+    AppServer,
+    Exec,
 }
 
 /// Return the configured LLM provider.
@@ -103,7 +183,19 @@ pub fn get_provider() -> Result<Box<dyn LlmProvider>, ProviderError> {
     let raw = env::var("LLM_PROVIDER").unwrap_or_else(|_| "unleash".into());
     match raw.to_ascii_lowercase().as_str() {
         "unleash" => Ok(Box::new(unleash::UnleashProvider)),
-        "codex" => Ok(Box::new(codex::CodexSubprocessProvider)),
+        "codex" => {
+            if codex_transport_mode() == CodexTransportMode::Exec {
+                record_effective_codex_transport("exec");
+                Ok(Box::new(codex::CodexSubprocessProvider))
+            } else if codex_app_server::probe_app_server_sync() {
+                record_effective_codex_transport("app-server");
+                Ok(Box::new(codex_app_server::CodexAppServerProvider::new()))
+            } else {
+                codex_app_server::log_app_server_fallback_once();
+                record_effective_codex_transport("exec");
+                Ok(Box::new(codex::CodexSubprocessProvider))
+            }
+        }
         _ => Err(ProviderError::Unknown(raw)),
     }
 }

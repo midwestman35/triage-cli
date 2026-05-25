@@ -103,6 +103,12 @@ pub struct SessionManifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_resumed_at: Option<DateTime<Utc>>,
     pub resume_count: u32,
+    /// Canonical resumable Codex thread id when using app-server transport.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_thread_id: Option<String>,
+    /// Transport recorded at session creation: `app-server` or `exec`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_transport: Option<String>,
     /// Records how the session ID was extracted (one of
     /// `codex_json_output`, `stderr_session_id_line`, `none_replay_only`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -214,11 +220,35 @@ mod tests {
             created_at: "2026-05-15T14:21:02Z".parse().unwrap(),
             last_resumed_at: Some("2026-05-17T09:14:54Z".parse().unwrap()),
             resume_count: 1,
-            codex_capture_method: Some("stderr_session_id_line".into()),
+            codex_thread_id: Some("thread-abc".into()),
+            codex_transport: Some("app-server".into()),
+            codex_capture_method: Some("app_server_thread_id".into()),
         };
         let json = serde_json::to_string_pretty(&m).unwrap();
         let back: SessionManifest = serde_json::from_str(&json).unwrap();
         assert_eq!(back.provider, "codex");
         assert_eq!(back.resume_count, 1);
+        assert_eq!(back.codex_thread_id.as_deref(), Some("thread-abc"));
+        assert_eq!(back.codex_transport.as_deref(), Some("app-server"));
+    }
+
+    #[test]
+    fn session_manifest_legacy_json_without_new_fields() {
+        let json = r#"{
+            "version": 1,
+            "provider": "codex",
+            "model": "gpt-5.5",
+            "created_at": "2026-05-15T14:21:02Z",
+            "resume_count": 0,
+            "codex_capture_method": "codex_json_output"
+        }"#;
+        let back: SessionManifest = serde_json::from_str(json).unwrap();
+        assert_eq!(back.provider, "codex");
+        assert!(back.codex_thread_id.is_none());
+        assert!(back.codex_transport.is_none());
+        assert_eq!(
+            back.codex_capture_method.as_deref(),
+            Some("codex_json_output")
+        );
     }
 }

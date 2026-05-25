@@ -24,6 +24,10 @@ impl LlmProvider for CodexSubprocessProvider {
         "codex"
     }
 
+    fn codex_transport(&self) -> Option<&'static str> {
+        Some("exec")
+    }
+
     fn complete<'a>(
         &'a self,
         prompt: &'a str,

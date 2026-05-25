@@ -10,7 +10,8 @@ This guide covers all test tiers for triage-cli and how to set up a sandbox for 
 | Integration | `cargo test --test integration` | No | No | Yes |
 | CLI Smoke | `cargo test --test integration runbook_cli` | No | No | Yes (needs release build) |
 | Sandbox (live) | `SANDBOX_INTEGRATION=1 cargo test --test sandbox -- --nocapture` | Yes | Yes | No |
-| Codex Contract | `CODEX_AVAILABLE=1 cargo test --test codex_contract -- --nocapture` | Yes | Yes | No |
+| Codex Contract (exec) | `CODEX_AVAILABLE=1 cargo test --test codex_contract -- --nocapture` | Yes | Yes | No |
+| Codex App-Server Contract | `CODEX_AVAILABLE=1 cargo test --test codex_app_server_contract -- --nocapture` | Yes | Yes | No |
 
 ## Running All Offline Tests
 
@@ -24,6 +25,19 @@ cargo fmt --all -- --check
 ```
 
 No `.env`, no credentials, no network required.
+
+## CI and Codex (`CODEX_TRANSPORT` / `CODEX_AVAILABLE`)
+
+- **Default CI:** use `CODEX_TRANSPORT=exec` or `LLM_PROVIDER=unleash`; do not set `CODEX_AVAILABLE=1`.
+- **Optional job** with an authenticated `codex` on PATH:
+
+  ```bash
+  export CODEX_AVAILABLE=1
+  CODEX_AVAILABLE=1 cargo test --test codex_contract -- --nocapture --test-threads=1
+  CODEX_AVAILABLE=1 cargo test --test codex_app_server_contract -- --nocapture
+  ```
+
+See `TESTING.md` and `docs/adr/0004-codex-app-server-transport.md`.
 
 ## Live Sandbox Tests
 

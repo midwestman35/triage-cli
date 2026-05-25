@@ -52,6 +52,7 @@ polling on the `--poll` interval.
 | `tab` / `shift-tab` | cycle into and through the file tabs |
 | `escape` | return to synth view / list |
 | `r` | force a refresh / immediate poll |
+| `a` | open chat for the selected ticket |
 | `y` | copy the selected ticket's synth summary |
 | `o` | open the selected ticket in Zendesk |
 | `q` or Ctrl-C | quit |
@@ -65,6 +66,18 @@ pane prompts you to select a ticket.
 If a clipboard tool is missing, install one of `wl-copy`, `xclip`, or `pbcopy`.
 Opening Zendesk requires `ZENDESK_SUBDOMAIN` in the environment; the app also
 shows the URL in a toast.
+
+## Chat and Cancel
+
+Press `a` on a selected ticket to open the chat session for that ticket. With
+`LLM_PROVIDER=codex`, inbox follow-up uses `CODEX_TRANSPORT`: app-server when
+available, or exec when forced / falling back. `CODEX_COMPLETE_TRANSPORT` does
+not change inbox follow-up; it only controls structured `complete()` calls used
+by triage and extraction.
+
+Cancel is transport-specific. App-server can interrupt a server-side turn once
+v2 Track 3 lands (`turn/interrupt` with the active `threadId` + `turnId`). Exec
+cancel is local-only unless a separate exec process-kill task is implemented.
 
 ## Status Icons
 
