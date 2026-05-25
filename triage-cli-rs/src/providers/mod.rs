@@ -141,12 +141,13 @@ pub fn active_codex_transport(provider: &dyn LlmProvider) -> Option<&'static str
 /// After `get_provider()`, reflects the provider actually selected (including
 /// exec fallback when app-server probe fails). Before that, reflects env intent.
 pub fn codex_transport_label() -> &'static str {
-    EFFECTIVE_CODEX_TRANSPORT.get().copied().unwrap_or_else(|| {
-        match codex_transport_mode() {
+    EFFECTIVE_CODEX_TRANSPORT
+        .get()
+        .copied()
+        .unwrap_or_else(|| match codex_transport_mode() {
             CodexTransportMode::Exec => "exec",
             CodexTransportMode::AppServer => "app-server",
-        }
-    })
+        })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

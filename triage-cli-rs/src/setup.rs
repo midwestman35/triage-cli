@@ -194,9 +194,7 @@ async fn check_codex_doctor(ok: &mut bool) -> bool {
         let transport = StdioAppServerTransport::spawn().await?;
         let mut client = CodexAppServerClient::new(transport);
         client.initialize().await?;
-        Ok::<CodexAppServerClient<StdioAppServerTransport>, crate::providers::ProviderError>(
-            client,
-        )
+        Ok::<CodexAppServerClient<StdioAppServerTransport>, crate::providers::ProviderError>(client)
     }
     .await;
 
@@ -239,10 +237,7 @@ async fn check_codex_doctor(ok: &mut bool) -> bool {
             eprintln!("  {} model `{model}` in model/list", "✓".green());
         }
         Ok(_) => {
-            eprintln!(
-                "  {} model `{model}` not found in model/list",
-                "✗".red()
-            );
+            eprintln!("  {} model `{model}` not found in model/list", "✗".red());
             eprintln!("  ({SETUP_HINT})");
             codex_ok = false;
         }
@@ -260,7 +255,9 @@ async fn check_codex_doctor(ok: &mut bool) -> bool {
 }
 
 fn codex_transport_for_setup() -> (&'static str, bool) {
-    use crate::providers::codex_app_server::{codex_supports_app_server_sync, probe_app_server_sync};
+    use crate::providers::codex_app_server::{
+        codex_supports_app_server_sync, probe_app_server_sync,
+    };
     if codex_supports_app_server_sync() && probe_app_server_sync() {
         ("app-server", false)
     } else {
@@ -278,15 +275,9 @@ async fn setup_codex_app_server_auth() -> Result<(), String> {
         .await
         .map_err(|e| e.to_string())?;
     let mut client = CodexAppServerClient::new(transport);
-    client
-        .initialize()
-        .await
-        .map_err(|e| e.to_string())?;
+    client.initialize().await.map_err(|e| e.to_string())?;
 
-    let account = client
-        .account_read()
-        .await
-        .map_err(|e| e.to_string())?;
+    let account = client.account_read().await.map_err(|e| e.to_string())?;
     if account_is_authenticated(&account) {
         eprintln!("  {} Codex already authenticated", "✓".green());
         if let Some(email) = account_email(&account) {

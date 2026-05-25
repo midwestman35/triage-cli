@@ -24,7 +24,9 @@ validator behavior — is documented in **`docs/spec/v1-reframe.md`**.
 - `triage-cli investigate <id-or-url>` — interactive guided session. Fetches
   the ticket, downloads attachments to a scratch workspace, prompts the
   analyst to drop in files / paste logs, then runs the structured pipeline
-  and writes the ticket folder. Requires TTY.
+  and writes the ticket folder. Requires TTY for live Zendesk tickets.
+  `--fixture <dir>` replays a canned ticket offline, skips attachment prompts,
+  and does not require Zendesk credentials.
 - `triage-cli triage <id-or-url>` — headless single-shot. Same pipeline,
   no evidence prompts. Writes the ticket folder and prints
   `FORK_PACKET.md` to stdout (pipeable handoff).
@@ -127,6 +129,21 @@ re-run. You can also manually copy `.env.example`:
 ```bash
 cp .env.example .env
 ```
+
+### Fixture and demo runs
+
+For offline smoke tests, use the canned fixtures:
+
+```bash
+triage-cli triage 55001 --fixture triage-cli-rs/fixtures/audio-drop --no-llm --force
+triage-cli demo audio-drop
+```
+
+Fixture and demo mode load canned ticket, Datadog, and memory inputs. They do
+not require Zendesk credentials, Datadog credentials, or a prebuilt
+`$TRIAGE_HOME/data/cnc-map.json`. If you pass `--site` during a fixture run,
+that value is used as the Datadog site hint; otherwise the canned logs are
+still injected under an isolated `TRIAGE_HOME`.
 
 ## Configuration
 
@@ -239,6 +256,16 @@ triage-cli investigate 12345 --verbose    # phase-by-phase stderr trace
 ```
 
 `--file` and `--paste LABEL=TEXT` may be repeated.
+
+For offline fixture replays during development or testing:
+
+```bash
+triage-cli investigate --fixture triage-cli-rs/fixtures/audio-drop --no-llm --force
+```
+
+This loads `ticket.json`, `datadog-logs.json`, and `memory-hits.json` from the
+fixture directory and skips the live Zendesk fetch plus attachment-download
+prompts.
 
 ### Fast one-shot triage
 

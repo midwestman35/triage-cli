@@ -133,6 +133,14 @@ Four named fixtures in `triage-cli-rs/fixtures/`:
 
 Each contains `ticket.json`, `datadog-logs.json` (optional), and `memory-hits.json` (optional).
 
+CLI fixture smoke coverage also exercises the command surface under an empty
+isolated `TRIAGE_HOME`. The regression check lives in
+`runbook_02_cli_triage_fixture_isolated_home_preserves_datadog_metrics`, which
+runs `triage --fixture ... --no-llm --force --metrics-out ...` without copying
+`apex-cnc-inventory.md` or running `build-map`, then asserts the metrics JSON
+contains `evidence_counts.datadog_lines == 8`. That is the guard against the
+isolated-home fixture bug regressing back to `datadog_lines: 0`.
+
 ### Key Patterns
 
 - **`MemoryEnvScope`** — RAII guard that overrides `TRIAGE_MEMORY_MD`, `TRIAGE_MEMORY_DB`, and `TRIAGE_TICKETS_ROOT` to temp paths and restores on drop. All integration tests use this to avoid polluting real data.

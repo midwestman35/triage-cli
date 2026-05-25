@@ -1021,7 +1021,10 @@ pub fn update_progress(prev: Option<ChatProgress>, evt: &ChatEvent) -> Option<Ch
             let draft_text = append_draft_snippet(base.draft_text, text);
             Some(ChatProgress {
                 stage: ChatStage::ProviderAwait,
-                canned_msg: canned_message(ChatStage::ProviderAwait, (base.elapsed_s / 4.0) as usize),
+                canned_msg: canned_message(
+                    ChatStage::ProviderAwait,
+                    (base.elapsed_s / 4.0) as usize,
+                ),
                 draft_text,
                 ..base
             })

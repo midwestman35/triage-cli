@@ -17,9 +17,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::timeout;
 
 use super::codex::CodexSubprocessProvider;
-use super::{
-    CompletionResult, FollowupResult, LlmProvider, ProviderError, ProviderProgress,
-};
+use super::{CompletionResult, FollowupResult, LlmProvider, ProviderError, ProviderProgress};
 
 /// JSON-RPC overload / rate-limit code from the Codex app-server.
 pub const JSONRPC_OVERLOAD_CODE: i64 = -32001;
@@ -205,16 +203,16 @@ impl StdioAppServerTransport {
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
             .spawn()
-            .map_err(|e| {
-                ProviderError::SubprocessFailure("codex app-server", e.to_string())
-            })?;
+            .map_err(|e| ProviderError::SubprocessFailure("codex app-server", e.to_string()))?;
 
-        let stdin = child.stdin.take().ok_or_else(|| {
-            ProviderError::Transport("codex app-server: stdin not piped".into())
-        })?;
-        let stdout = child.stdout.take().ok_or_else(|| {
-            ProviderError::Transport("codex app-server: stdout not piped".into())
-        })?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| ProviderError::Transport("codex app-server: stdin not piped".into()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| ProviderError::Transport("codex app-server: stdout not piped".into()))?;
 
         Ok(Self {
             child,
@@ -247,10 +245,7 @@ impl StdioAppServerTransport {
         let stderr = self.stderr_snippet().await;
         match (status, stderr.is_empty()) {
             (Some(s), true) => format!("{context}: child exited {:?} ", s.code()),
-            (Some(s), false) => format!(
-                "{context}: child exited {:?}; stderr: {stderr}",
-                s.code()
-            ),
+            (Some(s), false) => format!("{context}: child exited {:?}; stderr: {stderr}", s.code()),
             (None, false) => format!("{context}; stderr: {stderr}"),
             (None, true) => context.to_string(),
         }
@@ -389,7 +384,10 @@ impl<T: AppServerTransport> CodexAppServerClient<T> {
 
             let msg = parse_line(&line)?;
 
-            if try_handle_server_request(&mut self.transport, &msg).await?.is_some() {
+            if try_handle_server_request(&mut self.transport, &msg)
+                .await?
+                .is_some()
+            {
                 continue;
             }
 
@@ -552,7 +550,10 @@ impl<T: AppServerTransport> CodexAppServerClient<T> {
                 Err(e) => return Err(e),
             };
 
-            if try_handle_server_request(&mut self.transport, &msg).await?.is_some() {
+            if try_handle_server_request(&mut self.transport, &msg)
+                .await?
+                .is_some()
+            {
                 continue;
             }
 
@@ -582,7 +583,10 @@ impl<T: AppServerTransport> CodexAppServerClient<T> {
         }
     }
 
-    async fn drain_until_turn_completed(&mut self, thread_id: &str) -> Result<String, ProviderError> {
+    async fn drain_until_turn_completed(
+        &mut self,
+        thread_id: &str,
+    ) -> Result<String, ProviderError> {
         let started = Instant::now();
         let mut lines = 0usize;
         let mut text = String::new();
@@ -614,7 +618,10 @@ impl<T: AppServerTransport> CodexAppServerClient<T> {
 
             let msg = parse_line(&line)?;
 
-            if try_handle_server_request(&mut self.transport, &msg).await?.is_some() {
+            if try_handle_server_request(&mut self.transport, &msg)
+                .await?
+                .is_some()
+            {
                 continue;
             }
 
@@ -733,9 +740,7 @@ fn jsonrpc_error_to_provider(error: &Value) -> ProviderError {
         .get("message")
         .and_then(Value::as_str)
         .unwrap_or("unknown error");
-    ProviderError::Transport(format!(
-        "codex app-server JSON-RPC error {code}: {message}"
-    ))
+    ProviderError::Transport(format!("codex app-server JSON-RPC error {code}: {message}"))
 }
 
 fn thread_id_from_result(result: &Value) -> Option<String> {
@@ -752,9 +757,7 @@ pub fn account_is_authenticated(result: &Value) -> bool {
 
 /// Email from a ChatGPT `account/read` payload, when present.
 pub fn account_email(result: &Value) -> Option<&str> {
-    result
-        .pointer("/account/email")
-        .and_then(Value::as_str)
+    result.pointer("/account/email").and_then(Value::as_str)
 }
 
 /// Device-code fields from `account/login/start` (`chatgptDeviceCode` variant).
@@ -782,9 +785,7 @@ pub fn model_list_contains(result: &Value, model_id: &str) -> bool {
 fn is_thread_resume_failure(err: &ProviderError) -> bool {
     match err {
         ProviderError::Transport(msg) => {
-            msg.contains("thread/resume")
-                || msg.contains("not found")
-                || msg.contains("no rollout")
+            msg.contains("thread/resume") || msg.contains("not found") || msg.contains("no rollout")
         }
         _ => false,
     }
@@ -1056,10 +1057,8 @@ mod tests {
 
     #[tokio::test]
     async fn fake_thread_start_returns_thread_id() {
-        let transport = FakeAppServerTransport::new([
-            initialize_ok_response(1),
-            thread_start_ok(2),
-        ]);
+        let transport =
+            FakeAppServerTransport::new([initialize_ok_response(1), thread_start_ok(2)]);
         let mut client = CodexAppServerClient::new(transport);
         client.initialize().await.unwrap();
         let tid = client.thread_start("sys", "gpt-5.5").await.unwrap();
@@ -1138,15 +1137,18 @@ mod tests {
             serde_json::json!({
                 "method": "item/agentMessage/delta",
                 "params": { "delta": "hel", "itemId": "i", "threadId": "t1", "turnId": "turn-1" }
-            }).to_string(),
+            })
+            .to_string(),
             serde_json::json!({
                 "method": "item/agentMessage/delta",
                 "params": { "delta": "lo", "itemId": "i", "threadId": "t1", "turnId": "turn-1" }
-            }).to_string(),
+            })
+            .to_string(),
             serde_json::json!({
                 "method": "turn/completed",
                 "params": { "threadId": "t1", "turn": { "id": "turn-1" } }
-            }).to_string(),
+            })
+            .to_string(),
         ]);
         let mut client = CodexAppServerClient::new(transport);
         client.initialize().await.unwrap();
