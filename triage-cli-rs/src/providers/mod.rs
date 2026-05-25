@@ -5,6 +5,7 @@
 //!   `REGRESSIONS.md` R2)
 
 pub mod codex;
+pub mod codex_app_server;
 pub mod unleash;
 
 use std::env;
