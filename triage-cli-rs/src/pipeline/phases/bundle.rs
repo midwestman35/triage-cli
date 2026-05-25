@@ -26,10 +26,8 @@ pub fn run(
         "evidence.datadog_lines",
         MetricValue::Int(enrichment.log_lines.len() as i64),
     );
-    ctx.reporter.record_metric(
-        "evidence.memory_hits",
-        MetricValue::Int(prior.len() as i64),
-    );
+    ctx.reporter
+        .record_metric("evidence.memory_hits", MetricValue::Int(prior.len() as i64));
 
     // Build the evidence bundle unconditionally so both the LLM path and the
     // --no-llm path have access to the assigned-ID evidence list. The

@@ -19,8 +19,8 @@ use thiserror::Error;
 
 use crate::investigation;
 use crate::models::{
-    BaseEvidenceManifest, EvidenceProvenance, ExtractionStatus, SessionManifest, Ticket, Turn,
-    TurnKind,
+    BaseEvidenceManifest, EvidenceProvenance, ExtractionStatus, FileType, SessionManifest, Ticket,
+    Turn, TurnKind,
 };
 
 #[derive(Debug, Error)]
@@ -267,7 +267,7 @@ pub fn attach_file(
             .join("attachments")
             .join(format!("turn-{turn_no:03}"));
         fs::create_dir_all(&dst_dir)?;
-        let dst = dst_dir.join(&basename);
+        let dst = unique_attachment_path(&dst_dir, &basename, &sha256);
         fs::copy(source, &dst)?;
         dst
     };
@@ -335,6 +335,39 @@ fn sha256_of_file(path: &Path) -> Result<String, ChatError> {
         hasher.update(&buf[..n]);
     }
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn unique_attachment_path(dst_dir: &Path, basename: &str, sha256: &str) -> PathBuf {
+    let initial = dst_dir.join(basename);
+    if !initial.exists() {
+        return initial;
+    }
+
+    let source_name = Path::new(basename);
+    let stem = source_name
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("attachment");
+    let ext = source_name.extension().and_then(|s| s.to_str());
+    let short_hash = &sha256[..sha256.len().min(8)];
+
+    for n in 0.. {
+        let suffix = if n == 0 {
+            short_hash.to_string()
+        } else {
+            format!("{short_hash}-{n}")
+        };
+        let candidate_name = match ext {
+            Some(ext) if !ext.is_empty() => format!("{stem}-{suffix}.{ext}"),
+            _ => format!("{stem}-{suffix}"),
+        };
+        let candidate = dst_dir.join(candidate_name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+
+    unreachable!("unbounded suffix loop must return")
 }
 
 // Private JSON helpers: extract common serde + atomic_write pattern.
@@ -606,11 +639,584 @@ Earlier turns in this analyst chat, oldest first:\n",
     ))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatStage {
+    Ingesting,
+    ContextAssembled,
+    SessionResumeAttempt,
+    ProviderAwait,
+    ResponseParsed,
+    Saved,
+}
+
+pub fn canned_message(stage: ChatStage, rotation_idx: usize) -> &'static str {
+    match stage {
+        ChatStage::Ingesting => "loading attachments…",
+        ChatStage::ContextAssembled => "reading the ticket…",
+        ChatStage::SessionResumeAttempt => "resuming session…",
+        ChatStage::ProviderAwait => {
+            const AWAIT_CYCLE: [&str; 4] = [
+                "asking around…",
+                "thinking it through…",
+                "still working…",
+                "the model is taking its time…",
+            ];
+            AWAIT_CYCLE[rotation_idx % AWAIT_CYCLE.len()]
+        }
+        ChatStage::ResponseParsed => "writing it up…",
+        ChatStage::Saved => "saved",
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionCloseReason {
+    UserQuit,
+    EscFromAsk,
+    EscFromInflight,
+    CtrlC,
+    ProviderUnavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CancelSource {
+    EscKey,
+    CtrlC,
+    AppExit,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ChatEvent {
+    SessionOpened {
+        ticket_id: String,
+        ts: chrono::DateTime<chrono::Utc>,
+    },
+    SessionClosed {
+        ts: chrono::DateTime<chrono::Utc>,
+        reason: SessionCloseReason,
+    },
+    KeyCommand {
+        ts: chrono::DateTime<chrono::Utc>,
+        command: String,
+    },
+    EvidenceAttached {
+        ts: chrono::DateTime<chrono::Utc>,
+        provenance: EvidenceProvenance,
+    },
+    EvidenceRejected {
+        ts: chrono::DateTime<chrono::Utc>,
+        reason: String,
+    },
+    AnalystAppended {
+        ts: chrono::DateTime<chrono::Utc>,
+        turn: u32,
+    },
+    Phase {
+        ts: chrono::DateTime<chrono::Utc>,
+        stage: ChatStage,
+        elapsed_s: f64,
+    },
+    ProviderRequest {
+        ts: chrono::DateTime<chrono::Utc>,
+        provider: String,
+        model: String,
+        prompt_bytes: usize,
+        attachments: usize,
+        session_id: Option<String>,
+    },
+    ProviderResponse {
+        ts: chrono::DateTime<chrono::Utc>,
+        elapsed_s: f64,
+        tokens_in: Option<u32>,
+        tokens_out: Option<u32>,
+        resumed: bool,
+        session_id: Option<String>,
+    },
+    ProviderError {
+        ts: chrono::DateTime<chrono::Utc>,
+        #[serde(rename = "error_kind")]
+        kind: String,
+        message: String,
+    },
+    TurnPersisted {
+        ts: chrono::DateTime<chrono::Utc>,
+        codex_turn: u32,
+    },
+    Cancelled {
+        ts: chrono::DateTime<chrono::Utc>,
+        by: CancelSource,
+    },
+}
+
+impl PartialEq for ChatEvent {
+    fn eq(&self, other: &Self) -> bool {
+        use ChatEvent::*;
+        match (self, other) {
+            (
+                SessionOpened {
+                    ticket_id: a_id,
+                    ts: a_ts,
+                },
+                SessionOpened {
+                    ticket_id: b_id,
+                    ts: b_ts,
+                },
+            ) => a_id == b_id && a_ts == b_ts,
+            (
+                SessionClosed {
+                    ts: a_ts,
+                    reason: a,
+                },
+                SessionClosed {
+                    ts: b_ts,
+                    reason: b,
+                },
+            ) => a_ts == b_ts && a == b,
+            (
+                KeyCommand {
+                    ts: a_ts,
+                    command: a,
+                },
+                KeyCommand {
+                    ts: b_ts,
+                    command: b,
+                },
+            ) => a_ts == b_ts && a == b,
+            (
+                EvidenceAttached {
+                    ts: a_ts,
+                    provenance: a,
+                },
+                EvidenceAttached {
+                    ts: b_ts,
+                    provenance: b,
+                },
+            ) => a_ts == b_ts && serde_json::to_value(a).ok() == serde_json::to_value(b).ok(),
+            (
+                EvidenceRejected {
+                    ts: a_ts,
+                    reason: a,
+                },
+                EvidenceRejected {
+                    ts: b_ts,
+                    reason: b,
+                },
+            ) => a_ts == b_ts && a == b,
+            (AnalystAppended { ts: a_ts, turn: a }, AnalystAppended { ts: b_ts, turn: b }) => {
+                a_ts == b_ts && a == b
+            }
+            (
+                Phase {
+                    ts: a_ts,
+                    stage: a_stage,
+                    elapsed_s: a_elapsed,
+                },
+                Phase {
+                    ts: b_ts,
+                    stage: b_stage,
+                    elapsed_s: b_elapsed,
+                },
+            ) => a_ts == b_ts && a_stage == b_stage && a_elapsed == b_elapsed,
+            (
+                ProviderRequest {
+                    ts: a_ts,
+                    provider: a_provider,
+                    model: a_model,
+                    prompt_bytes: a_prompt_bytes,
+                    attachments: a_attachments,
+                    session_id: a_session_id,
+                },
+                ProviderRequest {
+                    ts: b_ts,
+                    provider: b_provider,
+                    model: b_model,
+                    prompt_bytes: b_prompt_bytes,
+                    attachments: b_attachments,
+                    session_id: b_session_id,
+                },
+            ) => {
+                a_ts == b_ts
+                    && a_provider == b_provider
+                    && a_model == b_model
+                    && a_prompt_bytes == b_prompt_bytes
+                    && a_attachments == b_attachments
+                    && a_session_id == b_session_id
+            }
+            (
+                ProviderResponse {
+                    ts: a_ts,
+                    elapsed_s: a_elapsed,
+                    tokens_in: a_tokens_in,
+                    tokens_out: a_tokens_out,
+                    resumed: a_resumed,
+                    session_id: a_session_id,
+                },
+                ProviderResponse {
+                    ts: b_ts,
+                    elapsed_s: b_elapsed,
+                    tokens_in: b_tokens_in,
+                    tokens_out: b_tokens_out,
+                    resumed: b_resumed,
+                    session_id: b_session_id,
+                },
+            ) => {
+                a_ts == b_ts
+                    && a_elapsed == b_elapsed
+                    && a_tokens_in == b_tokens_in
+                    && a_tokens_out == b_tokens_out
+                    && a_resumed == b_resumed
+                    && a_session_id == b_session_id
+            }
+            (
+                ProviderError {
+                    ts: a_ts,
+                    kind: a_kind,
+                    message: a_message,
+                },
+                ProviderError {
+                    ts: b_ts,
+                    kind: b_kind,
+                    message: b_message,
+                },
+            ) => a_ts == b_ts && a_kind == b_kind && a_message == b_message,
+            (
+                TurnPersisted {
+                    ts: a_ts,
+                    codex_turn: a,
+                },
+                TurnPersisted {
+                    ts: b_ts,
+                    codex_turn: b,
+                },
+            ) => a_ts == b_ts && a == b,
+            (Cancelled { ts: a_ts, by: a }, Cancelled { ts: b_ts, by: b }) => {
+                a_ts == b_ts && a == b
+            }
+            _ => false,
+        }
+    }
+}
+
+pub const THROBBER_FRAME_COUNT: usize = 10;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChatProgress {
+    pub stage: ChatStage,
+    pub canned_msg: &'static str,
+    pub elapsed_s: f64,
+    pub frame_idx: usize,
+    pub resumed: Option<bool>,
+    pub session_id: Option<String>,
+}
+
+pub fn update_progress(prev: Option<ChatProgress>, evt: &ChatEvent) -> Option<ChatProgress> {
+    match evt {
+        ChatEvent::AnalystAppended { .. } => Some(prev.unwrap_or(ChatProgress {
+            stage: ChatStage::Ingesting,
+            canned_msg: canned_message(ChatStage::Ingesting, 0),
+            elapsed_s: 0.0,
+            frame_idx: 0,
+            resumed: None,
+            session_id: None,
+        })),
+        ChatEvent::Phase {
+            stage, elapsed_s, ..
+        } => {
+            let base = prev.unwrap_or(ChatProgress {
+                stage: *stage,
+                canned_msg: canned_message(*stage, 0),
+                elapsed_s: *elapsed_s,
+                frame_idx: 0,
+                resumed: None,
+                session_id: None,
+            });
+            Some(ChatProgress {
+                stage: *stage,
+                canned_msg: canned_message(*stage, (*elapsed_s / 4.0) as usize),
+                elapsed_s: *elapsed_s,
+                ..base
+            })
+        }
+        ChatEvent::ProviderRequest { session_id, .. } => prev.map(|p| ChatProgress {
+            session_id: session_id.clone().or(p.session_id),
+            ..p
+        }),
+        ChatEvent::ProviderResponse {
+            resumed,
+            session_id,
+            elapsed_s,
+            ..
+        } => prev.map(|p| ChatProgress {
+            resumed: Some(*resumed),
+            session_id: session_id.clone().or(p.session_id),
+            elapsed_s: *elapsed_s,
+            ..p
+        }),
+        ChatEvent::TurnPersisted { .. }
+        | ChatEvent::ProviderError { .. }
+        | ChatEvent::Cancelled { .. } => None,
+        ChatEvent::SessionOpened { .. }
+        | ChatEvent::SessionClosed { .. }
+        | ChatEvent::KeyCommand { .. }
+        | ChatEvent::EvidenceAttached { .. }
+        | ChatEvent::EvidenceRejected { .. } => prev,
+    }
+}
+
+pub fn advance_progress_tick(prev: ChatProgress, elapsed_s: f64) -> ChatProgress {
+    let frame_idx = ((elapsed_s * 12.5) as usize) % THROBBER_FRAME_COUNT;
+    let rotation_idx = (elapsed_s / 4.0) as usize;
+    ChatProgress {
+        elapsed_s,
+        frame_idx,
+        canned_msg: canned_message(prev.stage, rotation_idx),
+        ..prev
+    }
+}
+
+pub fn chat_events_log_path(ticket_dir: &Path) -> PathBuf {
+    session_dir(ticket_dir).join("chat-events.log")
+}
+
+pub struct ChatLogger {
+    writer: Option<std::io::BufWriter<fs::File>>,
+}
+
+impl ChatLogger {
+    pub fn open(ticket_dir: &Path) -> Result<Self, ChatError> {
+        let sdir = session_dir(ticket_dir);
+        fs::create_dir_all(&sdir)?;
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(chat_events_log_path(ticket_dir))?;
+        Ok(Self {
+            writer: Some(std::io::BufWriter::new(file)),
+        })
+    }
+
+    pub fn log(&mut self, evt: &ChatEvent) {
+        let Some(w) = self.writer.as_mut() else {
+            return;
+        };
+        let loggable = loggable_chat_event(evt);
+        if let Ok(line) = serde_json::to_string(&loggable) {
+            let _ = writeln!(w, "{line}");
+            let _ = w.flush();
+        }
+    }
+}
+
+fn loggable_chat_event(evt: &ChatEvent) -> ChatEvent {
+    match evt {
+        ChatEvent::EvidenceAttached {
+            ts,
+            provenance:
+                EvidenceProvenance::Paste {
+                    label,
+                    bytes,
+                    sent_to_provider,
+                    ..
+                },
+        } => ChatEvent::EvidenceAttached {
+            ts: *ts,
+            provenance: EvidenceProvenance::Paste {
+                label: label.clone(),
+                body: "[omitted from chat-events.log]".into(),
+                bytes: *bytes,
+                sent_to_provider: *sent_to_provider,
+            },
+        },
+        _ => evt.clone(),
+    }
+}
+
+pub trait ChatPhaseReporter: Send + Sync {
+    fn phase(&self, stage: ChatStage);
+}
+
+pub struct MpscPhaseReporter {
+    tx: tokio::sync::mpsc::UnboundedSender<ChatEvent>,
+    started: Instant,
+}
+
+impl MpscPhaseReporter {
+    pub fn new(tx: tokio::sync::mpsc::UnboundedSender<ChatEvent>) -> Self {
+        Self {
+            tx,
+            started: Instant::now(),
+        }
+    }
+}
+
+impl ChatPhaseReporter for MpscPhaseReporter {
+    fn phase(&self, stage: ChatStage) {
+        let _ = self.tx.send(ChatEvent::Phase {
+            ts: chrono::Utc::now(),
+            stage,
+            elapsed_s: self.started.elapsed().as_secs_f64(),
+        });
+    }
+}
+
+pub(crate) fn simple_glob_match(pattern: &str, text: &str) -> bool {
+    fn rec(p: &[u8], t: &[u8]) -> bool {
+        match (p.first(), t.first()) {
+            (None, None) => true,
+            (None, Some(_)) => false,
+            (Some(b'*'), _) => rec(&p[1..], t) || (!t.is_empty() && rec(p, &t[1..])),
+            (Some(_), None) => p.iter().all(|&b| b == b'*'),
+            (Some(b'?'), Some(_)) => rec(&p[1..], &t[1..]),
+            (Some(&a), Some(&b)) if a == b => rec(&p[1..], &t[1..]),
+            _ => false,
+        }
+    }
+    rec(pattern.as_bytes(), text.as_bytes())
+}
+
+#[derive(Debug)]
+pub struct DirCollectResult {
+    pub attached: Vec<EvidenceProvenance>,
+    pub skipped: Vec<DirSkipped>,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum DirSkipped {
+    SizeCapExceeded { path: PathBuf, bytes: u64 },
+    UnsupportedType { path: PathBuf },
+    GlobMismatch { path: PathBuf },
+    ScanCapReached { path: PathBuf, limit: usize },
+}
+
+struct DirCollectCtx<'a> {
+    ticket_dir: &'a Path,
+    turn_no: u32,
+    recursive: bool,
+    glob: Option<&'a str>,
+    cap_files: usize,
+    cap_total_bytes: u64,
+    ext_allowlist: &'a [&'a str],
+}
+
+struct DirCollectState {
+    attached: Vec<EvidenceProvenance>,
+    skipped: Vec<DirSkipped>,
+    running_bytes: u64,
+}
+
+pub fn collect_dir_attachments(
+    ticket_dir: &Path,
+    turn_no: u32,
+    dir: &Path,
+    recursive: bool,
+    glob: Option<&str>,
+    cap_files: usize,
+    cap_total_bytes: u64,
+) -> Result<DirCollectResult, ChatError> {
+    const EXT_ALLOWLIST: &[&str] = &[
+        "txt", "log", "md", "json", "csv", "yaml", "yml", "conf", "ini", "rs", "py", "ts", "tsx",
+        "js", "jsx",
+    ];
+
+    let ctx = DirCollectCtx {
+        ticket_dir,
+        turn_no,
+        recursive,
+        glob,
+        cap_files,
+        cap_total_bytes,
+        ext_allowlist: EXT_ALLOWLIST,
+    };
+    let mut state = DirCollectState {
+        attached: Vec::new(),
+        skipped: Vec::new(),
+        running_bytes: 0,
+    };
+    collect_dir_entries(&ctx, dir, &mut state)?;
+
+    Ok(DirCollectResult {
+        attached: state.attached,
+        skipped: state.skipped,
+    })
+}
+
+fn collect_dir_entries(
+    ctx: &DirCollectCtx<'_>,
+    dir: &Path,
+    state: &mut DirCollectState,
+) -> Result<bool, ChatError> {
+    let entries = fs::read_dir(dir)?;
+    for entry in entries {
+        let entry = entry?;
+        if state.attached.len() >= ctx.cap_files {
+            state.skipped.push(DirSkipped::ScanCapReached {
+                path: dir.to_path_buf(),
+                limit: ctx.cap_files,
+            });
+            return Ok(true);
+        }
+
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            if ctx.recursive && collect_dir_entries(ctx, &path, state)? {
+                return Ok(true);
+            }
+            continue;
+        }
+        if !file_type.is_file() {
+            continue;
+        }
+
+        let basename = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        let matches_filter = if let Some(glob) = ctx.glob {
+            simple_glob_match(glob, basename)
+        } else {
+            let ext = path
+                .extension()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            investigation::detect_file_type(&path) != FileType::Unknown
+                && ctx.ext_allowlist.iter().any(|allowed| *allowed == ext)
+        };
+        if !matches_filter {
+            state.skipped.push(if ctx.glob.is_some() {
+                DirSkipped::GlobMismatch { path }
+            } else {
+                DirSkipped::UnsupportedType { path }
+            });
+            continue;
+        }
+
+        let bytes = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        if state.running_bytes.saturating_add(bytes) > ctx.cap_total_bytes {
+            state
+                .skipped
+                .push(DirSkipped::SizeCapExceeded { path, bytes });
+            return Ok(true);
+        }
+
+        match attach_file(ctx.ticket_dir, ctx.turn_no, &path) {
+            Ok(provenance) => {
+                state.running_bytes = state.running_bytes.saturating_add(bytes);
+                state.attached.push(provenance);
+            }
+            Err(_) => state.skipped.push(DirSkipped::UnsupportedType { path }),
+        }
+    }
+
+    Ok(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::models::{EvidenceProvenance, TurnKind};
-    use chrono::Utc;
+    use chrono::{TimeZone, Utc};
     use std::io::Write as IoWrite;
     use std::time::Duration;
     use tempfile::tempdir;
@@ -842,6 +1448,41 @@ mod tests {
             }
             _ => panic!("expected File variant"),
         }
+    }
+
+    #[test]
+    fn attach_file_avoids_overwriting_same_basename_in_one_turn() {
+        let dir = tempdir().unwrap();
+        let ticket_dir = dir.path().join("44776");
+        let src_a = dir.path().join("a/error.log");
+        let src_b = dir.path().join("b/error.log");
+        write_text_file(&src_a, "first");
+        write_text_file(&src_b, "second");
+
+        let prov_a = attach_file(&ticket_dir, 3, &src_a).unwrap();
+        let prov_b = attach_file(&ticket_dir, 3, &src_b).unwrap();
+
+        let (path_a, sha_a) = match prov_a {
+            EvidenceProvenance::File {
+                copied_path,
+                sha256,
+                ..
+            } => (copied_path, sha256),
+            _ => panic!("expected File variant"),
+        };
+        let (path_b, sha_b) = match prov_b {
+            EvidenceProvenance::File {
+                copied_path,
+                sha256,
+                ..
+            } => (copied_path, sha256),
+            _ => panic!("expected File variant"),
+        };
+
+        assert_ne!(path_a, path_b);
+        assert_eq!(std::fs::read_to_string(&path_a).unwrap(), "first");
+        assert_eq!(std::fs::read_to_string(&path_b).unwrap(), "second");
+        assert_ne!(sha_a, sha_b);
     }
 
     #[test]
@@ -1106,5 +1747,657 @@ mod tests {
             replay.contains(" […]"),
             "per-turn truncation marker missing: {replay}"
         );
+    }
+
+    #[test]
+    fn canned_message_is_non_empty_for_every_stage() {
+        for stage in [
+            ChatStage::Ingesting,
+            ChatStage::ContextAssembled,
+            ChatStage::SessionResumeAttempt,
+            ChatStage::ProviderAwait,
+            ChatStage::ResponseParsed,
+            ChatStage::Saved,
+        ] {
+            for rot in 0..8 {
+                let m = canned_message(stage, rot);
+                assert!(!m.is_empty(), "stage {stage:?} rot {rot} returned empty");
+            }
+        }
+    }
+
+    #[test]
+    fn canned_message_provider_await_rotates_four_distinct_strings() {
+        let mut seen = std::collections::HashSet::new();
+        for rot in 0..4 {
+            seen.insert(canned_message(ChatStage::ProviderAwait, rot));
+        }
+        assert_eq!(seen.len(), 4, "expected 4 distinct rotations, got {seen:?}");
+        assert_eq!(
+            canned_message(ChatStage::ProviderAwait, 0),
+            canned_message(ChatStage::ProviderAwait, 4)
+        );
+    }
+
+    #[test]
+    fn canned_message_non_await_stages_ignore_rotation() {
+        let m0 = canned_message(ChatStage::Ingesting, 0);
+        let m9 = canned_message(ChatStage::Ingesting, 9);
+        assert_eq!(m0, m9);
+    }
+
+    fn now_ts() -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc.with_ymd_and_hms(2026, 5, 20, 12, 0, 0).unwrap()
+    }
+
+    #[test]
+    fn chat_event_session_opened_round_trips() {
+        let evt = ChatEvent::SessionOpened {
+            ticket_id: "44776".into(),
+            ts: now_ts(),
+        };
+        let s = serde_json::to_string(&evt).unwrap();
+        assert!(
+            s.contains("\"kind\":\"session_opened\""),
+            "tag missing: {s}"
+        );
+        assert!(s.contains("\"ticket_id\":\"44776\""), "field missing: {s}");
+        let back: ChatEvent = serde_json::from_str(&s).unwrap();
+        assert_eq!(evt, back);
+    }
+
+    #[test]
+    fn chat_event_phase_round_trips() {
+        let evt = ChatEvent::Phase {
+            ts: now_ts(),
+            stage: ChatStage::ProviderAwait,
+            elapsed_s: 2.3,
+        };
+        let s = serde_json::to_string(&evt).unwrap();
+        assert!(s.contains("\"kind\":\"phase\""));
+        assert!(s.contains("\"stage\":\"provider_await\""));
+        let back: ChatEvent = serde_json::from_str(&s).unwrap();
+        assert_eq!(evt, back);
+    }
+
+    #[test]
+    fn chat_event_provider_request_round_trips() {
+        let evt = ChatEvent::ProviderRequest {
+            ts: now_ts(),
+            provider: "codex".into(),
+            model: "gpt-5.5".into(),
+            prompt_bytes: 4096,
+            attachments: 3,
+            session_id: Some("01HFAKE12345".into()),
+        };
+        let s = serde_json::to_string(&evt).unwrap();
+        assert!(s.contains("\"kind\":\"provider_request\""));
+        assert!(s.contains("\"prompt_bytes\":4096"));
+        let back: ChatEvent = serde_json::from_str(&s).unwrap();
+        assert_eq!(evt, back);
+    }
+
+    #[test]
+    fn chat_event_cancelled_round_trips() {
+        let evt = ChatEvent::Cancelled {
+            ts: now_ts(),
+            by: CancelSource::EscKey,
+        };
+        let s = serde_json::to_string(&evt).unwrap();
+        assert!(s.contains("\"kind\":\"cancelled\""));
+        assert!(s.contains("\"by\":\"esc_key\""));
+        let back: ChatEvent = serde_json::from_str(&s).unwrap();
+        assert_eq!(evt, back);
+    }
+
+    #[test]
+    fn chat_event_all_variants_serializable() {
+        let provenance = EvidenceProvenance::Paste {
+            label: "note".into(),
+            body: "body".into(),
+            bytes: 4,
+            sent_to_provider: true,
+        };
+        let events = vec![
+            ChatEvent::SessionOpened {
+                ticket_id: "1".into(),
+                ts: now_ts(),
+            },
+            ChatEvent::SessionClosed {
+                ts: now_ts(),
+                reason: SessionCloseReason::UserQuit,
+            },
+            ChatEvent::KeyCommand {
+                ts: now_ts(),
+                command: "send".into(),
+            },
+            ChatEvent::EvidenceAttached {
+                ts: now_ts(),
+                provenance: provenance.clone(),
+            },
+            ChatEvent::EvidenceRejected {
+                ts: now_ts(),
+                reason: "too big".into(),
+            },
+            ChatEvent::AnalystAppended {
+                ts: now_ts(),
+                turn: 7,
+            },
+            ChatEvent::Phase {
+                ts: now_ts(),
+                stage: ChatStage::Ingesting,
+                elapsed_s: 0.0,
+            },
+            ChatEvent::ProviderRequest {
+                ts: now_ts(),
+                provider: "p".into(),
+                model: "m".into(),
+                prompt_bytes: 1,
+                attachments: 0,
+                session_id: None,
+            },
+            ChatEvent::ProviderResponse {
+                ts: now_ts(),
+                elapsed_s: 1.0,
+                tokens_in: None,
+                tokens_out: None,
+                resumed: false,
+                session_id: None,
+            },
+            ChatEvent::ProviderError {
+                ts: now_ts(),
+                kind: "io".into(),
+                message: "x".into(),
+            },
+            ChatEvent::TurnPersisted {
+                ts: now_ts(),
+                codex_turn: 8,
+            },
+            ChatEvent::Cancelled {
+                ts: now_ts(),
+                by: CancelSource::CtrlC,
+            },
+        ];
+        for evt in events {
+            let s = serde_json::to_string(&evt).unwrap();
+            let back: ChatEvent = serde_json::from_str(&s).unwrap();
+            assert_eq!(evt, back, "round-trip failed for: {s}");
+        }
+    }
+
+    #[test]
+    fn chat_event_provider_error_uses_error_kind_payload_field() {
+        let evt = ChatEvent::ProviderError {
+            ts: now_ts(),
+            kind: "io".into(),
+            message: "x".into(),
+        };
+        let s = serde_json::to_string(&evt).unwrap();
+        assert!(s.contains("\"kind\":\"provider_error\""));
+        // The event discriminator already owns `kind`; serde cannot encode a
+        // second payload field with the same name without ambiguous JSON.
+        assert!(s.contains("\"error_kind\":\"io\""), "serialized: {s}");
+    }
+
+    #[test]
+    fn update_progress_canonical_sequence_advances_through_stages() {
+        let mut p: Option<ChatProgress> = None;
+        p = update_progress(
+            p,
+            &ChatEvent::AnalystAppended {
+                ts: now_ts(),
+                turn: 7,
+            },
+        );
+        assert!(p.is_some(), "AnalystAppended should open progress");
+        p = update_progress(
+            p,
+            &ChatEvent::Phase {
+                ts: now_ts(),
+                stage: ChatStage::Ingesting,
+                elapsed_s: 0.1,
+            },
+        );
+        assert_eq!(p.as_ref().unwrap().stage, ChatStage::Ingesting);
+        assert!((p.as_ref().unwrap().elapsed_s - 0.1).abs() < 1e-6);
+        p = update_progress(
+            p,
+            &ChatEvent::Phase {
+                ts: now_ts(),
+                stage: ChatStage::ContextAssembled,
+                elapsed_s: 0.4,
+            },
+        );
+        assert_eq!(p.as_ref().unwrap().stage, ChatStage::ContextAssembled);
+        p = update_progress(
+            p,
+            &ChatEvent::ProviderRequest {
+                ts: now_ts(),
+                provider: "codex".into(),
+                model: "gpt-5.5".into(),
+                prompt_bytes: 1024,
+                attachments: 0,
+                session_id: Some("01H".into()),
+            },
+        );
+        assert_eq!(p.as_ref().unwrap().session_id.as_deref(), Some("01H"));
+        p = update_progress(
+            p,
+            &ChatEvent::Phase {
+                ts: now_ts(),
+                stage: ChatStage::ProviderAwait,
+                elapsed_s: 0.5,
+            },
+        );
+        assert_eq!(p.as_ref().unwrap().stage, ChatStage::ProviderAwait);
+        p = update_progress(
+            p,
+            &ChatEvent::ProviderResponse {
+                ts: now_ts(),
+                elapsed_s: 2.0,
+                tokens_in: Some(100),
+                tokens_out: Some(50),
+                resumed: true,
+                session_id: Some("01H".into()),
+            },
+        );
+        assert_eq!(p.as_ref().unwrap().resumed, Some(true));
+        p = update_progress(
+            p,
+            &ChatEvent::Phase {
+                ts: now_ts(),
+                stage: ChatStage::Saved,
+                elapsed_s: 2.05,
+            },
+        );
+        assert_eq!(p.as_ref().unwrap().stage, ChatStage::Saved);
+        p = update_progress(
+            p,
+            &ChatEvent::TurnPersisted {
+                ts: now_ts(),
+                codex_turn: 8,
+            },
+        );
+        assert!(p.is_none(), "TurnPersisted must clear progress");
+    }
+
+    #[test]
+    fn update_progress_provider_error_clears_progress() {
+        let p = update_progress(
+            None,
+            &ChatEvent::AnalystAppended {
+                ts: now_ts(),
+                turn: 1,
+            },
+        );
+        let p = update_progress(
+            p,
+            &ChatEvent::ProviderError {
+                ts: now_ts(),
+                kind: "io".into(),
+                message: "boom".into(),
+            },
+        );
+        assert!(p.is_none());
+    }
+
+    #[test]
+    fn update_progress_cancel_clears_progress() {
+        let p = update_progress(
+            None,
+            &ChatEvent::AnalystAppended {
+                ts: now_ts(),
+                turn: 1,
+            },
+        );
+        let p = update_progress(
+            p,
+            &ChatEvent::Cancelled {
+                ts: now_ts(),
+                by: CancelSource::EscKey,
+            },
+        );
+        assert!(p.is_none());
+    }
+
+    #[test]
+    fn update_progress_ignores_lifecycle_and_input_events() {
+        let p0 = update_progress(
+            None,
+            &ChatEvent::SessionOpened {
+                ticket_id: "1".into(),
+                ts: now_ts(),
+            },
+        );
+        assert!(p0.is_none());
+        let p1 = update_progress(
+            None,
+            &ChatEvent::KeyCommand {
+                ts: now_ts(),
+                command: "send".into(),
+            },
+        );
+        assert!(p1.is_none());
+    }
+
+    #[test]
+    fn advance_progress_tick_derives_frame_idx_from_elapsed() {
+        let p = ChatProgress {
+            stage: ChatStage::ProviderAwait,
+            canned_msg: "asking around...",
+            elapsed_s: 0.0,
+            frame_idx: 0,
+            resumed: None,
+            session_id: None,
+        };
+        let a = advance_progress_tick(p.clone(), 1.2);
+        let b = advance_progress_tick(p.clone(), 1.2);
+        assert_eq!(a.frame_idx, b.frame_idx);
+        let c = advance_progress_tick(p.clone(), 0.0);
+        let d = advance_progress_tick(p.clone(), 0.5);
+        assert!(c.frame_idx != d.frame_idx || c.elapsed_s != d.elapsed_s);
+        assert_eq!(d.elapsed_s, 0.5);
+    }
+
+    #[test]
+    fn advance_progress_tick_rotates_canned_message_for_provider_await() {
+        let mut p = ChatProgress {
+            stage: ChatStage::ProviderAwait,
+            canned_msg: "",
+            elapsed_s: 0.0,
+            frame_idx: 0,
+            resumed: None,
+            session_id: None,
+        };
+        let messages: Vec<&str> = (0..16)
+            .map(|i| {
+                p = advance_progress_tick(p.clone(), i as f64 * 4.0);
+                p.canned_msg
+            })
+            .collect();
+        let unique: std::collections::HashSet<_> = messages.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            4,
+            "expected 4 distinct rotations: {messages:?}"
+        );
+    }
+
+    #[test]
+    fn chat_logger_round_trips_six_events() {
+        let dir = tempdir().unwrap();
+        let ticket_dir = dir.path().to_path_buf();
+        let mut logger = ChatLogger::open(&ticket_dir).unwrap();
+        let events = vec![
+            ChatEvent::SessionOpened {
+                ticket_id: "44776".into(),
+                ts: now_ts(),
+            },
+            ChatEvent::KeyCommand {
+                ts: now_ts(),
+                command: "send".into(),
+            },
+            ChatEvent::AnalystAppended {
+                ts: now_ts(),
+                turn: 1,
+            },
+            ChatEvent::Phase {
+                ts: now_ts(),
+                stage: ChatStage::ProviderAwait,
+                elapsed_s: 0.5,
+            },
+            ChatEvent::TurnPersisted {
+                ts: now_ts(),
+                codex_turn: 2,
+            },
+            ChatEvent::SessionClosed {
+                ts: now_ts(),
+                reason: SessionCloseReason::UserQuit,
+            },
+        ];
+        for evt in &events {
+            logger.log(evt);
+        }
+        drop(logger);
+        let body = std::fs::read_to_string(chat_events_log_path(&ticket_dir)).unwrap();
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), events.len());
+        for (line, expected) in lines.iter().zip(events.iter()) {
+            let back: ChatEvent = serde_json::from_str(line).unwrap();
+            assert_eq!(&back, expected);
+        }
+    }
+
+    #[test]
+    fn chat_logger_appends_across_opens() {
+        let dir = tempdir().unwrap();
+        let ticket_dir = dir.path().to_path_buf();
+        {
+            let mut logger = ChatLogger::open(&ticket_dir).unwrap();
+            logger.log(&ChatEvent::KeyCommand {
+                ts: now_ts(),
+                command: "send".into(),
+            });
+        }
+        {
+            let mut logger = ChatLogger::open(&ticket_dir).unwrap();
+            logger.log(&ChatEvent::KeyCommand {
+                ts: now_ts(),
+                command: "/quit".into(),
+            });
+        }
+        let body = std::fs::read_to_string(chat_events_log_path(&ticket_dir)).unwrap();
+        assert_eq!(
+            body.lines().count(),
+            2,
+            "second open should append, not truncate"
+        );
+    }
+
+    #[test]
+    fn chat_logger_omits_paste_body_content() {
+        let dir = tempdir().unwrap();
+        let ticket_dir = dir.path().to_path_buf();
+        let mut logger = ChatLogger::open(&ticket_dir).unwrap();
+        logger.log(&ChatEvent::EvidenceAttached {
+            ts: now_ts(),
+            provenance: EvidenceProvenance::Paste {
+                label: "note".into(),
+                body: "SECRET_BODY_SENTINEL".into(),
+                bytes: 20,
+                sent_to_provider: true,
+            },
+        });
+        drop(logger);
+
+        let body = std::fs::read_to_string(chat_events_log_path(&ticket_dir)).unwrap();
+        assert!(
+            !body.contains("SECRET_BODY_SENTINEL"),
+            "body leaked: {body}"
+        );
+        assert!(body.contains("[omitted from chat-events.log]"));
+    }
+
+    #[test]
+    fn chat_events_log_path_is_inside_session_dir() {
+        let dir = tempdir().unwrap();
+        let p = chat_events_log_path(dir.path());
+        assert_eq!(p, session_dir(dir.path()).join("chat-events.log"));
+    }
+
+    #[tokio::test]
+    async fn mpsc_phase_reporter_emits_phase_events_in_order() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ChatEvent>();
+        let reporter = MpscPhaseReporter::new(tx);
+        reporter.phase(ChatStage::ContextAssembled);
+        reporter.phase(ChatStage::ProviderAwait);
+        reporter.phase(ChatStage::ResponseParsed);
+        drop(reporter);
+        let mut got: Vec<ChatStage> = Vec::new();
+        while let Some(evt) = rx.recv().await {
+            match evt {
+                ChatEvent::Phase { stage, .. } => got.push(stage),
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+        assert_eq!(
+            got,
+            vec![
+                ChatStage::ContextAssembled,
+                ChatStage::ProviderAwait,
+                ChatStage::ResponseParsed
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn mpsc_phase_reporter_does_not_panic_on_closed_channel() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<ChatEvent>();
+        drop(rx);
+        let reporter = MpscPhaseReporter::new(tx);
+        reporter.phase(ChatStage::Ingesting);
+    }
+
+    #[test]
+    fn simple_glob_match_exact_no_wildcard() {
+        assert!(simple_glob_match("station.log", "station.log"));
+        assert!(!simple_glob_match("station.log", "other.log"));
+    }
+
+    #[test]
+    fn simple_glob_match_star_extension() {
+        assert!(simple_glob_match("*.log", "station.log"));
+        assert!(simple_glob_match("*.log", "a.log"));
+        assert!(!simple_glob_match("*.log", "station.txt"));
+    }
+
+    #[test]
+    fn simple_glob_match_leading_and_trailing_star() {
+        assert!(simple_glob_match("station*", "station.log"));
+        assert!(simple_glob_match("*log*", "preflight.log.gz"));
+        assert!(!simple_glob_match("station*", "preflight.log"));
+    }
+
+    #[test]
+    fn simple_glob_match_question_mark_one_char() {
+        assert!(simple_glob_match("a?.log", "a1.log"));
+        assert!(simple_glob_match("a?.log", "ab.log"));
+        assert!(!simple_glob_match("a?.log", "abc.log"));
+    }
+
+    fn write_text_file(path: &Path, body: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, body).unwrap();
+    }
+
+    #[test]
+    fn collect_dir_respects_file_cap() {
+        let dir = tempdir().unwrap();
+        let src_dir = dir.path().join("logs");
+        for i in 0..30 {
+            write_text_file(&src_dir.join(format!("a{i:03}.log")), "data");
+        }
+        let ticket_dir = dir.path().join("ticket");
+        let r = collect_dir_attachments(&ticket_dir, 1, &src_dir, false, None, 25, 4 * 1024 * 1024)
+            .unwrap();
+        assert_eq!(r.attached.len(), 25);
+        assert_eq!(r.skipped.len(), 1);
+        assert!(matches!(
+            r.skipped[0],
+            DirSkipped::ScanCapReached { limit: 25, .. }
+        ));
+    }
+
+    #[test]
+    fn collect_dir_respects_size_cap() {
+        let dir = tempdir().unwrap();
+        let src_dir = dir.path().join("logs");
+        let payload = "X".repeat(1024 * 1024);
+        for i in 0..10 {
+            write_text_file(&src_dir.join(format!("a{i}.log")), &payload);
+        }
+        let ticket_dir = dir.path().join("ticket");
+        let r =
+            collect_dir_attachments(&ticket_dir, 1, &src_dir, false, None, 100, 3 * 1024 * 1024)
+                .unwrap();
+        assert_eq!(
+            r.attached.len(),
+            3,
+            "expected 3 files within 3 MiB cap, got {}",
+            r.attached.len()
+        );
+        assert_eq!(r.skipped.len(), 1);
+        assert!(r
+            .skipped
+            .iter()
+            .all(|s| matches!(s, DirSkipped::SizeCapExceeded { .. })));
+    }
+
+    #[test]
+    fn collect_dir_glob_filter() {
+        let dir = tempdir().unwrap();
+        let src_dir = dir.path().join("logs");
+        write_text_file(&src_dir.join("a.log"), "x");
+        write_text_file(&src_dir.join("b.log"), "x");
+        write_text_file(&src_dir.join("notes.txt"), "x");
+        let ticket_dir = dir.path().join("ticket");
+        let r =
+            collect_dir_attachments(&ticket_dir, 1, &src_dir, false, Some("*.log"), 100, 4 << 20)
+                .unwrap();
+        assert_eq!(r.attached.len(), 2);
+        assert_eq!(r.skipped.len(), 1);
+        assert!(matches!(r.skipped[0], DirSkipped::GlobMismatch { .. }));
+    }
+
+    #[test]
+    fn collect_dir_recursive_vs_single_level() {
+        let dir = tempdir().unwrap();
+        let src_dir = dir.path().join("logs");
+        write_text_file(&src_dir.join("top.log"), "x");
+        write_text_file(&src_dir.join("nested/deep.log"), "x");
+        let ticket_dir = dir.path().join("ticket");
+        let r_flat =
+            collect_dir_attachments(&ticket_dir, 1, &src_dir, false, None, 100, 4 << 20).unwrap();
+        assert_eq!(r_flat.attached.len(), 1);
+        let ticket_dir2 = dir.path().join("ticket2");
+        let r_recur =
+            collect_dir_attachments(&ticket_dir2, 1, &src_dir, true, None, 100, 4 << 20).unwrap();
+        assert_eq!(r_recur.attached.len(), 2);
+    }
+
+    #[test]
+    fn collect_dir_type_allowlist_filters_unknown_extensions() {
+        let dir = tempdir().unwrap();
+        let src_dir = dir.path().join("logs");
+        write_text_file(&src_dir.join("good.log"), "x");
+        write_text_file(&src_dir.join("blob.bin"), "x");
+        let ticket_dir = dir.path().join("ticket");
+        let r =
+            collect_dir_attachments(&ticket_dir, 1, &src_dir, false, None, 100, 4 << 20).unwrap();
+        assert_eq!(r.attached.len(), 1, "only good.log should attach");
+        assert!(r
+            .skipped
+            .iter()
+            .any(|s| matches!(s, DirSkipped::UnsupportedType { .. })));
+    }
+
+    #[test]
+    fn collect_dir_rejects_unknown_content_even_with_allowed_extension() {
+        let dir = tempdir().unwrap();
+        let src_dir = dir.path().join("logs");
+        write_text_file(&src_dir.join("good.log"), "x");
+        if let Some(parent) = src_dir.join("binary.log").parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(src_dir.join("binary.log"), b"x\0y").unwrap();
+        let ticket_dir = dir.path().join("ticket");
+        let r =
+            collect_dir_attachments(&ticket_dir, 1, &src_dir, false, None, 100, 4 << 20).unwrap();
+        assert_eq!(r.attached.len(), 1, "binary.log must not attach");
+        assert!(r.skipped.iter().any(
+            |s| matches!(s, DirSkipped::UnsupportedType { path } if path.ends_with("binary.log"))
+        ));
     }
 }

@@ -4,8 +4,8 @@ use crate::ticket_folder::{self, TicketFolderError, TicketFolderPaths};
 
 use super::super::base_evidence::collect_base_evidence_entries;
 use super::super::ctx::PhaseCtx;
-use super::super::owner::current_owner;
 use super::super::options::StructuredInvestigation;
+use super::super::owner::current_owner;
 use super::super::PipelineError;
 
 pub async fn run(
@@ -31,10 +31,7 @@ pub async fn run(
     )?;
     let _ = memory::append_investigation(
         &ctx.ticket.id.to_string(),
-        ctx.ticket
-            .requester_email
-            .as_deref()
-            .unwrap_or("unknown"),
+        ctx.ticket.requester_email.as_deref().unwrap_or("unknown"),
         &ctx.ticket.subject,
         &ctx.ticket.description,
         &report.fork_packet.commitment.reasoning,
@@ -59,7 +56,8 @@ pub async fn run(
         // fail the investigation. The /revise path treats missing
         // snapshots as a re-fetch trigger.
         if let Err(e) = crate::chat::write_base_ticket(&ticket_dir, ctx.ticket) {
-            ctx.reporter.phase_failed("base_ticket_snapshot", &e.to_string());
+            ctx.reporter
+                .phase_failed("base_ticket_snapshot", &e.to_string());
         }
         let bem = crate::models::BaseEvidenceManifest {
             schema: "triage-cli/base-evidence".into(),
@@ -69,7 +67,8 @@ pub async fn run(
             evidence: collect_base_evidence_entries(bundle),
         };
         if let Err(e) = crate::chat::write_base_evidence_manifest(&ticket_dir, &bem) {
-            ctx.reporter.phase_failed("base_evidence_snapshot", &e.to_string());
+            ctx.reporter
+                .phase_failed("base_evidence_snapshot", &e.to_string());
         }
     }
 

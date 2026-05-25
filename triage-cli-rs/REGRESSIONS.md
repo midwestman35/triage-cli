@@ -11,6 +11,64 @@ Status keys:
 
 ---
 
+## PR 37 Review Regressions - 2026-05-23
+
+These were found during merge-readiness review of PR 37
+(`inbox-chat-revamp`) after the first green CI pass. They are kept here so the
+failure modes stay visible even though the fixes are expected to ship in the
+same PR branch.
+
+### PR37-R1 - Non-Codex follow-ups could log false Codex session loss *(CLOSED)*
+**Status:** CLOSED. `pipeline::followup_turn` now only passes a prior Codex
+session id, emits `SessionResumeAttempt`, includes Codex replay context, and
+inserts the `session_lost` System turn when the current provider is actually
+`codex`.
+
+**Impact:** Switching to the default `unleash` provider after a prior Codex
+chat turn could append a misleading "Codex resume failed" System turn even
+though Unleash has no resumable subprocess session.
+
+### PR37-R2 - Chat session errors could leave the terminal in raw mode *(CLOSED)*
+**Status:** CLOSED. The chat surface now uses a raw-mode drop guard and creates
+the provider before entering raw mode.
+
+**Impact:** Provider setup failures, conversation parse errors, attach errors,
+or revise failures inside `run_chat_session` could return before
+`disable_raw_mode()`, leaving the caller's terminal with broken input/echo.
+
+### PR37-R3 - Slash/modal attachment failures could close chat *(CLOSED)*
+**Status:** CLOSED. File and directory attachment failures now emit
+`EvidenceRejected` plus a System turn and keep the chat open.
+
+**Impact:** `/file`, `/dir`, and the directory modal propagated ordinary path
+errors through `?`, so a typo or missing path could terminate the chat instead
+of reporting an in-chat rejection.
+
+### PR37-R4 - Retry dropped prior analyst evidence *(CLOSED)*
+**Status:** CLOSED. `/retry` and `Ctrl-T` now resend the last analyst turn's
+evidence list with the body.
+
+**Impact:** Retrying a failed provider call could silently omit the files or
+pastes that the analyst had attached to the original turn.
+
+### PR37-R5 - Directory attach cap did not cap traversal cost *(CLOSED)*
+**Status:** CLOSED. Directory traversal now streams entries and checks the file
+cap before each entry instead of collecting and sorting the whole directory
+first.
+
+**Impact:** Recursive or large-directory attaches could still spend time and
+memory walking a large tree before applying the intended 25-file cap.
+
+### PR37-R6 - Provider failures could duplicate failure System turns *(CLOSED)*
+**Status:** CLOSED. The event loop drains final queued chat events before
+handling a failed join result, so a queued `ProviderError` is the single source
+of the failure System turn.
+
+**Impact:** Depending on event timing, one failed follow-up could append two
+"follow-up failed" System turns.
+
+---
+
 ## OPEN
 
 ### R1 — `claude` provider is a subprocess, not an in-process SDK call *(CLOSED)*
@@ -179,4 +237,3 @@ Still open:
    What is the actual CLI surface — does it accept a system prompt flag, JSON
    output, take prompts on stdin? Will revisit when the codex CLI shape is
    nailed down (`REGRESSIONS.md` R2).
-

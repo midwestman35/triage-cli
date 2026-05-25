@@ -125,19 +125,29 @@ pub async fn run(ctx: &PhaseCtx<'_>, bundle: &TriageBundle) -> Result<LlmOutcome
 
     // Forward LLM call metrics through the reporter so MetricsReporter can capture them.
     if let Some(ref m) = llm_call_metrics {
-        ctx.reporter
-            .record_metric("llm.provider", super::super::reporter::MetricValue::Str(m.provider.clone()));
-        ctx.reporter
-            .record_metric("llm.model", super::super::reporter::MetricValue::Str(m.model.clone()));
-        ctx.reporter
-            .record_metric("llm.retried", super::super::reporter::MetricValue::Bool(m.retried));
+        ctx.reporter.record_metric(
+            "llm.provider",
+            super::super::reporter::MetricValue::Str(m.provider.clone()),
+        );
+        ctx.reporter.record_metric(
+            "llm.model",
+            super::super::reporter::MetricValue::Str(m.model.clone()),
+        );
+        ctx.reporter.record_metric(
+            "llm.retried",
+            super::super::reporter::MetricValue::Bool(m.retried),
+        );
         if let Some(ti) = m.tokens_in {
-            ctx.reporter
-                .record_metric("llm.tokens_in", super::super::reporter::MetricValue::Int(ti as i64));
+            ctx.reporter.record_metric(
+                "llm.tokens_in",
+                super::super::reporter::MetricValue::Int(ti as i64),
+            );
         }
         if let Some(to) = m.tokens_out {
-            ctx.reporter
-                .record_metric("llm.tokens_out", super::super::reporter::MetricValue::Int(to as i64));
+            ctx.reporter.record_metric(
+                "llm.tokens_out",
+                super::super::reporter::MetricValue::Int(to as i64),
+            );
         }
     }
 

@@ -38,11 +38,16 @@ pub async fn run(ctx: &PhaseCtx<'_>) -> Result<EnrichmentResult, PipelineError> 
                         } else {
                             None
                         };
-                        let (anchor_dt, _src) =
-                            extract::resolve_anchor(ctx.ticket, ctx.opts.anchor_override, extracted_dt);
-                        let (start, end) = extract::build_window(anchor_dt, ctx.opts.window_minutes)?;
-                        let (logs, truncated) =
-                            dd.get_logs(&entry.site_name, &ctx.levels, start, end).await?;
+                        let (anchor_dt, _src) = extract::resolve_anchor(
+                            ctx.ticket,
+                            ctx.opts.anchor_override,
+                            extracted_dt,
+                        );
+                        let (start, end) =
+                            extract::build_window(anchor_dt, ctx.opts.window_minutes)?;
+                        let (logs, truncated) = dd
+                            .get_logs(&entry.site_name, &ctx.levels, start, end)
+                            .await?;
                         log_lines = logs;
                         log_truncated = truncated;
                         site_entry = Some(entry);
@@ -51,10 +56,8 @@ pub async fn run(ctx: &PhaseCtx<'_>) -> Result<EnrichmentResult, PipelineError> 
                 Err(e) => ctx.reporter.phase_failed("enrichment", &e.to_string()),
             }
         }
-        ctx.reporter.phase_done(
-            "enrichment",
-            &format!("{} log line(s)", log_lines.len()),
-        );
+        ctx.reporter
+            .phase_done("enrichment", &format!("{} log line(s)", log_lines.len()));
     } else {
         ctx.reporter
             .phase_done("enrichment", "skipped (no Datadog client)");

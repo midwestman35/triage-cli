@@ -40,7 +40,9 @@ pub(crate) fn cap_body_snapshot(body: String) -> Option<String> {
 ///
 /// Extracted as a free function so the mapping is unit-testable in
 /// isolation from the rest of `investigate_one_structured`.
-pub fn collect_base_evidence_entries(bundle: &TriageBundle) -> Vec<crate::models::BaseEvidenceEntry> {
+pub fn collect_base_evidence_entries(
+    bundle: &TriageBundle,
+) -> Vec<crate::models::BaseEvidenceEntry> {
     use crate::models::BaseEvidenceEntry;
     bundle
         .evidence_index
