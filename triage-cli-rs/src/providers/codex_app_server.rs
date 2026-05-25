@@ -30,6 +30,12 @@ pub const DEFAULT_MAX_READ_LINES: usize = 10_000;
 /// Default wall-clock budget while waiting for one JSON-RPC response.
 pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Wall-clock budget while waiting for device-code login to complete.
+pub const LOGIN_READ_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Hint printed when doctor/setup Codex checks fail.
+pub const SETUP_HINT: &str = "run `triage-cli setup`";
+
 const OVERLOAD_MAX_ATTEMPTS: u32 = 3;
 const OVERLOAD_TOTAL_CAP: Duration = Duration::from_secs(8);
 
@@ -67,9 +73,28 @@ pub(crate) fn log_app_server_fallback_once() {
     }
 }
 
-/// Probe whether app-server is usable (`codex` on PATH + `initialize` succeeds).
+/// Returns true when the `codex` binary is on `PATH`.
+pub fn codex_binary_on_path() -> bool {
+    which::which("codex").is_ok()
+}
+
+/// Returns true when the installed Codex CLI exposes the `app-server` subcommand.
+pub fn codex_supports_app_server_sync() -> bool {
+    if !codex_binary_on_path() {
+        return false;
+    }
+    std::process::Command::new("codex")
+        .args(["app-server", "--help"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Probe whether app-server is usable (`codex` on PATH + subcommand + `initialize`).
 pub async fn probe_app_server() -> bool {
-    if which::which("codex").is_err() {
+    if !codex_supports_app_server_sync() {
         return false;
     }
     match StdioAppServerTransport::spawn().await {
@@ -83,7 +108,7 @@ pub async fn probe_app_server() -> bool {
 
 /// Sync probe for `get_provider()` — uses the current Tokio runtime or a temporary one.
 pub fn probe_app_server_sync() -> bool {
-    if which::which("codex").is_err() {
+    if !codex_supports_app_server_sync() {
         return false;
     }
     match tokio::runtime::Handle::try_current() {
@@ -317,6 +342,86 @@ impl<T: AppServerTransport> CodexAppServerClient<T> {
 
     pub async fn account_read(&mut self) -> Result<Value, ProviderError> {
         self.call("account/read", json!({})).await
+    }
+
+    /// Start ChatGPT device-code login (`account/login/start`).
+    pub async fn account_login_start(&mut self) -> Result<Value, ProviderError> {
+        self.call(
+            "account/login/start",
+            json!({ "type": "chatgptDeviceCode" }),
+        )
+        .await
+    }
+
+    /// List models available to the authenticated account.
+    pub async fn model_list(&mut self) -> Result<Value, ProviderError> {
+        self.call("model/list", json!({})).await
+    }
+
+    /// Drain notifications until `account/login/completed` (setup device-code flow).
+    pub async fn wait_for_login_completed(&mut self) -> Result<(), ProviderError> {
+        let started = Instant::now();
+        let mut lines = 0usize;
+        loop {
+            if lines >= self.bounds.max_lines {
+                return Err(ProviderError::Transport(format!(
+                    "codex app-server: login exceeded {} lines",
+                    self.bounds.max_lines
+                )));
+            }
+            if started.elapsed() >= LOGIN_READ_TIMEOUT {
+                return Err(ProviderError::Transport(
+                    "codex app-server: timed out waiting for account/login/completed".into(),
+                ));
+            }
+
+            let remaining = LOGIN_READ_TIMEOUT.saturating_sub(started.elapsed());
+            let line = match timeout(remaining, self.transport.read_line()).await {
+                Ok(Ok(l)) => l,
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    return Err(ProviderError::Transport(
+                        "codex app-server: timed out waiting for account/login/completed".into(),
+                    ));
+                }
+            };
+            lines += 1;
+
+            let msg = parse_line(&line)?;
+
+            if try_handle_server_request(&mut self.transport, &msg).await?.is_some() {
+                continue;
+            }
+
+            let Some(method) = msg.get("method").and_then(Value::as_str) else {
+                continue;
+            };
+            if msg.get("id").is_some() {
+                continue;
+            }
+            let Some(params) = msg.get("params") else {
+                continue;
+            };
+
+            if method == "account/login/completed" {
+                let success = params
+                    .get("success")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if success {
+                    return Ok(());
+                }
+                let detail = params
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("login failed");
+                return Err(ProviderError::Transport(format!(
+                    "codex app-server: account login failed: {detail}"
+                )));
+            }
+
+            handle_notification(method, params);
+        }
     }
 
     pub async fn thread_start(
@@ -640,6 +745,40 @@ fn thread_id_from_result(result: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
+/// True when `account/read` reports a signed-in account (non-null `account`).
+pub fn account_is_authenticated(result: &Value) -> bool {
+    result.get("account").is_some_and(|a| !a.is_null())
+}
+
+/// Email from a ChatGPT `account/read` payload, when present.
+pub fn account_email(result: &Value) -> Option<&str> {
+    result
+        .pointer("/account/email")
+        .and_then(Value::as_str)
+}
+
+/// Device-code fields from `account/login/start` (`chatgptDeviceCode` variant).
+pub fn parse_device_code_login(result: &Value) -> Option<(&str, &str)> {
+    let response_type = result.get("type").and_then(Value::as_str)?;
+    if response_type != "chatgptDeviceCode" {
+        return None;
+    }
+    let url = result.get("verificationUrl").and_then(Value::as_str)?;
+    let code = result.get("userCode").and_then(Value::as_str)?;
+    Some((url, code))
+}
+
+/// Whether `model/list` includes the given model id (matches `id` or `model` fields).
+pub fn model_list_contains(result: &Value, model_id: &str) -> bool {
+    let Some(data) = result.get("data").and_then(Value::as_array) else {
+        return false;
+    };
+    data.iter().any(|entry| {
+        entry.get("id").and_then(Value::as_str) == Some(model_id)
+            || entry.get("model").and_then(Value::as_str) == Some(model_id)
+    })
+}
+
 fn is_thread_resume_failure(err: &ProviderError) -> bool {
     match err {
         ProviderError::Transport(msg) => {
@@ -921,6 +1060,70 @@ mod tests {
         client.initialize().await.unwrap();
         let tid = client.thread_start("sys", "gpt-5.5").await.unwrap();
         assert_eq!(tid, "thread-abc-123");
+    }
+
+    #[test]
+    fn account_is_authenticated_detects_non_null_account() {
+        let v = json!({ "requiresOpenaiAuth": true, "account": { "type": "chatgpt", "email": "a@b.com", "planType": "pro" } });
+        assert!(account_is_authenticated(&v));
+        let missing = json!({ "requiresOpenaiAuth": true, "account": null });
+        assert!(!account_is_authenticated(&missing));
+    }
+
+    #[test]
+    fn parse_device_code_login_extracts_url_and_code() {
+        let v = json!({
+            "type": "chatgptDeviceCode",
+            "loginId": "lid",
+            "verificationUrl": "https://auth.example/verify",
+            "userCode": "ABCD-1234"
+        });
+        assert_eq!(
+            parse_device_code_login(&v),
+            Some(("https://auth.example/verify", "ABCD-1234"))
+        );
+        let other = json!({ "type": "chatgpt", "authUrl": "https://x", "loginId": "l" });
+        assert!(parse_device_code_login(&other).is_none());
+    }
+
+    #[test]
+    fn model_list_contains_matches_id_or_model_field() {
+        let v = json!({
+            "data": [
+                { "id": "gpt-5.5", "model": "gpt-5.5", "displayName": "GPT", "description": "", "hidden": false, "isDefault": true, "defaultReasoningEffort": "medium", "supportedReasoningEfforts": [] }
+            ]
+        });
+        assert!(model_list_contains(&v, "gpt-5.5"));
+        assert!(!model_list_contains(&v, "gpt-4"));
+    }
+
+    #[tokio::test]
+    async fn fake_device_code_login_completed_notification() {
+        let transport = FakeAppServerTransport::new([
+            initialize_ok_response(1),
+            serde_json::json!({
+                "id": 2,
+                "result": {
+                    "type": "chatgptDeviceCode",
+                    "loginId": "lid",
+                    "verificationUrl": "https://auth.example/verify",
+                    "userCode": "CODE"
+                }
+            })
+            .to_string(),
+            serde_json::json!({
+                "method": "account/login/completed",
+                "params": { "success": true, "loginId": "lid", "error": null }
+            })
+            .to_string(),
+        ]);
+        let mut client = CodexAppServerClient::new(transport);
+        client.initialize().await.unwrap();
+        let start = client.account_login_start().await.unwrap();
+        let pair = parse_device_code_login(&start).unwrap();
+        assert_eq!(pair.0, "https://auth.example/verify");
+        assert_eq!(pair.1, "CODE");
+        client.wait_for_login_completed().await.unwrap();
     }
 
     #[tokio::test]

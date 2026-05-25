@@ -60,16 +60,7 @@ pub async fn doctor() -> ExitCode {
             check_env("UNLEASH_ASSISTANT_ID", &provider, &mut ok);
         }
         "codex" => {
-            // Subprocess provider — verify the binary is on PATH.
-            if which::which("codex").is_ok() {
-                eprintln!("  {} `codex` on PATH (subprocess provider)", "✓".green());
-            } else {
-                eprintln!(
-                    "  {} `codex` not on PATH (required for LLM_PROVIDER=codex)",
-                    "✗".red()
-                );
-                ok = false;
-            }
+            check_codex_doctor(&mut ok).await;
         }
         other => {
             eprintln!(
@@ -156,8 +147,174 @@ fn probe_writable(dir: &Path) -> std::io::Result<()> {
     fs::remove_file(&probe)
 }
 
+async fn check_codex_doctor(ok: &mut bool) -> bool {
+    use crate::providers::codex::DEFAULT_CODEX_MODEL;
+    use crate::providers::codex_app_server::{
+        account_is_authenticated, codex_binary_on_path, codex_supports_app_server_sync,
+        model_list_contains, CodexAppServerClient, StdioAppServerTransport, SETUP_HINT,
+    };
+
+    let mut codex_ok = true;
+    eprintln!("Codex:");
+
+    if codex_binary_on_path() {
+        eprintln!("  {} `codex` on PATH", "✓".green());
+    } else {
+        eprintln!("  {} `codex` not on PATH", "✗".red());
+        codex_ok = false;
+    }
+
+    let transport = env::var("CODEX_TRANSPORT")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if transport == "exec" {
+        eprintln!(
+            "  {} CODEX_TRANSPORT=exec (uses codex CLI OAuth; app-server auth checks skipped)",
+            "✓".green()
+        );
+        if !codex_ok {
+            *ok = false;
+        }
+        return codex_ok;
+    }
+
+    if !codex_supports_app_server_sync() {
+        eprintln!(
+            "  {} `codex app-server` subcommand not available (upgrade Codex CLI)",
+            "✗".red()
+        );
+        eprintln!("  ({SETUP_HINT})");
+        *ok = false;
+        return false;
+    }
+    eprintln!("  {} `codex app-server` subcommand available", "✓".green());
+
+    let client_result = async {
+        let transport = StdioAppServerTransport::spawn().await?;
+        let mut client = CodexAppServerClient::new(transport);
+        client.initialize().await?;
+        Ok::<CodexAppServerClient<StdioAppServerTransport>, crate::providers::ProviderError>(
+            client,
+        )
+    }
+    .await;
+
+    let mut client = match client_result {
+        Ok(c) => {
+            eprintln!("  {} codex app-server initialize", "✓".green());
+            c
+        }
+        Err(e) => {
+            eprintln!("  {} codex app-server initialize failed: {e}", "✗".red());
+            eprintln!("  ({SETUP_HINT})");
+            *ok = false;
+            return false;
+        }
+    };
+
+    match client.account_read().await {
+        Ok(account) if account_is_authenticated(&account) => {
+            eprintln!("  {} codex account authenticated", "✓".green());
+        }
+        Ok(_) => {
+            eprintln!("  {} codex account not authenticated", "✗".red());
+            eprintln!("  ({SETUP_HINT})");
+            codex_ok = false;
+        }
+        Err(e) => {
+            eprintln!("  {} account/read failed: {e}", "✗".red());
+            eprintln!("  ({SETUP_HINT})");
+            codex_ok = false;
+        }
+    }
+
+    let model = env::var("CODEX_MODEL")
+        .ok()
+        .filter(|m| !m.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_CODEX_MODEL.to_string());
+
+    match client.model_list().await {
+        Ok(list) if model_list_contains(&list, &model) => {
+            eprintln!("  {} model `{model}` in model/list", "✓".green());
+        }
+        Ok(_) => {
+            eprintln!(
+                "  {} model `{model}` not found in model/list",
+                "✗".red()
+            );
+            eprintln!("  ({SETUP_HINT})");
+            codex_ok = false;
+        }
+        Err(e) => {
+            eprintln!("  {} model/list failed: {e}", "✗".red());
+            eprintln!("  ({SETUP_HINT})");
+            codex_ok = false;
+        }
+    }
+
+    if !codex_ok {
+        *ok = false;
+    }
+    codex_ok
+}
+
+fn codex_transport_for_setup() -> (&'static str, bool) {
+    use crate::providers::codex_app_server::{codex_supports_app_server_sync, probe_app_server_sync};
+    if codex_supports_app_server_sync() && probe_app_server_sync() {
+        ("app-server", false)
+    } else {
+        ("exec", true)
+    }
+}
+
+async fn setup_codex_app_server_auth() -> Result<(), String> {
+    use crate::providers::codex_app_server::{
+        account_email, account_is_authenticated, parse_device_code_login, CodexAppServerClient,
+        StdioAppServerTransport,
+    };
+
+    let transport = StdioAppServerTransport::spawn()
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut client = CodexAppServerClient::new(transport);
+    client
+        .initialize()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let account = client
+        .account_read()
+        .await
+        .map_err(|e| e.to_string())?;
+    if account_is_authenticated(&account) {
+        eprintln!("  {} Codex already authenticated", "✓".green());
+        if let Some(email) = account_email(&account) {
+            eprintln!("    signed in as {email}");
+        }
+        return Ok(());
+    }
+
+    eprintln!("{} Codex sign-in required (device code)", "→".cyan());
+    let login = client
+        .account_login_start()
+        .await
+        .map_err(|e| e.to_string())?;
+    let (url, code) = parse_device_code_login(&login)
+        .ok_or_else(|| "codex login/start did not return device-code fields".to_string())?;
+    eprintln!("  Open: {url}");
+    eprintln!("  Enter code: {code}");
+    eprintln!("  Waiting for sign-in to complete…");
+    client
+        .wait_for_login_completed()
+        .await
+        .map_err(|e| e.to_string())?;
+    eprintln!("  {} Codex sign-in complete", "✓".green());
+    Ok(())
+}
+
 /// Interactive first-run setup. Idempotent: existing values become defaults.
-pub fn setup() -> ExitCode {
+pub async fn setup() -> ExitCode {
     eprintln!("{} triage-cli setup", "→".cyan());
     eprintln!(
         "Will prompt for credentials and write them to {}.",
@@ -198,6 +355,16 @@ pub fn setup() -> ExitCode {
         let aid = prompt_text("UNLEASH_ASSISTANT_ID", existing.get("UNLEASH_ASSISTANT_ID"));
         next.push(("UNLEASH_API_KEY".into(), key));
         next.push(("UNLEASH_ASSISTANT_ID".into(), aid));
+    } else if provider.as_str() == "codex" {
+        let (transport, fallback) = codex_transport_for_setup();
+        next.push(("CODEX_TRANSPORT".into(), transport.to_string()));
+        if fallback {
+            eprintln!(
+                "{} codex app-server unavailable; wrote CODEX_TRANSPORT=exec. \
+                 Inbox follow-ups use subprocess until you upgrade Codex CLI.",
+                "⚠".yellow().bold()
+            );
+        }
     }
 
     let dd_key = prompt_text_optional(
@@ -217,6 +384,22 @@ pub fn setup() -> ExitCode {
         return ExitCode::FAILURE;
     }
     eprintln!("{} wrote {} ({} keys)", "✓".green(), ENV_PATH, next.len());
+
+    if provider.as_str() == "codex" {
+        let transport = next
+            .iter()
+            .find(|(k, _)| k == "CODEX_TRANSPORT")
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("exec");
+        if transport == "app-server" {
+            eprintln!();
+            if let Err(e) = setup_codex_app_server_auth().await {
+                eprintln!("{} Codex sign-in failed: {e}", "✗".red());
+                eprintln!("  Re-run `triage-cli setup` after completing sign-in.");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
 
     eprintln!();
     eprintln!(
