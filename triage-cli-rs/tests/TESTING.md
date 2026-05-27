@@ -43,6 +43,27 @@ Offline regression gates for Codex code changes remain:
 `cargo test --lib`, `cargo test --test pipeline_integration`,
 `cargo clippy --all-targets -- -D warnings`.
 
+## Operator-visible evidence tests
+
+When a task claims a workflow is fixed or improved, add a test that proves what
+the Trader / Operator / analyst now sees, receives, or can do. The assertion
+should name:
+
+1. **Before / trigger** — fixture, flag, prior state, or regression.
+2. **Now / surface** — stdout, stderr, one of the five markdown files, metrics
+   JSON, base-evidence manifest, session log, or rendered TUI state.
+3. **Proof** — exact string, count, ID, schema version, path, fork letter,
+   rubric row, or manifest body snippet.
+
+Current example: `triage_fixture_writes_operator_visible_base_evidence_delta`
+runs the `audio-drop` fixture with `--no-llm`, reads
+`.session/base-evidence-manifest.json`, and proves the operator can inspect:
+
+- schema `triage-cli/base-evidence`, `schema_version == 2`;
+- two Zendesk comment bodies (`E-001`, `E-002`);
+- one Datadog log-window body (`E-003`) with all 8 fixture log lines and the
+  codec-mismatch signal.
+
 ## Live Sandbox Tests
 
 Gated behind `SANDBOX_INTEGRATION=1`. Requires a `.env` in the repo root with valid Zendesk credentials. Run `triage-cli doctor` first to verify setup.
@@ -107,14 +128,15 @@ Four named fixtures in `triage-cli-rs/fixtures/`: `audio-drop`, `no-site-map`, `
 
 ```
 tests/
-  README.md                     # This file (detailed testing guide)
+  README.md                     # Detailed testing guide
+  TESTING.md                    # Quick testing guide and proof patterns
   codex_contract.rs             # Codex exec JSONL contract (CODEX_AVAILABLE=1)
   codex_app_server_contract.rs  # App-server initialize smoke (CODEX_AVAILABLE=1)
   integration/
     mod.rs                      # Module root
     zendesk_mock.rs             # ZendeskFixtureClient
     runbook_01_setup.rs         # Doctor + build-map
-    runbook_02_triage.rs        # Fixture-based triage pipeline
+    runbook_02_triage.rs        # Fixture-based triage pipeline + operator-visible evidence proof
     runbook_03_sitemap.rs       # Site map generation
     runbook_05_llm.rs           # LLM provider contract tests
     runbook_cli_smoke.rs        # CLI subprocess smoke tests
