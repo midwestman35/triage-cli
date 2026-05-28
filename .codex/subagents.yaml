@@ -1,0 +1,79 @@
+version: 1
+
+# These are lightweight review workers used beside Codex. They do not replace
+# tests; they force sharper plans before implementation grows wide.
+subagents:
+  - name: plan_reviewer
+    purpose: Catch scope gaps, missing tests, wrong skill routing, and sequencing problems before code changes begin.
+    load_skills: []
+    run_when:
+      - task changes more than one module
+      - task changes public CLI behavior
+      - task changes docs/spec/ADR-backed behavior
+    checks:
+      - Is the operator-visible outcome named?
+      - Are the selected skills fewer than five and directly relevant?
+      - Is there a rollback or no-write story for risky changes?
+      - Are offline tests identified before live tests?
+    output: approve | revise_plan, with missing evidence and missing tests listed
+
+  - name: security_reviewer
+    purpose: Enforce local-first boundaries, credential safety, PII handling, and audited-surface discipline.
+    load_skills:
+      - pipeline-contract
+      - codex-transport
+    run_when:
+      - task touches provider prompts or redaction
+      - task touches Zendesk, Datadog, Jira, shell commands, setup, or doctor
+      - task reads/writes files outside the ticket folder or TRIAGE_HOME
+    checks:
+      - No autonomous posting to Zendesk, Jira, or audited external systems.
+      - Provider-bound content remains PII-redacted where required.
+      - Credentials are never logged, written to artifacts, or included in prompts.
+      - Live tests are gated by explicit env vars.
+    output: approve | block, with concrete boundary violation if blocked
+
+  - name: architecture_reviewer
+    purpose: Protect the structured pipeline, module seams, typed errors, and ADR discipline.
+    load_skills:
+      - pipeline-contract
+    run_when:
+      - task adds a module or provider path
+      - task changes pipeline phases or ticket-folder shape
+      - task duplicates rendering/prompting/session logic
+    checks:
+      - No parallel prose-only pipeline.
+      - New errors are typed at module boundaries.
+      - Existing seams are reused before adding new ones.
+      - ADR is added or updated for structural decisions.
+    output: approve | revise_architecture, with duplicate seams called out
+
+  - name: product_evidence_reviewer
+    purpose: Ensure each change proves what the operator sees, receives, or can do now.
+    load_skills:
+      - fixture-evidence-tests
+      - pipeline-contract
+    run_when:
+      - task claims a workflow is fixed or improved
+      - task changes markdown artifacts, metrics, manifests, stdout/stderr, or TUI state
+      - task fixes a regression that was previously hard to see
+    checks:
+      - Test names encode the trigger and visible surface.
+      - Assertions include exact evidence: strings, counts, IDs, schema version, paths, body snippets.
+      - Failure messages explain the operator-visible delta.
+      - Fixtures are used before live systems whenever possible.
+    output: approve | strengthen_evidence, with the weakest assertion named
+
+  - name: duplication_reviewer
+    purpose: Stop context rot caused by duplicate skills, prompts, renderers, providers, or test helpers.
+    load_skills: []
+    run_when:
+      - task adds a new skill, prompt, renderer, provider, or helper module
+      - more than four skills appear necessary
+      - similar code already exists nearby
+    checks:
+      - New skill is justified by stable invariants, not task importance.
+      - Shared helpers are extracted only when they reduce actual duplication.
+      - The new code does not fork canonical artifact rendering.
+      - AGENTS.md remains a doctrine/router, not a dumping ground.
+    output: approve | dedupe_first, with the specific duplicate path listed
